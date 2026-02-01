@@ -2,6 +2,7 @@
 name = "wondermagick"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 description = "Memory-safe replacement for imagemagick"
 repository = "https://github.com/Shnatsel/wondermagick"
@@ -10,17 +11,17 @@ repository = "https://github.com/Shnatsel/wondermagick"
 current_platform = "0.2.0"
 bytemuck = "1"
 image = { version = "0.25.9", default-features = false, features = ["rayon"] }
-pic-scale-safe = { version = "0.1.5", features = ["rayon"] }
-strum = { version = "0.26.3", features = ["derive"] }
-tempfile = "3.23.0"
-webp = "0.3.1"
-mimalloc = { version = "0.1.47", optional = true }
-jxl-oxide = { version = "0.12.5", features = ["image", "moxcms"], optional = true }
-hayro-jpeg2000 = { version = "0.3.0", optional = true }
-image-extras = { version = "0.1.0", optional = true, default-features = false }
+pic-scale-safe = { version = "0.1", features = ["rayon"] }
+strum = { version = "0.27", features = ["derive"] }
+tempfile = "3.23"
+webp = "0.3"
+mimalloc = { version = "0.1", optional = true }
+jxl-oxide = { version = "0.12", features = ["image", "moxcms"], optional = true }
+hayro-jpeg2000 = { version = "0.3", optional = true }
+image-extras = { version = "0.1", optional = true, default-features = false }
 
 [features]
-default = ["hardened_malloc", "default-formats"]
+default = ["hardened_malloc", "default-formats", "asm"]
 # Use a hardened memory allocator for defense-in-depth against memory corruption:
 # https://github.com/microsoft/mimalloc?tab=readme-ov-file#secure-mode
 hardened_malloc = ["mimalloc/secure"]
