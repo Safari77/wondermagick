@@ -1,81 +1,76 @@
 use crate::{error::MagickError, image::Image};
 use image::{DynamicImage, GrayImage, Luma};
 
+// 1.00 = mathematically perfect (aggressive, noisy shadows)
+// 0.35 = ImageMagick legacy (solid blacks, crushed shadows)
+const SHADOW_DIFFUSION: f32 = 0.40;
+
+// Controls black speckles in light areas.
+// Set this very low (e.g., 0.05) to get clean, spotless whites.
+const HIGHLIGHT_DIFFUSION: f32 = 0.00;
+
+//   0.0: Pure Math (No Jitter)
+//  20.0 to 60.0: Subtle Breakup
+//  80.0 to 140.0: The "Film Grain" Sweet Spot
+// 150.0 to 255.0: Heavy Noise
+const THRESHOLD_JITTER: f32 = 140.0;
+
 pub fn monochrome(image: &mut Image) -> Result<(), MagickError> {
     let mut grayscaled = image.pixels.to_luma8();
-    auto_contrast(&mut grayscaled);
-    apply_contrast(&mut grayscaled, CONTRAST_FACTOR);
-    apply_dithering(&mut grayscaled);
+    apply_blue_noise_scatter(&mut grayscaled);
     image.pixels = DynamicImage::ImageLuma8(grayscaled);
-
     Ok(())
 }
 
-/// Stretches out the image contrast to span the entire 0..=255 range
-fn auto_contrast(image: &mut GrayImage) {
-    if let Some(first_pixel) = image.pixels().next() {
-        let first_luma = first_pixel.0[0];
-        // find the smallest and largest luma value in a single pass over memory
-        let (min_luma, max_luma) =
-            image
-                .pixels()
-                .fold((first_luma, first_luma), |(min, max): (u8, u8), pixel| {
-                    let luma = pixel.0[0];
-                    (min.min(luma), max.max(luma))
-                });
-        // if the image already has full range, no need to do anything
-        if min_luma != 0 || max_luma != 255 {
-            let range = max_luma - min_luma;
-            let factor = 255.0 / range as f32;
-            for pixel in image.pixels_mut() {
-                for channel in pixel.0.iter_mut() {
-                    let adjusted: f32 = (*channel - min_luma) as f32 * factor;
-                    *channel = adjusted as u8;
-                }
-            }
-        }
-    }
-}
-
-/// Empirically tuned to give results similar to ImageMagick's -monochrome
-const CONTRAST_FACTOR: f32 = 2.0;
-
-fn apply_contrast(image: &mut GrayImage, contrast_factor: f32) {
-    let offset = 128.0 * (1.0 - contrast_factor);
-
-    for pixel in image.pixels_mut() {
-        for channel in pixel.0.iter_mut() {
-            let value = *channel as f32;
-            let adjusted = (value * contrast_factor + offset).clamp(0.0, 255.0);
-            *channel = adjusted as u8;
-        }
-    }
-}
-
-const WHITE: Luma<u8> = Luma([255]);
-const BLACK: Luma<u8> = Luma([0]);
-
-fn apply_dithering(image: &mut GrayImage) {
+pub fn apply_blue_noise_scatter(image: &mut GrayImage) {
     let width = image.width();
     let height = image.height();
 
+    // Pad by 2 to safely handle x-1 and x+1 boundary math
+    let mut errors = vec![0.0f32; (width + 2) as usize * height as usize];
+
     for y in 0..height {
         for x in 0..width {
-            let pixel_luma = image.get_pixel(x, y).0[0];
+            let idx = (y * (width + 2) + x + 1) as usize;
 
-            let noise_luma = get_noise(x, y);
-            let color = if pixel_luma > noise_luma {
-                WHITE
-            } else if pixel_luma < noise_luma {
-                BLACK
-            // tie break: pixel and noise have the same value, select the nearest color
-            } else if pixel_luma > 127 {
-                WHITE
+            // Current pixel value + accumulated error
+            let original_luma = image.get_pixel(x, y).0[0] as f32;
+            let current_val = original_luma + errors[idx];
+
+            // 1. Fetch blue noise (0 to 255) and normalize to (-0.5 to 0.5)
+            let noise_u8 = get_noise(x, y);
+            let noise = (noise_u8 as f32 / 255.0) - 0.5;
+
+            // 2. Modulate the threshold with blue noise
+            let dynamic_threshold = 127.5 + (noise * THRESHOLD_JITTER);
+
+            // 3. Thresholding against the jittered baseline
+            let (new_val, color) = if current_val > dynamic_threshold {
+                (255.0, Luma([255]))
             } else {
-                BLACK
+                (0.0, Luma([0]))
             };
 
             image.put_pixel(x, y, color);
+
+            // 4. Calculate raw error mathematically (guarantees brightness retention)
+            let raw_error = current_val - new_val;
+
+            // 5. Apply asymmetric damping for spotless whites and clean blacks
+            let tuned_error = if raw_error > 0.0 {
+                raw_error * SHADOW_DIFFUSION
+            } else {
+                raw_error * HIGHLIGHT_DIFFUSION
+            };
+
+            // 6. Tight Sierra Lite distribution (keeps grain microscopic)
+            if x < width - 1 {
+                errors[idx + 1] += tuned_error * 0.5; // Right: 1/2
+            }
+            if y < height - 1 {
+                errors[idx + (width + 2) as usize - 1] += tuned_error * 0.25; // Bottom-Left: 1/4
+                errors[idx + (width + 2) as usize] += tuned_error * 0.25; // Bottom: 1/4
+            }
         }
     }
 }
@@ -96,8 +91,8 @@ fn apply_dithering(image: &mut GrayImage) {
 //  * Generate the blue noise file with:
 //    `./target/release/blue-noise generate --size 64 --output blue-noise.bin`
 //  * Copy the binary next to this source file.
-const NOISE_DATA: &[u8] = include_bytes!("blue-noise.bin");
-const NOISE_DATA_WIDTH_AND_HEIGHT: usize = 64;
+const NOISE_DATA: &[u8] = include_bytes!("blue-noise-256.bin");
+const NOISE_DATA_WIDTH_AND_HEIGHT: usize = 256;
 
 /// Get the noise value at the given coordinates. If the coordinates are out of bounds,
 /// they will wrap around. Means we don't need a noise texture as large as the image.
