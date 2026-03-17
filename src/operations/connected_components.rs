@@ -1,5 +1,5 @@
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
-use image::{DynamicImage, GrayImage, Luma};
+use image::{DynamicImage, GenericImageView, GrayImage, Luma};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConnectedComponentsConfig {
@@ -33,14 +33,26 @@ pub fn connected_components(
     image: &mut Image,
     config: &ConnectedComponentsConfig,
 ) -> Result<(), MagickError> {
-    let input = image.pixels.to_luma8();
-    let (width, height) = input.dimensions();
+    // No change
+    if config.area_threshold <= 1 {
+        return Ok(());
+    }
 
+    let (width, height) = image.pixels.dimensions();
+    let total_pixels = width * height;
+
+    // All white
+    if config.area_threshold > total_pixels {
+        let output = GrayImage::from_pixel(width, height, Luma([255]));
+        image.pixels = DynamicImage::ImageLuma8(output);
+        return Ok(());
+    }
+
+    let input = image.pixels.to_luma8();
     // Initialize the output image entirely with white (background)
     let mut output = GrayImage::from_pixel(width, height, Luma([255]));
-
     // Keep track of visited pixels to avoid infinite loops
-    let mut visited = vec![false; (width * height) as usize];
+    let mut visited = vec![false; total_pixels as usize];
 
     for y in 0..height {
         for x in 0..width {
