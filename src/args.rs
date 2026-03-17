@@ -73,6 +73,8 @@ pub enum Arg {
     Thumbnail,
     Unsharp,
     Write,
+    Sauvola,
+    ConnectedComponents,
 }
 
 impl Arg {
@@ -100,6 +102,8 @@ impl Arg {
             Arg::Thumbnail => true,
             Arg::Unsharp => true,
             Arg::Write => true,
+            Arg::Sauvola => true,
+            Arg::ConnectedComponents => true,
         }
     }
 
@@ -127,6 +131,8 @@ impl Arg {
             Arg::Thumbnail => "create a thumbnail of the image",
             Arg::Unsharp => "sharpen the image",
             Arg::Write => "write current image sequence to an output file",
+                        Arg::Sauvola => "apply Sauvola local adaptive thresholding (use 'default' or window_size,k,r)",
+            Arg::ConnectedComponents => "label connected components and remove small blobs (use 'default' or area_threshold)",
         }
     }
 }

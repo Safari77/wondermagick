@@ -17,7 +17,9 @@ use crate::{encode, wm_err};
 use crate::{
     error::MagickError,
     operations::Axis,
-    operations::{MonochromeConfig, Operation, RewriteOperation},
+    operations::{
+        ConnectedComponentsConfig, MonochromeConfig, Operation, RewriteOperation, SauvolaConfig,
+    },
     wm_try,
 };
 
@@ -176,11 +178,27 @@ impl ExecutionPlan {
                 value.unwrap(),
             )?)),
             Arg::Monochrome => {
-                let val_str = value.unwrap().to_str().ok_or_else(|| {
-                    ArgParseErr::with_msg("monochrome: value is not valid UTF-8")
-                })?;
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("monochrome: value is not valid UTF-8"))?;
                 let config = MonochromeConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Monochrome(config));
+            }
+            Arg::Sauvola => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("sauvola: value is not valid UTF-8"))?;
+                let config = SauvolaConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::Sauvola(config));
+            }
+            Arg::ConnectedComponents => {
+                let val_str = value.unwrap().to_str().ok_or_else(|| {
+                    ArgParseErr::with_msg("connected-components: value is not valid UTF-8")
+                })?;
+                let config = ConnectedComponentsConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::ConnectedComponents(config));
             }
             Arg::Negate => self.add_operation(Operation::Negate),
             Arg::Quality => self.modifiers.quality = Some(parse_numeric_arg(value.unwrap())?),

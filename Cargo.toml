@@ -10,14 +10,14 @@ repository = "https://github.com/Shnatsel/wondermagick"
 current_platform = "0.2.0"
 bytemuck = "1"
 image = { version = "0.25.9", default-features = false, features = ["rayon"] }
-pic-scale-safe = { version = "0.1.5", features = ["rayon"] }
-strum = { version = "0.26.3", features = ["derive"] }
-tempfile = "3.23.0"
-webp = "0.3.1"
-mimalloc = { version = "0.1.47", optional = true }
-jxl-oxide = { version = "0.12.5", features = ["image", "moxcms"], optional = true }
-hayro-jpeg2000 = { version = "0.3.0", optional = true }
-image-extras = { version = "0.1.0", optional = true, default-features = false }
+pic-scale-safe = { version = "0.1", features = ["rayon"] }
+strum = { version = "0.28", features = ["derive"] }
+tempfile = "3"
+webp = "0.3"
+mimalloc = { version = "0.1", optional = true }
+jxl-oxide = { version = "0.12", features = ["image", "moxcms"], optional = true }
+hayro-jpeg2000 = { version = "0.3", optional = true }
+image-extras = { version = "0.1", optional = true, default-features = false }
 
 [features]
 default = ["hardened_malloc", "default-formats"]
@@ -29,10 +29,9 @@ hardened_malloc = ["mimalloc/secure"]
 asm = ["image/nasm"]
 
 # These features enable/disable support for specific image formats at compile time
-default-formats = ["avif", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "jpeg2000", "jxl", "otb", "pcx", "png", "pnm", "qoi", "sgi", "tga", "tiff", "webp", "xbm", "xpm"]
+default-formats = ["avif", "bmp", "exr", "ff", "gif", "hdr", "ico", "jpeg", "jpeg2000", "jxl", "otb", "pcx", "png", "pnm", "qoi", "sgi", "tga", "tiff", "webp", "xbm", "xpm"]
 avif = ["image/avif"]
 bmp = ["image/bmp"]
-dds = ["image/dds"]
 exr = ["image/exr"]
 ff = ["image/ff"]
 gif = ["image/gif"]

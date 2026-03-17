@@ -8,6 +8,10 @@ mod grayscale;
 mod identify;
 mod monochrome;
 pub use monochrome::MonochromeConfig;
+mod sauvola;
+pub use sauvola::SauvolaConfig;
+mod connected_components;
+pub use connected_components::ConnectedComponentsConfig;
 mod negate;
 mod resize;
 mod unsharpen;
@@ -39,6 +43,8 @@ pub enum Operation {
     Flip(Axis),
     Monochrome(MonochromeConfig),
     Unsharpen(UnsharpenGeometry),
+    Sauvola(SauvolaConfig),
+    ConnectedComponents(ConnectedComponentsConfig),
 }
 
 impl Operation {
@@ -59,6 +65,10 @@ impl Operation {
             Operation::Flip(axis) => flip::flip(image, axis),
             Operation::Monochrome(config) => monochrome::monochrome(image, config),
             Operation::Unsharpen(geom) => unsharpen::unsharpen(image, geom),
+            Operation::Sauvola(config) => sauvola::sauvola(image, config),
+            Operation::ConnectedComponents(config) => {
+                connected_components::connected_components(image, config)
+            }
         }
     }
 
@@ -83,6 +93,8 @@ impl Operation {
             Flip(_) => (),
             Monochrome(_) => (),
             Unsharpen(_) => (),
+            Sauvola(_) => (),
+            ConnectedComponents(_) => (),
         }
     }
 }
