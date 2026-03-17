@@ -79,6 +79,7 @@ pub enum Arg {
     Morphology,
     Skeleton,
     Prune,
+    NormalizeBackground,
 }
 
 impl Arg {
@@ -99,6 +100,7 @@ impl Arg {
             Arg::Identify => false,
             Arg::Monochrome => true,
             Arg::Negate => false,
+            Arg::NormalizeBackground => true,
             Arg::Prune => true,
             Arg::Quality => true,
             Arg::Resize => true,
@@ -132,6 +134,7 @@ impl Arg {
             Arg::Identify => "identify the format and characteristics of the image",
             Arg::Monochrome => "transform image to black and white (use 'default' or noise,shadow,highlight,brightness,contrast,gamma)",
             Arg::Negate => "replace every pixel with its complementary color",
+            Arg::NormalizeBackground => "flatten uneven lighting and shadows (use 'default' or blur radius like '50')",
             Arg::Quality => "JPEG/MIFF/PNG compression level", // I'm so sorry
             Arg::Resize => "resize the image",
             Arg::Sample => "scale image with pixel sampling",
