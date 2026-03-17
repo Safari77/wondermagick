@@ -18,8 +18,8 @@ use crate::{
     error::MagickError,
     operations::Axis,
     operations::{
-        ConnectedComponentsConfig, MonochromeConfig, MorphologyConfig, Operation, RewriteOperation,
-        SauvolaConfig,
+        ConnectedComponentsConfig, MonochromeConfig, MorphologyConfig, Operation, PruneConfig,
+        RewriteOperation, SauvolaConfig,
     },
     wm_try,
 };
@@ -194,6 +194,14 @@ impl ExecutionPlan {
                 let config = MorphologyConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Morphology(config));
             }
+            Arg::Prune => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("prune: value is not valid UTF-8"))?;
+                let config = PruneConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::Prune(config));
+            }
             Arg::Sauvola => {
                 let val_str = value
                     .unwrap()
@@ -221,6 +229,7 @@ impl ExecutionPlan {
             Arg::Scale => {
                 self.add_operation(Operation::Scale(ResizeGeometry::try_from(value.unwrap())?))
             }
+            Arg::Skeleton => self.add_operation(Operation::Skeleton),
             Arg::Strip => {
                 self.modifiers.strip.set_all(true);
             }

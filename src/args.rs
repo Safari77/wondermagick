@@ -76,6 +76,8 @@ pub enum Arg {
     Sauvola,
     ConnectedComponents,
     Morphology,
+    Skeleton,
+    Prune,
 }
 
 impl Arg {
@@ -95,10 +97,12 @@ impl Arg {
             Arg::Identify => false,
             Arg::Monochrome => true,
             Arg::Negate => false,
+            Arg::Prune => true,
             Arg::Quality => true,
             Arg::Resize => true,
             Arg::Sample => true,
             Arg::Scale => true,
+            Arg::Skeleton => false,
             Arg::Strip => false,
             Arg::Thumbnail => true,
             Arg::Unsharp => true,
@@ -136,6 +140,8 @@ impl Arg {
             Arg::Sauvola => "apply Sauvola local adaptive thresholding (use 'default' or window_size,k,r)",
             Arg::ConnectedComponents => "label connected components and remove small blobs (use 'default' or area_threshold)",
             Arg::Morphology => "apply mathematical morphology (format: method,shape,size | Methods: erode, dilate, open, close | Shapes: square, cross, circle | Size: odd int | e.g., 'close,cross,3')",
+            Arg::Skeleton => "reduce binary shapes to a 1-pixel wide skeleton (Zhang-Suen thinning)",
+            Arg::Prune => "remove short branches from a skeletonized image (use 'default' [3] or number of iterations)",
         }
     }
 }

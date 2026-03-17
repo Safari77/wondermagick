@@ -15,7 +15,10 @@ pub use sauvola::SauvolaConfig;
 mod connected_components;
 pub use connected_components::ConnectedComponentsConfig;
 mod negate;
+mod prune;
+pub use prune::PruneConfig;
 mod resize;
+mod skeleton;
 mod unsharpen;
 
 use crate::{
@@ -48,6 +51,8 @@ pub enum Operation {
     Sauvola(SauvolaConfig),
     ConnectedComponents(ConnectedComponentsConfig),
     Morphology(MorphologyConfig),
+    Skeleton,
+    Prune(PruneConfig),
 }
 
 impl Operation {
@@ -73,6 +78,8 @@ impl Operation {
                 connected_components::connected_components(image, config)
             }
             Operation::Morphology(config) => morphology::morphology(image, config),
+            Operation::Skeleton => skeleton::skeleton(image),
+            Operation::Prune(config) => prune::prune(image, config),
         }
     }
 
@@ -100,6 +107,8 @@ impl Operation {
             Sauvola(_) => (),
             ConnectedComponents(_) => (),
             Morphology(_) => (),
+            Skeleton => (),
+            Prune(_) => (),
         }
     }
 }
