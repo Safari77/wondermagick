@@ -55,6 +55,7 @@ pub enum Arg {
     Crop,
     // TODO: -format can actually change meaning, as `-format type`
     // and as `-format expression`. We currently only implement `-format expression`.
+    Despeckle,
     Format,
     Filter,
     Flip,
@@ -87,6 +88,7 @@ impl Arg {
             Arg::Colorspace => true,
             Arg::Combine => matches!(sign, ArgSign::Plus),
             Arg::Crop => true,
+            Arg::Despeckle => true,
             Arg::Format => true,
             Arg::Filter => true,
             Arg::Flip => false,
@@ -119,6 +121,7 @@ impl Arg {
             Arg::Colorspace => "specify the colorspace of created images",
             Arg::Combine => "create an image channel by channel from separate greyscale inputs",
             Arg::Crop => "cut out a rectangular region of the image",
+            Arg::Despeckle => "despeckle image",
             Arg::Format => "output formatted image characteristics",
             Arg::Filter => "use this filter when resizing an image",
             Arg::Flip => "flip image vertically",

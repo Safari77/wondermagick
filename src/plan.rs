@@ -18,8 +18,8 @@ use crate::{
     error::MagickError,
     operations::Axis,
     operations::{
-        ConnectedComponentsConfig, MonochromeConfig, MorphologyConfig, Operation, PruneConfig,
-        RewriteOperation, SauvolaConfig,
+        ConnectedComponentsConfig, DespeckleConfig, MonochromeConfig, MorphologyConfig, Operation,
+        PruneConfig, RewriteOperation, SauvolaConfig,
     },
     wm_try,
 };
@@ -165,6 +165,13 @@ impl ExecutionPlan {
             }
             Arg::Crop => {
                 self.add_operation(Operation::Crop(CropGeometry::try_from(value.unwrap())?))
+            }
+            Arg::Despeckle => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("invalid UTF-8"))?;
+                self.add_operation(Operation::Despeckle(DespeckleConfig::parse_arg(val_str)?));
             }
             Arg::Identify => {
                 self.add_operation(Operation::Identify(self.modifiers.identify_format.clone()));

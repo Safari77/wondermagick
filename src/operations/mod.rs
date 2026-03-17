@@ -17,9 +17,11 @@ pub use connected_components::ConnectedComponentsConfig;
 mod negate;
 mod prune;
 pub use prune::PruneConfig;
+mod despeckle;
 mod resize;
 mod skeleton;
 mod unsharpen;
+pub use despeckle::DespeckleConfig;
 
 use crate::{
     arg_parsers::{
@@ -39,6 +41,7 @@ pub enum Operation {
     Sample(ResizeGeometry),
     CropOnLoad(LoadCropGeometry),
     Crop(CropGeometry),
+    Despeckle(DespeckleConfig),
     Identify(Option<IdentifyFormat>),
     Negate,
     AutoOrient,
@@ -64,6 +67,7 @@ impl Operation {
             Operation::Sample(geom) => resize::sample(image, geom),
             Operation::CropOnLoad(geom) => crop::crop_on_load(image, geom),
             Operation::Crop(geom) => crop::crop(image, geom),
+            Operation::Despeckle(config) => despeckle::despeckle(image, config),
             Operation::Identify(format) => identify::identify(image, format.clone()),
             Operation::Negate => negate::negate(image),
             Operation::AutoOrient => auto_orient::auto_orient(image),
@@ -95,6 +99,7 @@ impl Operation {
             Sample(_) => (),
             CropOnLoad(_) => (),
             Crop(_) => (),
+            Despeckle(_) => (),
             Identify(_) => *self = Identify(mods.identify_format.clone()),
             Negate => (),
             AutoOrient => (),
