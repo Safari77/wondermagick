@@ -75,6 +75,7 @@ pub enum Arg {
     Write,
     Sauvola,
     ConnectedComponents,
+    Morphology,
 }
 
 impl Arg {
@@ -104,6 +105,7 @@ impl Arg {
             Arg::Write => true,
             Arg::Sauvola => true,
             Arg::ConnectedComponents => true,
+            Arg::Morphology => true,
         }
     }
 
@@ -131,8 +133,9 @@ impl Arg {
             Arg::Thumbnail => "create a thumbnail of the image",
             Arg::Unsharp => "sharpen the image",
             Arg::Write => "write current image sequence to an output file",
-                        Arg::Sauvola => "apply Sauvola local adaptive thresholding (use 'default' or window_size,k,r)",
+            Arg::Sauvola => "apply Sauvola local adaptive thresholding (use 'default' or window_size,k,r)",
             Arg::ConnectedComponents => "label connected components and remove small blobs (use 'default' or area_threshold)",
+            Arg::Morphology => "apply mathematical morphology (format: method,shape,size | Methods: erode, dilate, open, close | Shapes: square, cross, circle | Size: odd int | e.g., 'close,cross,3')",
         }
     }
 }

@@ -18,7 +18,8 @@ use crate::{
     error::MagickError,
     operations::Axis,
     operations::{
-        ConnectedComponentsConfig, MonochromeConfig, Operation, RewriteOperation, SauvolaConfig,
+        ConnectedComponentsConfig, MonochromeConfig, MorphologyConfig, Operation, RewriteOperation,
+        SauvolaConfig,
     },
     wm_try,
 };
@@ -184,6 +185,14 @@ impl ExecutionPlan {
                     .ok_or_else(|| ArgParseErr::with_msg("monochrome: value is not valid UTF-8"))?;
                 let config = MonochromeConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Monochrome(config));
+            }
+            Arg::Morphology => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("morphology: value is not valid UTF-8"))?;
+                let config = MorphologyConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::Morphology(config));
             }
             Arg::Sauvola => {
                 let val_str = value

@@ -8,7 +8,9 @@ mod grayscale;
 mod identify;
 mod monochrome;
 pub use monochrome::MonochromeConfig;
+mod morphology;
 mod sauvola;
+pub use morphology::MorphologyConfig;
 pub use sauvola::SauvolaConfig;
 mod connected_components;
 pub use connected_components::ConnectedComponentsConfig;
@@ -45,6 +47,7 @@ pub enum Operation {
     Unsharpen(UnsharpenGeometry),
     Sauvola(SauvolaConfig),
     ConnectedComponents(ConnectedComponentsConfig),
+    Morphology(MorphologyConfig),
 }
 
 impl Operation {
@@ -69,6 +72,7 @@ impl Operation {
             Operation::ConnectedComponents(config) => {
                 connected_components::connected_components(image, config)
             }
+            Operation::Morphology(config) => morphology::morphology(image, config),
         }
     }
 
@@ -95,6 +99,7 @@ impl Operation {
             Unsharpen(_) => (),
             Sauvola(_) => (),
             ConnectedComponents(_) => (),
+            Morphology(_) => (),
         }
     }
 }
