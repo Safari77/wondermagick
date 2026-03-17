@@ -1,0 +1,1 @@
+wm-convert TRAIN_DIBCO2009_H04_source.png -resize 400% -unsharp 0x5 -normalize-background 555 -sauvola 99,0.25,177 -morphology close,circle,3 -connected-components 133 TRAIN_DIBCO2009_H04_wm.png
