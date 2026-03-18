@@ -1,0 +1,3 @@
+gmic Trump_fund_Russia.webp remove_opacity to_gray n 0,255 r 400%,400%,1,1,6,1 otsu 256 mul 255 -o Trump_fund_Russia.otsu.png 
+wm-convert Trump_fund_Russia.webp -resize 400% -unsharp 0x2 -sauvola 55,0.1,128 -morphology dilate,circle,3 Trump_fund_Russia.sauvola.png
+wm-convert Trump_fund_Russia.webp -resize 400% -unsharp 0x2 -sauvola 55,0.1,128 -morphology dilate,circle,3 -skeleton Trump_fund_Russia.sauvola.skeleton.png
