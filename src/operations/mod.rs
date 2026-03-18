@@ -22,8 +22,8 @@ mod resize;
 mod skeleton;
 mod unsharpen;
 pub use despeckle::DespeckleConfig;
-mod normalize;
-pub use normalize::NormalizeConfig;
+mod normalize_background;
+pub use normalize_background::NormalizeBackgroundConfig;
 
 use crate::{
     arg_parsers::{
@@ -46,7 +46,7 @@ pub enum Operation {
     Despeckle(DespeckleConfig),
     Identify(Option<IdentifyFormat>),
     Negate,
-    NormalizeBackground(NormalizeConfig),
+    NormalizeBackground(NormalizeBackgroundConfig),
     AutoOrient,
     Blur(BlurGeometry),
     GaussianBlur(BlurGeometry),
@@ -74,7 +74,7 @@ impl Operation {
             Operation::Identify(format) => identify::identify(image, format.clone()),
             Operation::Negate => negate::negate(image),
             Operation::NormalizeBackground(config) => {
-                normalize::normalize_background(image, config)
+                normalize_background::normalize_background(image, config)
             }
             Operation::AutoOrient => auto_orient::auto_orient(image),
             Operation::Blur(geom) => blur::blur(image, geom),

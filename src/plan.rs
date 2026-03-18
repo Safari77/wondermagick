@@ -19,7 +19,7 @@ use crate::{
     operations::Axis,
     operations::{
         ConnectedComponentsConfig, DespeckleConfig, MonochromeConfig, MorphologyConfig,
-        NormalizeConfig, Operation, PruneConfig, RewriteOperation, SauvolaConfig,
+        NormalizeBackgroundConfig, Operation, PruneConfig, RewriteOperation, SauvolaConfig,
     },
     wm_try,
 };
@@ -206,7 +206,7 @@ impl ExecutionPlan {
                     .unwrap()
                     .to_str()
                     .ok_or_else(|| ArgParseErr::with_msg("normalize: value is not valid UTF-8"))?;
-                let config = NormalizeConfig::parse_arg(val_str)?;
+                let config = NormalizeBackgroundConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::NormalizeBackground(config));
             }
             Arg::Prune => {

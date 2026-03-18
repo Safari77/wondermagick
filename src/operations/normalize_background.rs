@@ -2,18 +2,18 @@ use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
 use image::{imageops, DynamicImage, GrayImage, Luma};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct NormalizeConfig {
+pub struct NormalizeBackgroundConfig {
     pub radius: u32,
 }
 
-impl Default for NormalizeConfig {
+impl Default for NormalizeBackgroundConfig {
     fn default() -> Self {
         // 50 is usually a good radius to destroy text but keep the lighting gradients
         Self { radius: 50 }
     }
 }
 
-impl NormalizeConfig {
+impl NormalizeBackgroundConfig {
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("default") {
@@ -30,7 +30,7 @@ impl NormalizeConfig {
 
 pub fn normalize_background(
     image: &mut Image,
-    config: &NormalizeConfig,
+    config: &NormalizeBackgroundConfig,
 ) -> Result<(), MagickError> {
     if config.radius == 0 {
         return Ok(());
