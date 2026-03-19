@@ -19,14 +19,14 @@ pub struct Bm3dConfig {
 impl Default for Bm3dConfig {
     fn default() -> Self {
         Self {
-            sigma_l: 0.05,
+            sigma_l: 0.015,
             sigma_a: 0.15,
             sigma_b: 0.15,
             patch_size: 8,
             step_size: 3,
-            search_window: 24,
-            max_matches: 16,
-            anscombe: false, // Default to false
+            search_window: 48,
+            max_matches: 32,
+            anscombe: false,
         }
     }
 }
@@ -50,8 +50,15 @@ impl Bm3dConfig {
         }
 
         let anscombe = if parts.len() == 8 {
-            let a_str = parts[7].trim().to_lowercase();
-            a_str == "true" || a_str == "1"
+            match parts[7].trim().to_lowercase().as_str() {
+                "true" | "1" | "y" | "yes" => true,
+                "false" | "0" | "n" | "no" => false,
+                _ => {
+                    return Err(ArgParseErr::with_msg(
+                        "invalid anscombe flag: expected true/false, 1/0, or yes/no",
+                    ))
+                }
+            }
         } else {
             false
         };
