@@ -13,6 +13,7 @@ pub struct Bm3dConfig {
     pub step_size: usize,
     pub search_window: usize,
     pub max_matches: usize,
+    pub anscombe: bool,
 }
 
 impl Default for Bm3dConfig {
@@ -25,13 +26,14 @@ impl Default for Bm3dConfig {
             step_size: 3,
             search_window: 24,
             max_matches: 16,
+            anscombe: false, // Default to false
         }
     }
 }
 
 impl Bm3dConfig {
-    /// Format: "sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches"
-    /// Example: "0.05,0.15,0.15,8,3,24,16" or "default"
+    /// Format: "sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches[,anscombe]"
+    /// Example: "0.05,0.15,0.15,8,3,24,16,true" or "default"
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("default") {
@@ -39,12 +41,20 @@ impl Bm3dConfig {
         }
 
         let parts: Vec<&str> = s.split(',').collect();
-        if parts.len() != 7 {
+        // Allow either 7 or 8 arguments (making anscombe optional for backward compatibility)
+        if parts.len() != 7 && parts.len() != 8 {
             return Err(ArgParseErr::with_msg(
-                "bm3d requires 'default' or exactly 7 comma-separated values: \
-                 sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches",
+                "bm3d requires 'default' or 7-8 comma-separated values: \
+                 sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches[,anscombe]",
             ));
         }
+
+        let anscombe = if parts.len() == 8 {
+            let a_str = parts[7].trim().to_lowercase();
+            a_str == "true" || a_str == "1"
+        } else {
+            false
+        };
 
         Ok(Self {
             sigma_l: parts[0]
@@ -75,6 +85,7 @@ impl Bm3dConfig {
                 .trim()
                 .parse()
                 .map_err(|_| ArgParseErr::with_msg("invalid max_matches"))?,
+            anscombe,
         })
     }
 }
@@ -83,6 +94,7 @@ fn run_bm3d_channel(
     channel: &Array2<f32>,
     sigma: f32,
     config: &Bm3dConfig,
+    apply_anscombe: bool,
 ) -> Result<Array2<f32>, MagickError> {
     let core_config = CoreConfig {
         sigma_random: sigma,
@@ -90,10 +102,10 @@ fn run_bm3d_channel(
         step_size: config.step_size,
         search_window: config.search_window,
         max_matches: config.max_matches,
+        anscombe: apply_anscombe,
         ..Default::default()
     };
 
-    // Notice the updated 3-argument signature and .view() call
     bm3d_ring_artifact_removal(channel.view(), RingRemovalMode::Generic, &core_config)
         .map_err(|e| wm_err!("BM3D error: {}", e))
 }
@@ -113,7 +125,8 @@ pub fn bm3d(image: &mut Image, config: &Bm3dConfig) -> Result<(), MagickError> {
             luma_arr[[y as usize, x as usize]] = pixel[0] as f32 / 255.0;
         }
 
-        let denoised_luma = run_bm3d_channel(&luma_arr, config.sigma_l, config)?;
+        // Grayscale is safe for Anscombe
+        let denoised_luma = run_bm3d_channel(&luma_arr, config.sigma_l, config, config.anscombe)?;
 
         let mut output = image::GrayImage::new(width, height);
         for y in 0..height {
@@ -144,9 +157,10 @@ pub fn bm3d(image: &mut Image, config: &Bm3dConfig) -> Result<(), MagickError> {
         }
 
         // 2. Denoise independent channels
-        let denoise_l = run_bm3d_channel(&l_arr, config.sigma_l, config)?;
-        let denoise_a = run_bm3d_channel(&a_arr, config.sigma_a, config)?;
-        let denoise_b = run_bm3d_channel(&b_arr, config.sigma_b, config)?;
+        // Anscombe only for the Lightness channel.
+        let denoise_l = run_bm3d_channel(&l_arr, config.sigma_l, config, config.anscombe)?;
+        let denoise_a = run_bm3d_channel(&a_arr, config.sigma_a, config, false)?;
+        let denoise_b = run_bm3d_channel(&b_arr, config.sigma_b, config, false)?;
 
         // 3. Reconstruct Rgba Image
         let mut output = image::RgbaImage::new(width, height);
