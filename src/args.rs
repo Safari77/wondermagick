@@ -50,6 +50,7 @@ impl SignedArg {
 #[strum(serialize_all = "kebab-case")]
 pub enum Arg {
     AutoOrient,
+    Bm3d,
     Colorspace,
     Combine,
     Crop,
@@ -86,6 +87,7 @@ impl Arg {
     pub fn needs_value(&self, sign: &ArgSign) -> bool {
         match self {
             Arg::AutoOrient => false,
+            Arg::Bm3d => true,
             Arg::Colorspace => true,
             Arg::Combine => matches!(sign, ArgSign::Plus),
             Arg::Crop => true,
@@ -120,6 +122,7 @@ impl Arg {
     pub fn help_text(&self) -> &'static str {
         match self {
             Arg::AutoOrient => "automagically orient (rotate) image",
+            Arg::Bm3d => "apply BM3D denoising in Oklab color space (use 'default' or sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches)",
             Arg::Colorspace => "specify the colorspace of created images",
             Arg::Combine => "create an image channel by channel from separate greyscale inputs",
             Arg::Crop => "cut out a rectangular region of the image",

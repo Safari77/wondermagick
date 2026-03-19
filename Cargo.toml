@@ -18,6 +18,9 @@ mimalloc = { version = "0.1", optional = true }
 jxl-oxide = { version = "0.12", features = ["image", "moxcms"], optional = true }
 hayro-jpeg2000 = { version = "0.3", optional = true }
 image-extras = { version = "0.1", optional = true, default-features = false }
+oklab = "1.1.2"
+bm3d_core = { git = "https://github.com/Safari77/bm3d_core" }
+ndarray = "0.17"
 
 [features]
 default = ["hardened_malloc", "default-formats"]

@@ -24,6 +24,8 @@ mod unsharpen;
 pub use despeckle::DespeckleConfig;
 mod normalize_background;
 pub use normalize_background::NormalizeBackgroundConfig;
+mod bm3d;
+pub use bm3d::Bm3dConfig;
 
 use crate::{
     arg_parsers::{
@@ -59,6 +61,7 @@ pub enum Operation {
     Morphology(MorphologyConfig),
     Skeleton,
     Prune(PruneConfig),
+    Bm3d(Bm3dConfig),
 }
 
 impl Operation {
@@ -90,6 +93,7 @@ impl Operation {
             Operation::Morphology(config) => morphology::morphology(image, config),
             Operation::Skeleton => skeleton::skeleton(image),
             Operation::Prune(config) => prune::prune(image, config),
+            Operation::Bm3d(config) => bm3d::bm3d(image, config),
         }
     }
 
@@ -121,6 +125,7 @@ impl Operation {
             Morphology(_) => (),
             Skeleton => (),
             Prune(_) => (),
+            Bm3d(_) => (),
         }
     }
 }
