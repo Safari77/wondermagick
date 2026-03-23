@@ -154,7 +154,7 @@ impl Arg {
             Arg::WolfJolion => "apply Wolf-Jolion local adaptive thresholding (use 'default' or window_size,k)",
             Arg::Phansalkar => "apply Phansalkar local adaptive thresholding (use 'default' or window_size,k,r,p,q)",
             Arg::ConnectedComponents => "label connected components and remove small blobs (use 'default' or area_threshold)",
-            Arg::Morphology => "apply mathematical morphology (format: method,shape,size | Methods: erode, dilate, open, close | Shapes: square, cross, circle | Size: odd int | e.g., 'close,cross,3')",
+            Arg::Morphology => "apply mathematical morphology (format: method,shape,size | Methods: erode, dilate, open, close, tophat, bottomhat | Shapes: square, cross, circle, ellipse, rectangle | Size: odd int or WxH | e.g., 'close,cross,3' or 'bottomhat,ellipse,3x7')",
             Arg::Skeleton => "reduce binary shapes to a 1-pixel wide skeleton (Zhang-Suen thinning)",
             Arg::Prune => "remove short branches from a skeletonized image (use 'default' [3] or number of iterations)",
         }

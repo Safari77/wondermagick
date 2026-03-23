@@ -1,5 +1,6 @@
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
-use image::{DynamicImage, GrayImage, Luma};
+use image::{DynamicImage, GrayImage};
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MorphologyMethod {
@@ -7,6 +8,8 @@ pub enum MorphologyMethod {
     Dilate,
     Open,
     Close,
+    TopHat,
+    BottomHat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,9 +58,13 @@ impl MorphologyConfig {
             "dilate" => MorphologyMethod::Dilate,
             "open" => MorphologyMethod::Open,
             "close" => MorphologyMethod::Close,
+            "tophat" | "top-hat" | "top_hat" => MorphologyMethod::TopHat,
+            "bottomhat" | "bottom-hat" | "bottom_hat" | "blackhat" | "black-hat" | "black_hat" => {
+                MorphologyMethod::BottomHat
+            }
             _ => {
                 return Err(ArgParseErr::with_msg(
-                    "invalid method. Use: erode, dilate, open, close",
+                    "invalid method. Use: erode, dilate, open, close, tophat, bottomhat",
                 ))
             }
         };
@@ -65,11 +72,11 @@ impl MorphologyConfig {
         let shape = match parts[1].trim().to_lowercase().as_str() {
             "square" => KernelShape::Square,
             "cross" => KernelShape::Cross,
-            "circle" | "disk" => KernelShape::Circle,
+            "circle" | "disk" | "ellipse" => KernelShape::Circle,
             "rectangle" | "rect" => KernelShape::Rectangle,
             _ => {
                 return Err(ArgParseErr::with_msg(
-                    "invalid shape. Use: square, cross, circle, rectangle",
+                    "invalid shape. Use: square, cross, circle, ellipse, rectangle",
                 ))
             }
         };
@@ -95,10 +102,13 @@ impl MorphologyConfig {
             (s, s)
         };
 
-        // Reject asymmetric sizes for symmetric shapes
-        if kernel_width != kernel_height && shape != KernelShape::Rectangle {
+        // Reject asymmetric sizes for shapes that require symmetry
+        if kernel_width != kernel_height
+            && shape != KernelShape::Rectangle
+            && shape != KernelShape::Circle
+        {
             return Err(ArgParseErr::with_msg(
-                "asymmetric sizes (e.g., '1x10') are only allowed when using the 'rectangle' shape",
+                "asymmetric sizes (e.g., '3x7') are only allowed for 'rectangle' and 'circle' (ellipse) shapes",
             ));
         }
 
@@ -139,12 +149,27 @@ pub fn morphology(image: &mut Image, config: &MorphologyConfig) -> Result<(), Ma
             let dilated = apply_filter(&input, config, FilterType::Max);
             apply_filter(&dilated, config, FilterType::Min)
         }
+        // Top-Hat: Original - Open(Image)
+        // Extracts bright features smaller than the kernel from a dark background.
+        MorphologyMethod::TopHat => {
+            let eroded = apply_filter(&input, config, FilterType::Min);
+            let opened = apply_filter(&eroded, config, FilterType::Max);
+            subtract_images(&input, &opened)
+        }
+        // Bottom-Hat (Black-Hat): Close(Image) - Original
+        // Extracts dark features (e.g. text) from a bright, unevenly lit background.
+        MorphologyMethod::BottomHat => {
+            let dilated = apply_filter(&input, config, FilterType::Max);
+            let closed = apply_filter(&dilated, config, FilterType::Min);
+            subtract_images(&closed, &input)
+        }
     };
 
     image.pixels = DynamicImage::ImageLuma8(output);
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 enum FilterType {
     Min,
     Max,
@@ -161,51 +186,85 @@ fn apply_filter(
     let half_w = config.kernel_width / 2;
     let half_h = config.kernel_height / 2;
 
-    // Fallback circle radius calculation
-    let r_sq = std::cmp::max(half_w, half_h) * std::cmp::max(half_w, half_h);
+    // Precompute ellipse semi-axis radii squared for the inclusion test.
+    // For a symmetric kernel (half_w == half_h) this reduces to a circle.
+    let rw_sq = (half_w * half_w).max(1) as f64;
+    let rh_sq = (half_h * half_h).max(1) as f64;
 
-    for y in 0..height {
-        for x in 0..width {
-            let mut local_min = 255u8;
-            let mut local_max = 0u8;
+    let shape = config.shape;
+    let row_len = width as usize;
+    let input_raw = input.as_raw();
 
-            let x_start = x.saturating_sub(half_w);
-            let x_end = (x + half_w).min(width - 1);
+    // Process rows in parallel. Each row writes to a disjoint slice of the output buffer
+    // and reads only from the immutable input, so there are no data races.
+    output
+        .as_mut()
+        .par_chunks_mut(row_len)
+        .enumerate()
+        .for_each(|(y_idx, row)| {
+            let y = y_idx as u32;
             let y_start = y.saturating_sub(half_h);
             let y_end = (y + half_h).min(height - 1);
 
-            for ky in y_start..=y_end {
-                for kx in x_start..=x_end {
-                    let include = match config.shape {
-                        KernelShape::Square | KernelShape::Rectangle => true,
-                        KernelShape::Cross => kx == x || ky == y,
-                        KernelShape::Circle => {
-                            let dx = kx.abs_diff(x);
-                            let dy = ky.abs_diff(y);
-                            (dx * dx + dy * dy) <= r_sq
-                        }
-                    };
+            for x in 0..width {
+                let mut local_min = 255u8;
+                let mut local_max = 0u8;
 
-                    if include {
-                        let val = input.get_pixel(kx, ky)[0];
-                        if val < local_min {
-                            local_min = val;
-                        }
-                        if val > local_max {
-                            local_max = val;
+                let x_start = x.saturating_sub(half_w);
+                let x_end = (x + half_w).min(width - 1);
+
+                for ky in y_start..=y_end {
+                    let row_offset = ky as usize * row_len;
+                    for kx in x_start..=x_end {
+                        let include = match shape {
+                            KernelShape::Square | KernelShape::Rectangle => true,
+                            KernelShape::Cross => kx == x || ky == y,
+                            // Ellipse inclusion: (dx/rx)^2 + (dy/ry)^2 <= 1
+                            // When half_w == half_h this is a circle.
+                            KernelShape::Circle => {
+                                let dx = kx.abs_diff(x) as f64;
+                                let dy = ky.abs_diff(y) as f64;
+                                (dx * dx) / rw_sq + (dy * dy) / rh_sq <= 1.0
+                            }
+                        };
+
+                        if include {
+                            let val = input_raw[row_offset + kx as usize];
+                            if val < local_min {
+                                local_min = val;
+                            }
+                            if val > local_max {
+                                local_max = val;
+                            }
                         }
                     }
                 }
+
+                row[x as usize] = match filter_type {
+                    FilterType::Min => local_min,
+                    FilterType::Max => local_max,
+                };
             }
+        });
 
-            let result_val = match filter_type {
-                FilterType::Min => local_min,
-                FilterType::Max => local_max,
-            };
+    output
+}
 
-            output.put_pixel(x, y, Luma([result_val]));
-        }
-    }
+/// Saturating per-pixel subtraction: result = max(a - b, 0).
+fn subtract_images(a: &GrayImage, b: &GrayImage) -> GrayImage {
+    let (width, height) = a.dimensions();
+    let mut output = GrayImage::new(width, height);
+
+    let a_raw = a.as_raw();
+    let b_raw = b.as_raw();
+
+    output
+        .as_mut()
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, out)| {
+            *out = a_raw[i].saturating_sub(b_raw[i]);
+        });
 
     output
 }
