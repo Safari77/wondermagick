@@ -1,0 +1,1 @@
+wm-convert TRAIN_DIBCO2009_H04_source.png -resize 400% -unsharp 0x5 -normalize-background 555  -wolf-jolion 50,0.3 -morphology close,circle,5  -connected-components 150 TRAIN_DIBCO2009_H04_nb.wolf_50_0.3.close5.cc150.png

@@ -20,6 +20,7 @@ use crate::{
     operations::{
         Bm3dConfig, ConnectedComponentsConfig, DespeckleConfig, MonochromeConfig, MorphologyConfig,
         NormalizeBackgroundConfig, Operation, PruneConfig, RewriteOperation, SauvolaConfig,
+        WolfJolionConfig,
     },
     wm_try,
 };
@@ -224,6 +225,13 @@ impl ExecutionPlan {
                     .ok_or_else(|| ArgParseErr::with_msg("sauvola: value is not valid UTF-8"))?;
                 let config = SauvolaConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Sauvola(config));
+            }
+            Arg::WolfJolion => {
+                let val_str = value.unwrap().to_str().ok_or_else(|| {
+                    ArgParseErr::with_msg("wolf-jolion: value is not valid UTF-8")
+                })?;
+                let config = WolfJolionConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::WolfJolion(config));
             }
             Arg::ConnectedComponents => {
                 let val_str = value.unwrap().to_str().ok_or_else(|| {

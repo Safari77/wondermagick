@@ -12,6 +12,8 @@ mod morphology;
 mod sauvola;
 pub use morphology::MorphologyConfig;
 pub use sauvola::SauvolaConfig;
+mod wolf_jolion;
+pub use wolf_jolion::WolfJolionConfig;
 mod connected_components;
 pub use connected_components::ConnectedComponentsConfig;
 mod negate;
@@ -57,6 +59,7 @@ pub enum Operation {
     Monochrome(MonochromeConfig),
     Unsharpen(UnsharpenGeometry),
     Sauvola(SauvolaConfig),
+    WolfJolion(WolfJolionConfig),
     ConnectedComponents(ConnectedComponentsConfig),
     Morphology(MorphologyConfig),
     Skeleton,
@@ -87,6 +90,7 @@ impl Operation {
             Operation::Monochrome(config) => monochrome::monochrome(image, config),
             Operation::Unsharpen(geom) => unsharpen::unsharpen(image, geom),
             Operation::Sauvola(config) => sauvola::sauvola(image, config),
+            Operation::WolfJolion(config) => wolf_jolion::wolf_jolion(image, config),
             Operation::ConnectedComponents(config) => {
                 connected_components::connected_components(image, config)
             }
@@ -121,6 +125,7 @@ impl Operation {
             Monochrome(_) => (),
             Unsharpen(_) => (),
             Sauvola(_) => (),
+            WolfJolion(_) => (),
             ConnectedComponents(_) => (),
             Morphology(_) => (),
             Skeleton => (),

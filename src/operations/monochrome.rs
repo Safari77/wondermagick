@@ -322,8 +322,7 @@ pub fn apply_blue_noise_scatter(image: &mut GrayImage, config: &MonochromeConfig
             let attenuation = 1.0 - (distance_from_center / 127.5).clamp(0.0, 1.0);
 
             // Modulate the threshold
-            let dynamic_threshold =
-                127.5 + (noise * config.dither_noise * attenuation);
+            let dynamic_threshold = 127.5 + (noise * config.dither_noise * attenuation);
 
             // Thresholding
             let (new_val, color) = if current_val > dynamic_threshold {
