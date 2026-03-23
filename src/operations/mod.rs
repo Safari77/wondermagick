@@ -14,6 +14,8 @@ pub use morphology::MorphologyConfig;
 pub use sauvola::SauvolaConfig;
 mod wolf_jolion;
 pub use wolf_jolion::WolfJolionConfig;
+mod phansalkar;
+pub use phansalkar::PhansalkarConfig;
 mod connected_components;
 pub use connected_components::ConnectedComponentsConfig;
 mod negate;
@@ -60,6 +62,7 @@ pub enum Operation {
     Unsharpen(UnsharpenGeometry),
     Sauvola(SauvolaConfig),
     WolfJolion(WolfJolionConfig),
+    Phansalkar(PhansalkarConfig),
     ConnectedComponents(ConnectedComponentsConfig),
     Morphology(MorphologyConfig),
     Skeleton,
@@ -91,6 +94,7 @@ impl Operation {
             Operation::Unsharpen(geom) => unsharpen::unsharpen(image, geom),
             Operation::Sauvola(config) => sauvola::sauvola(image, config),
             Operation::WolfJolion(config) => wolf_jolion::wolf_jolion(image, config),
+            Operation::Phansalkar(config) => phansalkar::phansalkar(image, config),
             Operation::ConnectedComponents(config) => {
                 connected_components::connected_components(image, config)
             }
@@ -126,6 +130,7 @@ impl Operation {
             Unsharpen(_) => (),
             Sauvola(_) => (),
             WolfJolion(_) => (),
+            Phansalkar(_) => (),
             ConnectedComponents(_) => (),
             Morphology(_) => (),
             Skeleton => (),
