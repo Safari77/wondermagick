@@ -16,6 +16,7 @@ pub enum GrayscaleMethod {
     Rec601Luminance,
     Rec709Luma,
     Rec709Luminance,
+    OklabLuminance,
 }
 
 impl TryFrom<&std::ffi::OsStr> for GrayscaleMethod {
@@ -38,6 +39,10 @@ mod tests {
         assert_eq!(
             GrayscaleMethod::from_str("Rec709Luma"),
             Ok(GrayscaleMethod::Rec709Luma)
+        );
+        assert_eq!(
+            GrayscaleMethod::from_str("OklabLuminance"),
+            Ok(GrayscaleMethod::OklabLuminance)
         );
     }
 
