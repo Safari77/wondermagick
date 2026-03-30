@@ -83,6 +83,9 @@ pub enum Arg {
     Skeleton,
     Prune,
     NormalizeBackground,
+    Otsu,
+    Kapur,
+    EqualizeHistogram,
 }
 
 impl Arg {
@@ -120,6 +123,9 @@ impl Arg {
             Arg::Phansalkar => true,
             Arg::ConnectedComponents => true,
             Arg::Morphology => true,
+            Arg::Otsu => false,
+            Arg::Kapur => false,
+            Arg::EqualizeHistogram => false,
         }
     }
 
@@ -157,6 +163,9 @@ impl Arg {
             Arg::Morphology => "apply mathematical morphology (format: method,shape,size | Methods: erode, dilate, open, close, tophat, bottomhat | Shapes: square, cross, circle, ellipse, rectangle | Size: odd int or WxH | e.g., 'close,cross,3' or 'bottomhat,ellipse,3x7')",
             Arg::Skeleton => "reduce binary shapes to a 1-pixel wide skeleton (Zhang-Suen thinning)",
             Arg::Prune => "remove short branches from a skeletonized image (use 'default' [3] or number of iterations)",
+            Arg::Otsu => "otsu threshold",
+            Arg::Kapur => "kapur threshold",
+            Arg::EqualizeHistogram => "equalize histogram",
         }
     }
 }

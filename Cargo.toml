@@ -9,7 +9,7 @@ repository = "https://github.com/Shnatsel/wondermagick"
 [dependencies]
 current_platform = "0.2.0"
 bytemuck = "1"
-image = { version = "0.25.9", default-features = false, features = ["rayon", "avif-native"] }
+image = { version = "0.25", default-features = false, features = ["rayon", "avif-native"] }
 pic-scale-safe = { version = "0.1", features = ["rayon"] }
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
@@ -22,6 +22,8 @@ oklab = "1.1.2"
 bm3d_core = { git = "https://github.com/Safari77/bm3d_core" }
 ndarray = "0.17"
 rayon = "1"
+#imageproc = "0.26"
+imageproc = { git = "https://github.com/Safari77/imageproc" }
 
 [features]
 default = ["hardened_malloc", "default-formats"]

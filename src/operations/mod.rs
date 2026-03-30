@@ -30,6 +30,7 @@ mod normalize_background;
 pub use normalize_background::NormalizeBackgroundConfig;
 mod bm3d;
 pub use bm3d::Bm3dConfig;
+mod contrast;
 
 use crate::{
     arg_parsers::{
@@ -68,6 +69,9 @@ pub enum Operation {
     Skeleton,
     Prune(PruneConfig),
     Bm3d(Bm3dConfig),
+    Otsu,
+    Kapur,
+    EqualizeHistogram,
 }
 
 impl Operation {
@@ -102,6 +106,9 @@ impl Operation {
             Operation::Skeleton => skeleton::skeleton(image),
             Operation::Prune(config) => prune::prune(image, config),
             Operation::Bm3d(config) => bm3d::bm3d(image, config),
+            Operation::Otsu => contrast::otsu(image),
+            Operation::Kapur => contrast::kapur(image),
+            Operation::EqualizeHistogram => contrast::equalize_histogram(image),
         }
     }
 
@@ -136,6 +143,9 @@ impl Operation {
             Skeleton => (),
             Prune(_) => (),
             Bm3d(_) => (),
+            Otsu => (),
+            Kapur => (),
+            EqualizeHistogram => (),
         }
     }
 }

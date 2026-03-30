@@ -272,6 +272,9 @@ impl ExecutionPlan {
             Arg::Strip => {
                 self.modifiers.strip.set_all(true);
             }
+            Arg::Otsu => self.add_operation(Operation::Otsu),
+            Arg::Kapur => self.add_operation(Operation::Kapur),
+            Arg::EqualizeHistogram => self.add_operation(Operation::EqualizeHistogram),
             Arg::Thumbnail => {
                 self.add_operation(Operation::Thumbnail(
                     ResizeGeometry::try_from(value.unwrap())?,
