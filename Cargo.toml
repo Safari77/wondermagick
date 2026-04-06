@@ -24,6 +24,8 @@ ndarray = "0.17"
 rayon = "1"
 #imageproc = "0.26"
 imageproc = { git = "https://github.com/Safari77/imageproc" }
+cosmic-text = "0.18"
+tiny-skia = "0.12"
 
 [features]
 default = ["hardened_malloc", "default-formats"]

@@ -33,6 +33,8 @@ pub use bm3d::Bm3dConfig;
 mod contrast;
 mod quantize;
 pub use quantize::QuantizeConfig;
+mod text;
+pub use text::TextConfig;
 
 use crate::{
     arg_parsers::{
@@ -75,6 +77,7 @@ pub enum Operation {
     Kapur,
     EqualizeHistogram,
     Quantize(QuantizeConfig),
+    Text(TextConfig),
 }
 
 impl Operation {
@@ -113,6 +116,7 @@ impl Operation {
             Operation::Kapur => contrast::kapur(image),
             Operation::EqualizeHistogram => contrast::equalize_histogram(image),
             Operation::Quantize(config) => quantize::quantize(image, config),
+            Operation::Text(config) => text::render_text(image, config),
         }
     }
 
@@ -151,6 +155,7 @@ impl Operation {
             Kapur => (),
             EqualizeHistogram => (),
             Quantize(_) => (),
+            Text(_) => (),
         }
     }
 }
