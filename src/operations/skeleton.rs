@@ -130,7 +130,7 @@ where
     }
 
     // Condition 1: 2 <= B(P1) <= 6
-    if b < 2 || b > 6 {
+    if !(2..=6).contains(&b) {
         return false;
     }
 
