@@ -31,6 +31,8 @@ pub use normalize_background::NormalizeBackgroundConfig;
 mod bm3d;
 pub use bm3d::Bm3dConfig;
 mod contrast;
+mod quantize;
+pub use quantize::QuantizeConfig;
 
 use crate::{
     arg_parsers::{
@@ -72,6 +74,7 @@ pub enum Operation {
     Otsu,
     Kapur,
     EqualizeHistogram,
+    Quantize(QuantizeConfig),
 }
 
 impl Operation {
@@ -109,6 +112,7 @@ impl Operation {
             Operation::Otsu => contrast::otsu(image),
             Operation::Kapur => contrast::kapur(image),
             Operation::EqualizeHistogram => contrast::equalize_histogram(image),
+            Operation::Quantize(config) => quantize::quantize(image, config),
         }
     }
 
@@ -146,6 +150,7 @@ impl Operation {
             Otsu => (),
             Kapur => (),
             EqualizeHistogram => (),
+            Quantize(_) => (),
         }
     }
 }

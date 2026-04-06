@@ -1,4 +1,5 @@
 /target
+/tags
 .DS_Store
 *~
 .*.sw?

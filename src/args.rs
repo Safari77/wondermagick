@@ -86,6 +86,7 @@ pub enum Arg {
     Otsu,
     Kapur,
     EqualizeHistogram,
+    Quantize,
 }
 
 impl Arg {
@@ -126,6 +127,7 @@ impl Arg {
             Arg::Otsu => false,
             Arg::Kapur => false,
             Arg::EqualizeHistogram => false,
+            Arg::Quantize => true,
         }
     }
 
@@ -166,6 +168,7 @@ impl Arg {
             Arg::Otsu => "otsu threshold",
             Arg::Kapur => "kapur threshold",
             Arg::EqualizeHistogram => "equalize histogram",
+            Arg::Quantize => "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '256,0.5,-1.0', or 'default' — bias < 0.0 uses Oklab median-cut, 0.0 uses RGB K-means, >0.0 uses Oklab K-means++)",
         }
     }
 }

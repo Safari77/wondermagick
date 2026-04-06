@@ -19,8 +19,8 @@ use crate::{
     operations::Axis,
     operations::{
         Bm3dConfig, ConnectedComponentsConfig, DespeckleConfig, MonochromeConfig, MorphologyConfig,
-        NormalizeBackgroundConfig, Operation, PhansalkarConfig, PruneConfig, RewriteOperation,
-        SauvolaConfig, WolfJolionConfig,
+        NormalizeBackgroundConfig, Operation, PhansalkarConfig, PruneConfig, QuantizeConfig,
+        RewriteOperation, SauvolaConfig, WolfJolionConfig,
     },
     wm_try,
 };
@@ -255,6 +255,14 @@ impl ExecutionPlan {
                     .ok_or_else(|| ArgParseErr::with_msg("bm3d: value is not valid UTF-8"))?;
                 let config = Bm3dConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Bm3d(config));
+            }
+            Arg::Quantize => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("quantize: value is not valid UTF-8"))?;
+                let config = QuantizeConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::Quantize(config));
             }
             Arg::Negate => self.add_operation(Operation::Negate),
             Arg::Quality => self.modifiers.quality = Some(parse_numeric_arg(value.unwrap())?),
