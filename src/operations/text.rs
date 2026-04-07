@@ -1,9 +1,125 @@
-use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
-use cosmic_text::{
-    Align, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache,
-};
+use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image, wm_err};
+use cosmic_text::{Align, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
 use image::{DynamicImage, RgbaImage};
+use qrcode::{EcLevel, QrCode};
+use rayon::prelude::*;
 use tiny_skia::{BlendMode, ColorU8, Pixmap, PixmapPaint, PremultipliedColorU8, Transform};
+
+/// A parsed QR code block extracted from the text field.
+#[derive(Debug, Clone, PartialEq)]
+struct QrBlock {
+    pub ec_level: EcLevel,
+    pub content: String,
+    /// Gaussian blur sigma for the region under the QR code (0.0 = disabled).
+    pub blur_sigma: f32,
+    /// Light (background) color of the QR code modules.
+    pub light_color: (u8, u8, u8, u8),
+}
+
+/// A segment of the text field: either plain text or a QR code block.
+#[derive(Debug, Clone, PartialEq)]
+enum TextSegment {
+    Plain(String),
+    Qr(QrBlock),
+}
+
+/// Parse the text field into segments, handling `{QR:EcLevel:blur:light_color:content}` blocks
+/// and `\{QR` escape sequences.
+///
+/// - `{QR:L:0:#00000000:hello}` → QR block, no blur, transparent light color
+/// - `{QR:H:3.0:#FFFFFFCC:https://x.com}` → QR block, blur sigma=3.0, semi-opaque white light
+/// - `\{QR:L:...}` → literal text "{QR:L:...}"
+fn parse_text_segments(text: &str) -> Result<Vec<TextSegment>, ArgParseErr> {
+    let mut segments: Vec<TextSegment> = Vec::new();
+    let mut plain = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Handle escape: \{QR → literal {QR
+        if chars[i] == '\\' && i + 1 < len && chars[i + 1] == '{' {
+            // Check if this looks like an escaped QR block
+            let rest: String = chars[i + 1..].iter().collect();
+            if rest.starts_with("{QR") {
+                plain.push('{');
+                i += 2; // skip \ and {
+                continue;
+            }
+            // Not a QR escape, keep backslash as-is
+            plain.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // Detect {QR:...:...:...:...}
+        if chars[i] == '{' {
+            let rest: String = chars[i..].iter().collect();
+            if rest.starts_with("{QR:") {
+                // Find the closing brace
+                if let Some(close_pos) = rest.find('}') {
+                    let inner = &rest[4..close_pos]; // after "{QR:" and before "}"
+
+                    // Parse: EcLevel:blur_sigma:light_color:content
+                    // Split at first 3 colons to get 4 parts
+                    let mut parts = inner.splitn(4, ':');
+                    let ec_str = parts
+                        .next()
+                        .ok_or_else(|| ArgParseErr::with_msg("QR block missing EcLevel"))?;
+                    let blur_str = parts
+                        .next()
+                        .ok_or_else(|| ArgParseErr::with_msg("QR block missing blur sigma"))?;
+                    let light_str = parts
+                        .next()
+                        .ok_or_else(|| ArgParseErr::with_msg("QR block missing light_color"))?;
+                    let content = parts
+                        .next()
+                        .ok_or_else(|| ArgParseErr::with_msg("QR block missing content"))?;
+
+                    let ec_level = match ec_str {
+                        "L" => EcLevel::L,
+                        "M" => EcLevel::M,
+                        "Q" => EcLevel::Q,
+                        "H" => EcLevel::H,
+                        _ => {
+                            return Err(ArgParseErr::with_msg("QR EcLevel must be L, M, Q, or H"));
+                        }
+                    };
+
+                    let blur_sigma = blur_str.parse::<f32>().map_err(|_| {
+                        ArgParseErr::with_msg("QR blur must be a number (0 to disable, e.g. 3.0)")
+                    })?;
+
+                    let light_color = parse_hex_color(light_str)?;
+
+                    // Flush accumulated plain text
+                    if !plain.is_empty() {
+                        segments.push(TextSegment::Plain(std::mem::take(&mut plain)));
+                    }
+
+                    segments.push(TextSegment::Qr(QrBlock {
+                        ec_level,
+                        content: content.to_string(),
+                        blur_sigma,
+                        light_color,
+                    }));
+
+                    i += close_pos + 1; // skip past '}'
+                    continue;
+                }
+            }
+        }
+
+        plain.push(chars[i]);
+        i += 1;
+    }
+
+    if !plain.is_empty() {
+        segments.push(TextSegment::Plain(plain));
+    }
+
+    Ok(segments)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FontSize {
@@ -51,7 +167,21 @@ impl Position {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum TextEffect {
+    /// No background effect, raw text.
+    None,
+    /// Gaussian-blur the region behind the text bounding box.
+    Blur { sigma: f32 },
+    /// Subtitle-style outline via morphological dilation of the text alpha mask.
+    Outline {
+        thickness: u32,
+        color: (u8, u8, u8, u8),
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextConfig {
+    pub effect: TextEffect,
     pub text: String,
     pub font_name: String,
     pub font_size: FontSize,
@@ -84,15 +214,34 @@ fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8, u8), ArgParseErr> {
 }
 
 impl TextConfig {
-    /// Format: "text,font_name,font_size,color,rotation,justify,x,y"
-    /// Example: "Hello\nWorld,Arial,5%,#FF000080,-45.0,center,center,80%"
+    /// Format: "effect,text,font_name,font_size,color,rotation,justify,x,y"
+    ///
+    /// Effect values:
+    ///   - `none`                 — plain text, no background effect
+    ///   - `blur:5.0`             — blur background behind text (sigma=5.0)
+    ///   - `outline:3:#000000FF`  — subtitle-style outline (thickness 3, black)
+    ///
+    /// Example: "outline:3:#000000FF,Hello\\nWorld,Arial,5%,#FFFFFF,-45.0,center,center,80%"
     /// Position units: px (absolute), % (0%=start, 100%=end-aligned), em (font-size-relative), center
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
-        let mut parts: Vec<&str> = s.rsplitn(8, ',').collect();
+        // Split effect (first field) from the rest.
+        // Effect uses colons internally, never commas, so the first comma is the boundary.
+        let first_comma = s.find(',').ok_or_else(|| {
+            ArgParseErr::with_msg(
+                "text requires 9 comma-separated values: \
+                 effect,text,font_name,font_size,color,rotation,justify,x,y",
+            )
+        })?;
+        let effect_str = &s[..first_comma];
+        let rest = &s[first_comma + 1..];
+
+        let effect = Self::parse_effect(effect_str)?;
+
+        let mut parts: Vec<&str> = rest.rsplitn(8, ',').collect();
         if parts.len() != 8 {
             return Err(ArgParseErr::with_msg(
-                "text requires exactly 8 comma-separated values: \
-                 text,font_name,font_size,color,rotation,justify,x,y",
+                "text requires 9 comma-separated values: \
+                 effect,text,font_name,font_size,color,rotation,justify,x,y",
             ));
         }
         parts.reverse();
@@ -136,6 +285,7 @@ impl TextConfig {
         let y = Position::parse(parts[7])?;
 
         Ok(Self {
+            effect,
             text,
             font_name,
             font_size,
@@ -146,9 +296,309 @@ impl TextConfig {
             y,
         })
     }
+
+    fn parse_effect(s: &str) -> Result<TextEffect, ArgParseErr> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("none") {
+            return Ok(TextEffect::None);
+        }
+        if let Some(sigma_str) = s.strip_prefix("blur:") {
+            let sigma = sigma_str.parse::<f32>().map_err(|_| {
+                ArgParseErr::with_msg("blur effect requires a float sigma (e.g. 'blur:5.0')")
+            })?;
+            return Ok(TextEffect::Blur { sigma });
+        }
+        if let Some(rest) = s.strip_prefix("outline:") {
+            // Format: outline:thickness:#color
+            let colon_pos = rest.find(':').ok_or_else(|| {
+                ArgParseErr::with_msg(
+                    "outline effect requires thickness:color (e.g. 'outline:3:#000000FF')",
+                )
+            })?;
+            let thickness_str = &rest[..colon_pos];
+            let color_str = &rest[colon_pos + 1..];
+            let thickness = thickness_str.parse::<u32>().map_err(|_| {
+                ArgParseErr::with_msg("outline thickness must be a positive integer")
+            })?;
+            if thickness == 0 {
+                return Err(ArgParseErr::with_msg("outline thickness must be >= 1"));
+            }
+            let color = parse_hex_color(color_str)?;
+            return Ok(TextEffect::Outline { thickness, color });
+        }
+        Err(ArgParseErr::with_msg(
+            "effect must be 'none', 'blur:<sigma>', or 'outline:<thickness>:<#color>'",
+        ))
+    }
+}
+
+/// Blur the region of `main_pixmap` that falls under a rotated mask.
+///
+/// `mask_src` is a solid-filled pixmap (e.g. the size of the QR or text layer).
+/// `transform` is the same transform used to composite the content.
+/// The blurred source comes from `source_image`.
+fn apply_blur_under_rotated_region(
+    main_pixmap: &mut Pixmap,
+    source_image: &Image,
+    mask_src: &Pixmap,
+    transform: Transform,
+    sigma: f32,
+    img_w: u32,
+    img_h: u32,
+) {
+    let blurred = source_image.pixels.blur(sigma);
+    let blurred_rgba = blurred.to_rgba8();
+
+    // Draw the solid mask through the rotation transform to get the rotated footprint
+    let mut mask_full = Pixmap::new(img_w, img_h).expect("Failed to allocate mask pixmap");
+    mask_full.draw_pixmap(
+        0,
+        0,
+        mask_src.as_ref(),
+        &PixmapPaint {
+            opacity: 1.0,
+            blend_mode: BlendMode::SourceOver,
+            quality: tiny_skia::FilterQuality::Bilinear,
+        },
+        transform,
+        None,
+    );
+
+    // Blend: where mask alpha > 0, lerp blurred into main
+    for (i, mask_px) in mask_full.pixels().iter().enumerate() {
+        let ma = mask_px.alpha() as u32;
+        if ma == 0 {
+            continue;
+        }
+        let x = (i as u32) % img_w;
+        let y = (i as u32) / img_w;
+        let bp = blurred_rgba.get_pixel(x, y);
+        let blurred_pre = ColorU8::from_rgba(bp[0], bp[1], bp[2], bp[3]).premultiply();
+
+        let orig = main_pixmap.pixels()[i];
+        let inv = 255 - ma;
+        let out_r = ((blurred_pre.red() as u32 * ma + orig.red() as u32 * inv) / 255) as u8;
+        let out_g = ((blurred_pre.green() as u32 * ma + orig.green() as u32 * inv) / 255) as u8;
+        let out_b = ((blurred_pre.blue() as u32 * ma + orig.blue() as u32 * inv) / 255) as u8;
+        let out_a = ((blurred_pre.alpha() as u32 * ma + orig.alpha() as u32 * inv) / 255) as u8;
+
+        if let Some(c) = PremultipliedColorU8::from_rgba(out_r, out_g, out_b, out_a) {
+            main_pixmap.pixels_mut()[i] = c;
+        }
+    }
+}
+
+/// Morphological dilation on an alpha channel using a circular structuring element.
+/// `thickness` is the kernel diameter (will be forced to odd).
+fn dilate_alpha(alpha: &[u8], width: u32, height: u32, thickness: u32) -> Vec<u8> {
+    let ksize = if thickness % 2 == 0 {
+        thickness + 1
+    } else {
+        thickness
+    };
+    let half = ksize / 2;
+    let half_f = half as f64;
+    let r_sq = half_f * half_f;
+
+    let w = width as usize;
+    let mut output = vec![0u8; alpha.len()];
+
+    // Process rows in parallel
+    output
+        .par_chunks_mut(w)
+        .enumerate()
+        .for_each(|(y_idx, row)| {
+            let y = y_idx as u32;
+            let y_start = y.saturating_sub(half);
+            let y_end = (y + half).min(height - 1);
+
+            for x in 0..width {
+                let x_start = x.saturating_sub(half);
+                let x_end = (x + half).min(width - 1);
+                let mut local_max = 0u8;
+
+                for ky in y_start..=y_end {
+                    for kx in x_start..=x_end {
+                        // Circular structuring element
+                        let dx = kx.abs_diff(x) as f64;
+                        let dy = ky.abs_diff(y) as f64;
+                        if dx * dx + dy * dy <= r_sq {
+                            let val = alpha[ky as usize * w + kx as usize];
+                            if val > local_max {
+                                local_max = val;
+                            }
+                        }
+                    }
+                }
+                row[x as usize] = local_max;
+            }
+        });
+
+    output
+}
+
+/// Render a QR code block onto the image, using the same position/rotation/color
+/// system as text rendering. The QR code size is determined by font_size.
+/// Renders at 4x internal resolution to anti-alias rotated edges.
+fn render_qr_block(
+    image: &mut Image,
+    config: &TextConfig,
+    qr: &QrBlock,
+) -> Result<(), MagickError> {
+    let rgba_img = image.pixels.to_rgba8();
+    let (img_w, img_h) = rgba_img.dimensions();
+
+    let qr_size = match config.font_size {
+        FontSize::Absolute(v) => v,
+        FontSize::RelativePercent(pct) => (img_h as f32 * (pct / 100.0)).max(1.0),
+    };
+
+    let code = QrCode::with_error_correction_level(qr.content.as_bytes(), qr.ec_level)
+        .map_err(|e| wm_err!("QR generation failed: {}", e))?;
+
+    let (r, g, b, a) = config.color;
+    let (lr, lg, lb, la) = qr.light_color;
+
+    // Render QR at 4x supersampled resolution for smooth rotated edges
+    let ss = 4u32;
+    let ss_size = qr_size as u32 * ss;
+    let qr_rgba: RgbaImage = code
+        .render::<image::Rgba<u8>>()
+        .dark_color(image::Rgba([r, g, b, a]))
+        .light_color(image::Rgba([lr, lg, lb, la]))
+        .min_dimensions(ss_size, ss_size)
+        .build();
+
+    let (ss_w, ss_h) = qr_rgba.dimensions();
+    // Final display size after downscale
+    let qw = ss_w / ss;
+    let qh = ss_h / ss;
+
+    // Build a tiny_skia pixmap from the supersampled QR image
+    let mut qr_pixmap = Pixmap::new(ss_w, ss_h).expect("Failed to allocate QR pixmap");
+    for (src, dst) in qr_rgba.pixels().zip(qr_pixmap.pixels_mut()) {
+        *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    }
+
+    // Compute the bounding box of the QR after rotation so positioning
+    // accounts for the full rotated extent (prevents corner clipping).
+    let angle_rad = config.rotation.to_radians();
+    let cos_a = angle_rad.cos().abs();
+    let sin_a = angle_rad.sin().abs();
+    let rot_w = qw as f32 * cos_a + qh as f32 * sin_a;
+    let rot_h = qw as f32 * sin_a + qh as f32 * cos_a;
+
+    // Resolve position using the *rotated* bounding box size so that e.g.
+    // x=0 means the leftmost rotated corner sits at x=0.
+    let desired_x = config.x.resolve(img_w as f32, rot_w, qr_size);
+    let desired_y = config.y.resolve(img_h as f32, rot_h, qr_size);
+
+    // The rotation pivot is at (qw/2, qh/2) relative to the translate origin.
+    // After rotation the bounding box top-left shifts by (rot_w-qw)/2 in each axis.
+    // Compensate so the *rotated* box lands at (desired_x, desired_y).
+    let start_x = desired_x + (rot_w - qw as f32) / 2.0;
+    let start_y = desired_y + (rot_h - qh as f32) / 2.0;
+
+    // Scale down from supersampled size + translate + rotate
+    let scale = 1.0 / ss as f32;
+    let transform = Transform::from_translate(start_x, start_y)
+        .pre_concat(Transform::from_rotate_at(
+            config.rotation,
+            qw as f32 / 2.0,
+            qh as f32 / 2.0,
+        ))
+        .pre_concat(Transform::from_scale(scale, scale));
+
+    // Start with the original image as the base
+    let mut main_pixmap = Pixmap::new(img_w, img_h).expect("Failed to allocate main pixmap");
+    for (src, dst) in rgba_img.pixels().zip(main_pixmap.pixels_mut()) {
+        *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    }
+
+    // If blur_sigma > 0, blur the region under the *rotated* QR footprint.
+    if qr.blur_sigma > 0.0 {
+        let mut mask_src = Pixmap::new(ss_w, ss_h).expect("Failed to allocate mask source pixmap");
+        for px in mask_src.pixels_mut() {
+            *px = PremultipliedColorU8::from_rgba(255, 255, 255, 255).unwrap();
+        }
+        apply_blur_under_rotated_region(
+            &mut main_pixmap,
+            image,
+            &mask_src,
+            transform,
+            qr.blur_sigma,
+            img_w,
+            img_h,
+        );
+    }
+
+    // Composite the QR code on top of the (optionally blurred) base
+    main_pixmap.draw_pixmap(
+        0,
+        0,
+        qr_pixmap.as_ref(),
+        &PixmapPaint {
+            opacity: 1.0,
+            blend_mode: BlendMode::SourceOver,
+            quality: tiny_skia::FilterQuality::Bilinear,
+        },
+        transform,
+        None,
+    );
+
+    let mut out_rgba = RgbaImage::new(img_w, img_h);
+    for (src, dst) in main_pixmap.pixels().iter().zip(out_rgba.pixels_mut()) {
+        let un_pre = src.demultiply();
+        *dst = image::Rgba([un_pre.red(), un_pre.green(), un_pre.blue(), un_pre.alpha()]);
+    }
+
+    image.pixels = DynamicImage::ImageRgba8(out_rgba);
+    Ok(())
 }
 
 pub fn render_text(image: &mut Image, config: &TextConfig) -> Result<(), MagickError> {
+    // Parse text for QR blocks and escape sequences
+    let segments = parse_text_segments(&config.text).map_err(|e| wm_err!("{:?}", e.message))?;
+
+    // If the entire text is a single QR block, render only the QR code
+    if segments.len() == 1 {
+        if let TextSegment::Qr(ref qr) = segments[0] {
+            return render_qr_block(image, config, qr);
+        }
+    }
+
+    // For mixed content or plain text, render QR blocks first (each one composited),
+    // then render the remaining plain text on top.
+    for seg in &segments {
+        if let TextSegment::Qr(ref qr) = seg {
+            render_qr_block(image, config, qr)?;
+        }
+    }
+
+    // Collect plain text portions (skip QR blocks)
+    let plain_text: String = segments
+        .iter()
+        .map(|s| match s {
+            TextSegment::Plain(t) => t.as_str(),
+            TextSegment::Qr(_) => "",
+        })
+        .collect();
+
+    // If there's no plain text left, we're done
+    if plain_text.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Render the plain text portion using the original text rendering pipeline,
+    // but with QR blocks stripped out.
+    let text_config = TextConfig {
+        text: plain_text,
+        ..config.clone()
+    };
+    render_text_inner(image, &text_config)
+}
+
+fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), MagickError> {
     let rgba_img = image.pixels.to_rgba8();
     let (img_w, img_h) = rgba_img.dimensions();
 
@@ -355,18 +805,109 @@ pub fn render_text(image: &mut Image, config: &TextConfig) -> Result<(), MagickE
         Transform::from_rotate_at(config.rotation, text_w / 2.0, text_h / 2.0),
     );
 
-    main_pixmap.draw_pixmap(
-        0,
-        0,
-        text_pixmap.as_ref(),
-        &PixmapPaint {
-            opacity: 1.0,
-            blend_mode: BlendMode::SourceOver,
-            quality: tiny_skia::FilterQuality::Bilinear,
-        },
-        transform,
-        None,
-    );
+    let paint = PixmapPaint {
+        opacity: 1.0,
+        blend_mode: BlendMode::SourceOver,
+        quality: tiny_skia::FilterQuality::Bilinear,
+    };
+
+    // Apply the configured background effect
+    match &config.effect {
+        TextEffect::None => {}
+        TextEffect::Blur { sigma } => {
+            // Scan the text pixmap alpha to find the tight bounding box of
+            // the actually-rendered glyphs. This avoids line-height padding
+            // that makes the blur region asymmetric.
+            let pixels = text_pixmap.pixels();
+            let mut min_x = tw_u32;
+            let mut max_x = 0u32;
+            let mut min_y = th_u32;
+            let mut max_y = 0u32;
+            for py in 0..th_u32 {
+                for px in 0..tw_u32 {
+                    if pixels[(py * tw_u32 + px) as usize].alpha() > 0 {
+                        min_x = min_x.min(px);
+                        max_x = max_x.max(px);
+                        min_y = min_y.min(py);
+                        max_y = max_y.max(py);
+                    }
+                }
+            }
+
+            if max_x >= min_x && max_y >= min_y {
+                let glyph_w = (max_x - min_x + 1) as f32;
+                let glyph_h = (max_y - min_y + 1) as f32;
+
+                // Small symmetric margin around the tight glyph bounds
+                let blur_margin = font_size * 0.3;
+                let mask_w = (glyph_w + blur_margin * 2.0).ceil() as u32;
+                let mask_h = (glyph_h + blur_margin * 2.0).ceil() as u32;
+                let mut mask_src = Pixmap::new(mask_w.max(1), mask_h.max(1))
+                    .expect("Failed to allocate blur mask pixmap");
+                for px in mask_src.pixels_mut() {
+                    *px = PremultipliedColorU8::from_rgba(255, 255, 255, 255).unwrap();
+                }
+
+                // The glyph bounding box top-left within the text pixmap is (min_x, min_y).
+                // The text pixmap top-left on the canvas is (start_x, start_y).
+                // So the glyph top-left on the canvas is (start_x + min_x, start_y + min_y).
+                // The mask starts blur_margin before that.
+                let mask_x = start_x + min_x as f32 - blur_margin;
+                let mask_y = start_y + min_y as f32 - blur_margin;
+
+                // Rotate around the same pivot as the text pixmap so blur stays aligned.
+                // Text pivots at (start_x + text_w/2, start_y + text_h/2) in canvas space.
+                let pivot_x = start_x + text_w / 2.0 - mask_x;
+                let pivot_y = start_y + text_h / 2.0 - mask_y;
+                let mask_transform = Transform::from_translate(mask_x, mask_y)
+                    .pre_concat(Transform::from_rotate_at(config.rotation, pivot_x, pivot_y));
+
+                apply_blur_under_rotated_region(
+                    &mut main_pixmap,
+                    image,
+                    &mask_src,
+                    mask_transform,
+                    *sigma,
+                    img_w,
+                    img_h,
+                );
+            }
+        }
+        TextEffect::Outline { thickness, color } => {
+            // Extract alpha channel from text_pixmap
+            let pixels = text_pixmap.pixels();
+            let alpha_buf: Vec<u8> = pixels.iter().map(|px| px.alpha()).collect();
+
+            // Dilate the alpha channel using a circular structuring element
+            let dilated = dilate_alpha(&alpha_buf, tw_u32, th_u32, *thickness);
+
+            // Build an outline pixmap: dilated area filled with outline color
+            let mut outline_pixmap =
+                Pixmap::new(tw_u32, th_u32).expect("Failed to allocate outline pixmap");
+            let (or, og, ob, oa) = *color;
+            for (i, out_px) in outline_pixmap.pixels_mut().iter_mut().enumerate() {
+                let da = dilated[i] as u32;
+                if da > 0 {
+                    // Modulate outline color alpha by the dilated mask
+                    let final_a = (oa as u32 * da) / 255;
+                    let pr = (or as u32 * final_a) / 255;
+                    let pg = (og as u32 * final_a) / 255;
+                    let pb = (ob as u32 * final_a) / 255;
+                    if let Some(c) =
+                        PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, final_a as u8)
+                    {
+                        *out_px = c;
+                    }
+                }
+            }
+
+            // Composite outline first (behind text)
+            main_pixmap.draw_pixmap(0, 0, outline_pixmap.as_ref(), &paint, transform, None);
+        }
+    }
+
+    // Composite the text on top
+    main_pixmap.draw_pixmap(0, 0, text_pixmap.as_ref(), &paint, transform, None);
 
     let mut out_rgba = RgbaImage::new(img_w, img_h);
     for (src, dst) in main_pixmap.pixels().iter().zip(out_rgba.pixels_mut()) {
