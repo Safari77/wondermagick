@@ -35,6 +35,7 @@ mod quantize;
 pub use quantize::QuantizeConfig;
 mod text;
 pub use text::TextConfig;
+mod countcolors;
 
 use crate::{
     arg_parsers::{
@@ -78,6 +79,7 @@ pub enum Operation {
     EqualizeHistogram,
     Quantize(QuantizeConfig),
     Text(TextConfig),
+    CountColors,
 }
 
 impl Operation {
@@ -116,6 +118,7 @@ impl Operation {
             Operation::Kapur => contrast::kapur(image),
             Operation::EqualizeHistogram => contrast::equalize_histogram(image),
             Operation::Quantize(config) => quantize::quantize(image, config),
+            Operation::CountColors => countcolors::countcolors(image),
             Operation::Text(config) => text::render_text(image, config),
         }
     }
@@ -156,6 +159,7 @@ impl Operation {
             EqualizeHistogram => (),
             Quantize(_) => (),
             Text(_) => (),
+            CountColors => (),
         }
     }
 }

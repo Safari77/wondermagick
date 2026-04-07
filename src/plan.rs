@@ -264,6 +264,9 @@ impl ExecutionPlan {
                 let config = QuantizeConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Quantize(config));
             }
+            Arg::CountColors => {
+                self.add_operation(Operation::CountColors);
+            }
             Arg::Text => {
                 let val_str = value
                     .unwrap()

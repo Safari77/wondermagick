@@ -88,6 +88,7 @@ pub enum Arg {
     EqualizeHistogram,
     Quantize,
     Text,
+    CountColors,
 }
 
 impl Arg {
@@ -129,6 +130,7 @@ impl Arg {
             Arg::Kapur => false,
             Arg::EqualizeHistogram => false,
             Arg::Quantize => true,
+            Arg::CountColors => false,
             Arg::Text => true,
         }
     }
@@ -171,6 +173,7 @@ impl Arg {
             Arg::Kapur => "kapur threshold",
             Arg::EqualizeHistogram => "equalize histogram",
             Arg::Quantize => "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '256,0.5,-1.0', or 'default' — bias < 0.0 uses Oklab median-cut, 0.0 uses RGB K-means, >0.0 uses Oklab K-means++)",
+            Arg::CountColors => "count the number of unique colors in the image",
             Arg::Text => "render rotated multi-line text (format: 'text,font,size,color,rotation,justify,x,y' | e.g. 'Hello,Arial,5%,#FF000080,45.0,center,center,80%')",
         }
     }
