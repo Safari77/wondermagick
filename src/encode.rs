@@ -1,6 +1,5 @@
 use std::{
     ffi::OsStr,
-    fs::File,
     io::{BufWriter, Seek, Write},
     path::Path,
 };
@@ -52,7 +51,7 @@ pub fn encode(
         image.exif = exif;
     }
     if icc.is_some() {
-        image.exif = icc;
+        image.icc = icc;
     }
 
     result
@@ -66,14 +65,24 @@ fn encode_inner(
 ) -> Result<(), MagickError> {
     let format = choose_encoding_format(image, location, format)?;
 
-    let file = match location {
-        // `File::create` automatically truncates (overwrites) the file if it exists.
-        Location::Path(path) => File::create(path)
-            .map_err(|error| wm_err!("unable to open image '{}': {error}", path.display()))?,
+    let (file, temp_path) = match location {
+        // Safely write to a temporary file first, then atomically move it to the destination.
+        Location::Path(path) => {
+            let parent = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            let named_temp = tempfile::Builder::new()
+                .tempfile_in(parent)
+                .map_err(|error| wm_err!("unable to open image '{}': {error}", path.display()))?;
+            let (file, temp_path) = named_temp.into_parts();
+            (file, Some(temp_path))
+        }
         // Some of the encoders require Seek, which Stdout doesn't implement.
         // We write to a temporary file and then print out the content at the end.
-        Location::Stdio => wm_try!(tempfile::tempfile()),
+        Location::Stdio => (wm_try!(tempfile::tempfile()), None),
     };
+
     // Wrap in BufWriter for performance
     let mut writer = BufWriter::new(file);
 
@@ -97,11 +106,17 @@ fn encode_inner(
     }
 
     match location {
-        Location::Path(_) => {
+        Location::Path(path) => {
             // Flush the buffers to write everything to disk.
-            // The buffers will be flushed automatically when the writer goes out of scope,
-            // but that will not report any errors. This handles errors.
-            wm_try!(writer.flush());
+            let file = wm_try!(writer.into_inner());
+            wm_try!(file.sync_all());
+            drop(file);
+
+            if let Some(tp) = temp_path {
+                tp.persist(path).map_err(|error| {
+                    wm_err!("unable to persist image to '{}': {error}", path.display())
+                })?;
+            }
         }
         Location::Stdio => {
             // Copy from the temporary file to stdout while handling errors
