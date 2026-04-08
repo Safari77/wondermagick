@@ -391,7 +391,7 @@ fn apply_blur_under_rotated_region(
 /// Morphological dilation on an alpha channel using a circular structuring element.
 /// `thickness` is the kernel diameter (will be forced to odd).
 fn dilate_alpha(alpha: &[u8], width: u32, height: u32, thickness: u32) -> Vec<u8> {
-    let ksize = if thickness % 2 == 0 {
+    let ksize = if thickness.is_multiple_of(2) {
         thickness + 1
     } else {
         thickness
