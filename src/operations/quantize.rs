@@ -8,6 +8,7 @@ pub struct QuantizeConfig {
     pub dither_level: f32, // 0.0 means disabled, 1.0 means full dither
     pub bias: f32, // <0.0 uses Oklab median-cut, 0.0 means classic k-means, >0.0 uses Oklab k-means++
     pub light_boost: f32, // >1.0 preserves bright detail, 1.0 is neutral (only used with Oklab k-means++)
+    pub lc_priority: f32, // 0.0 = equalize lightness only, 1.0 = equalize chroma only, 0.5 = both equally
 }
 
 impl Default for QuantizeConfig {
@@ -17,6 +18,7 @@ impl Default for QuantizeConfig {
             dither_level: 0.0,
             bias: 0.0,
             light_boost: 1.0,
+            lc_priority: 0.0,
         }
     }
 }
@@ -24,7 +26,8 @@ impl Default for QuantizeConfig {
 impl QuantizeConfig {
     /// Parse from a comma-separated string of three values, or "default".
     /// Format: "colors,dither_level,bias" or "colors,dither_level,bias:light_boost"
-    /// Example: "16,1.0,0.5", "8,0.1,1.0:5.5", "256,0.5,-1.0" or "default"
+    /// or "colors,dither_level,bias:light_boost:lc_priority"
+    /// Example: "16,1.0,0.5", "8,0.1,1.0:5.5", "4,0.1,1.0:1.5:0.5", "256,0.5,-1.0" or "default"
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("default") {
@@ -35,7 +38,7 @@ impl QuantizeConfig {
         if parts.len() != 3 {
             return Err(ArgParseErr::with_msg(
                 "quantize requires 'default' or exactly 3 comma-separated values: \
-                 colors,dither_level,bias (bias may include :light_boost, e.g. 1.0:5.5)",
+                 colors,dither_level,bias (bias may include :light_boost:lc_priority, e.g. 1.0:5.5:0.5)",
             ));
         }
 
@@ -48,21 +51,29 @@ impl QuantizeConfig {
             .parse::<f32>()
             .map_err(|_| ArgParseErr::with_msg("invalid dither_level value (must be float)"))?;
 
-        // bias field supports optional :light_boost suffix (e.g. "1.0:5.5")
+        // bias field supports optional :light_boost and :lc_priority suffixes
+        // (e.g. "1.0:5.5" or "1.0:5.5:0.5")
         let bias_str = parts[2].trim();
-        let (bias, light_boost) = if let Some((b, lb)) = bias_str.split_once(':') {
-            let bias = b
+        let colon_parts: Vec<&str> = bias_str.split(':').collect();
+        let bias = colon_parts[0]
+            .parse::<f32>()
+            .map_err(|_| ArgParseErr::with_msg("invalid bias value (must be float)"))?;
+        let light_boost = if colon_parts.len() > 1 {
+            colon_parts[1]
                 .parse::<f32>()
-                .map_err(|_| ArgParseErr::with_msg("invalid bias value (must be float)"))?;
-            let light_boost = lb
-                .parse::<f32>()
-                .map_err(|_| ArgParseErr::with_msg("invalid light_boost value (must be float)"))?;
-            (bias, light_boost)
+                .map_err(|_| ArgParseErr::with_msg("invalid light_boost value (must be float)"))?
         } else {
-            let bias = bias_str
+            1.0
+        };
+        let lc_priority = if colon_parts.len() > 2 {
+            colon_parts[2]
                 .parse::<f32>()
-                .map_err(|_| ArgParseErr::with_msg("invalid bias value (must be float)"))?;
-            (bias, 1.0)
+                .map_err(|_| {
+                    ArgParseErr::with_msg("invalid lc_priority value (must be float 0.0-1.0)")
+                })?
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
         };
 
         Ok(Self {
@@ -70,6 +81,7 @@ impl QuantizeConfig {
             dither_level,
             bias,
             light_boost,
+            lc_priority,
         })
     }
 }
@@ -94,6 +106,7 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
             config.colors as usize,
             config.bias,
             config.light_boost,
+            config.lc_priority,
         )
     } else {
         generate_palette_rgb(&pixels, config.colors as usize)
@@ -469,6 +482,7 @@ fn generate_palette_oklab(
     dominant_colors: usize,
     sat_bias: f32,
     light_boost: f32,
+    lc_priority: f32,
 ) -> Vec<[u8; 3]> {
     let k = dominant_colors.max(1);
     let oklab_pixels: Vec<Oklab> = rgb_pixels.par_iter().map(|&p| srgb_to_oklab(p)).collect();
@@ -478,11 +492,11 @@ fn generate_palette_oklab(
     }
 
     // 1. Lightness weighting & exponential chroma boost.
-    // Parabolic curve p.l*(1-p.l)^(1/light_boost) peaks at mid-lightness
-    // and rolls off toward both near-black and near-white, so neither
-    // extreme hogs palette slots. light_boost > 1.0 flattens the bright
-    // rolloff to preserve highlight detail. No dead zones — full
-    // differentiation across the entire lightness range.
+    // Asymmetric curve: dark side uses sqrt rolloff so near-black
+    // doesn't hog palette slots; bright side uses a very gentle
+    // rolloff controlled by light_boost so highlight detail is
+    // preserved. light_boost > 1.0 makes the bright exponent
+    // smaller, keeping near-white pixels at nearly full weight.
 
     let (working_pixels, weights): (Vec<Oklab>, Vec<f32>) = oklab_pixels
         .par_iter()
@@ -493,11 +507,17 @@ fn generate_palette_oklab(
             }
 
             let chroma = (p.a * p.a + p.b * p.b).sqrt();
-            // Parabolic curve: peaks at mid-lightness, rolls off toward
-            // both near-black and near-white so neither extreme hogs
-            // palette slots. light_boost > 1.0 flattens the bright-side
-            // rolloff so bright detail is preserved.
-            let base = (p.l * (1.0 - p.l).powf(1.0 / light_boost.max(0.1))).sqrt() * 2.0;
+            // Asymmetric lightness curve: dark side rolls off with a fixed
+            // sqrt to prevent near-black from hogging slots; bright side
+            // uses a very gentle rolloff controlled by light_boost so that
+            // highlights keep their weight when light_boost > 1.0.
+            // At light_boost == 1.0 both sides behave identically (exponent 1.0).
+            // At light_boost == 5.0 the bright exponent is 0.2, so L=0.95
+            // gets weight ≈0.97 instead of ≈0.72 — virtually no penalty.
+            let dark_side = p.l.sqrt();
+            let bright_exp = 1.0 / light_boost.max(0.1);
+            let bright_side = (1.0 - p.l).powf(bright_exp * 0.5);
+            let base = (dark_side * bright_side) * 2.0;
 
             let color_boost = 1.0 + (chroma * 15.0).powf(1.5) * sat_bias;
             Some((p, base * color_boost))
@@ -562,27 +582,75 @@ fn generate_palette_oklab(
         }
     }
 
-    // Lightness histogram equalization: boost rare lightness bands so
-    // small dark or bright regions aren't drowned by dominant mid-tones.
-    // Same sqrt-equalization pattern as the hue zones above.
-    const L_BINS: usize = 16;
-    let mut l_bin_weights = [0.0f32; L_BINS];
+    // Independent lightness and chroma histogram equalization.
+    // Two 16-bin histograms (one for L, one for chroma) are computed
+    // separately, and their equalization factors are blended via
+    // lc_priority: 0.0 = lightness only, 1.0 = chroma only, 0.5 = both.
+    const LC_BINS: usize = 16;
+
+    // Equalization strength scales with light_boost
+    let eq_power = (0.5_f32).max(1.0 - 0.5 / light_boost.max(0.1));
+
+    // --- Lightness histogram ---
+    let mut l_bin_weights = [0.0f32; LC_BINS];
     for (p, &w) in working_pixels.iter().zip(weights.iter()) {
-        let bin = ((p.l * L_BINS as f32) as usize).min(L_BINS - 1);
+        let bin = ((p.l * LC_BINS as f32) as usize).min(LC_BINS - 1);
         l_bin_weights[bin] += w;
     }
-    let active_l_bins = l_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
-    let avg_l_bin_weight = if active_l_bins > 0.0 {
-        l_bin_weights.iter().sum::<f32>() / active_l_bins
+    let active_l = l_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
+    let avg_l = if active_l > 0.0 {
+        l_bin_weights.iter().sum::<f32>() / active_l
     } else {
         1.0
     };
+
+    // --- Chroma histogram ---
+    // Find max chroma to scale bins across the image's actual range
+    let mut max_chroma = 0.0f32;
+    for p in working_pixels.iter() {
+        let c = (p.a * p.a + p.b * p.b).sqrt();
+        max_chroma = max_chroma.max(c);
+    }
+    let chroma_scale = if max_chroma > 1e-6 {
+        LC_BINS as f32 / max_chroma
+    } else {
+        1.0
+    };
+
+    let mut c_bin_weights = [0.0f32; LC_BINS];
+    for (p, &w) in working_pixels.iter().zip(weights.iter()) {
+        let chroma = (p.a * p.a + p.b * p.b).sqrt();
+        let bin = ((chroma * chroma_scale) as usize).min(LC_BINS - 1);
+        c_bin_weights[bin] += w;
+    }
+    let active_c = c_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
+    let avg_c = if active_c > 0.0 {
+        c_bin_weights.iter().sum::<f32>() / active_c
+    } else {
+        1.0
+    };
+
+    // --- Blend both equalization factors via lc_priority ---
+    let l_weight = 1.0 - lc_priority;
+    let c_weight = lc_priority;
     for (p, w) in working_pixels.iter().zip(weights.iter_mut()) {
-        let bin = ((p.l * L_BINS as f32) as usize).min(L_BINS - 1);
-        if l_bin_weights[bin] > 0.0 {
-            let eq = (avg_l_bin_weight / l_bin_weights[bin]).sqrt();
-            *w *= eq;
-        }
+        let l_bin = ((p.l * LC_BINS as f32) as usize).min(LC_BINS - 1);
+        let chroma = (p.a * p.a + p.b * p.b).sqrt();
+        let c_bin = ((chroma * chroma_scale) as usize).min(LC_BINS - 1);
+
+        let l_eq = if l_bin_weights[l_bin] > 0.0 {
+            (avg_l / l_bin_weights[l_bin]).powf(eq_power)
+        } else {
+            1.0
+        };
+        let c_eq = if c_bin_weights[c_bin] > 0.0 {
+            (avg_c / c_bin_weights[c_bin]).powf(eq_power)
+        } else {
+            1.0
+        };
+
+        // Geometric blend: eq = l_eq^(1-priority) * c_eq^priority
+        *w *= l_eq.powf(l_weight) * c_eq.powf(c_weight);
     }
 
     // Precompute chroma for each working pixel (avoids repeated sqrt in distance calc)
