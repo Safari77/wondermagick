@@ -27,7 +27,22 @@ impl QuantizeConfig {
     /// Parse from a comma-separated string of three values, or "default".
     /// Format: "colors,dither_level,bias" or "colors,dither_level,bias:light_boost"
     /// or "colors,dither_level,bias:light_boost:lc_priority"
-    /// Example: "16,1.0,0.5", "8,0.1,1.0:5.5", "4,0.1,1.0:1.5:0.5", "256,0.5,-1.0" or "default"
+    ///
+    ///   colors:  palette size (2-)
+    ///   dither:  error diffusion strength (0.0 = off, 1.0 = full)
+    ///   bias:    algorithm selector:
+    ///         < 0.0  Oklab median-cut (fast, good for flat art)
+    ///           0.0  RGB k-means
+    ///         > 0.0  Oklab k-means++ (perceptual, value = saturation boost)
+    ///
+    ///  Oklab k-means++ accepts optional suffixes after bias:
+    ///    bias:light_boost     highlight preservation (default 1.0, higher keeps brights)
+    ///    bias:light_boost:lc  equalization blend (0.0 = lightness, 1.0 = chroma, default 0.0)
+    ///
+    ///  Examples:  16,1.0,0.0      16 colors, full dither, RGB k-means
+    ///             8,0.5,-1.0       8 colors, half dither, Oklab median-cut
+    ///             32,0.2,0.5:3.0   32 colors, Oklab k-means++, sat boost 0.5, light_boost 3.0
+    ///           4,0.1,1.0:1.5:0.5  chroma+lightness equalization balanced
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("default") {
@@ -476,116 +491,45 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
         .collect()
 }
 
-/// K-means++ clustering with Logarithmic Culling and Oklch Distance (used when bias > 0.0)
+/// K-means++ clustering in Oklab with Oklch distance (used when bias > 0.0).
+///
+/// Histogram equalization across lightness and chroma ensures dark areas and
+/// minority colors get fair palette representation. sat_bias boosts saturated
+/// pixels' weight, light_boost controls equalization strength, and lc_priority
+/// blends between lightness-only (0.0) and chroma-only (1.0) equalization.
 fn generate_palette_oklab(
     rgb_pixels: &[[u8; 3]],
-    dominant_colors: usize,
+    k: usize,
     sat_bias: f32,
     light_boost: f32,
     lc_priority: f32,
 ) -> Vec<[u8; 3]> {
-    let k = dominant_colors.max(1);
+    let k = k.max(1);
     let oklab_pixels: Vec<Oklab> = rgb_pixels.par_iter().map(|&p| srgb_to_oklab(p)).collect();
 
     if oklab_pixels.is_empty() {
         return vec![[0, 0, 0]; k];
     }
 
-    // 1. Lightness weighting & exponential chroma boost.
-    // Asymmetric curve: dark side uses sqrt rolloff so near-black
-    // doesn't hog palette slots; bright side uses a very gentle
-    // rolloff controlled by light_boost so highlight detail is
-    // preserved. light_boost > 1.0 makes the bright exponent
-    // smaller, keeping near-white pixels at nearly full weight.
+    // 1. Per-pixel weights: uniform base with chroma boost controlled by sat_bias.
+    //    No pixels are culled — every pixel participates in clustering so the
+    //    final palette can represent the full image faithfully.
+    let chromas: Vec<f32> = oklab_pixels
+        .iter()
+        .map(|p| (p.a * p.a + p.b * p.b).sqrt())
+        .collect();
 
-    let (working_pixels, weights): (Vec<Oklab>, Vec<f32>) = oklab_pixels
-        .par_iter()
-        .filter_map(|&p| {
-            // THE HARD FLOOR: Only truly invisible black (L < 1%) is culled.
-            if p.l < 0.01 {
-                return None;
-            }
+    let mut weights: Vec<f32> = chromas
+        .iter()
+        .map(|&c| 1.0 + (c * 15.0).powf(1.5) * sat_bias)
+        .collect();
 
-            let chroma = (p.a * p.a + p.b * p.b).sqrt();
-            // Asymmetric lightness curve: dark side rolls off with a fixed
-            // sqrt to prevent near-black from hogging slots; bright side
-            // uses a very gentle rolloff controlled by light_boost so that
-            // highlights keep their weight when light_boost > 1.0.
-            // At light_boost == 1.0 both sides behave identically (exponent 1.0).
-            // At light_boost == 5.0 the bright exponent is 0.2, so L=0.95
-            // gets weight ≈0.97 instead of ≈0.72 — virtually no penalty.
-            let dark_side = p.l.sqrt();
-            let bright_exp = 1.0 / light_boost.max(0.1);
-            let bright_side = (1.0 - p.l).powf(bright_exp * 0.5);
-            let base = (dark_side * bright_side) * 2.0;
-
-            let color_boost = 1.0 + (chroma * 15.0).powf(1.5) * sat_bias;
-            Some((p, base * color_boost))
-        })
-        .unzip();
-
-    let mut working_pixels = working_pixels;
-    let mut weights = weights;
-
-    // Fallback: If the image is literally a pitch-black square, don't crash.
-    if working_pixels.len() < k {
-        working_pixels = oklab_pixels.to_vec();
-        weights = vec![1.0; oklab_pixels.len()];
-    }
-
-    // We group every pixel into one of 4 dominant color zones using Oklab's native axes.
-    let mut zone_weights = [0.0f32; 4];
-
-    for (p, &w) in working_pixels.iter().zip(weights.iter()) {
-        if p.a.abs() > p.b.abs() {
-            if p.a > 0.0 {
-                zone_weights[0] += w; // RED dominant
-            } else {
-                zone_weights[1] += w; // GREEN dominant
-            }
-        } else {
-            if p.b > 0.0 {
-                zone_weights[2] += w; // YELLOW dominant
-            } else {
-                zone_weights[3] += w; // BLUE dominant
-            }
-        }
-    }
-
-    // Find the average weight of an active zone
-    let active_zones = zone_weights.iter().filter(|&&w| w > 0.0).count() as f32;
-    let avg_zone_weight = if active_zones > 0.0 {
-        zone_weights.iter().sum::<f32>() / active_zones
-    } else {
-        1.0
-    };
-
-    // Equalize
-    for (p, w) in working_pixels.iter_mut().zip(weights.iter_mut()) {
-        let zone = if p.a.abs() > p.b.abs() {
-            if p.a > 0.0 {
-                0
-            } else {
-                1
-            }
-        } else {
-            if p.b > 0.0 {
-                2
-            } else {
-                3
-            }
-        };
-
-        if zone_weights[zone] > 0.0 {
-            let equalization_factor = (avg_zone_weight / zone_weights[zone]).sqrt();
-            *w *= equalization_factor;
-        }
-    }
-
-    // Independent lightness and chroma histogram equalization.
-    // Two 16-bin histograms (one for L, one for chroma) are computed
-    // separately, and their equalization factors are blended via
-    // lc_priority: 0.0 = lightness only, 1.0 = chroma only, 0.5 = both.
+    // 2. Histogram equalization across lightness and chroma.
+    //    Two independent 16-bin histograms are computed, and their equalization
+    //    factors are blended via lc_priority: 0.0 = lightness only, 1.0 = chroma
+    //    only, 0.5 = both equally. This is what preserves dark-area detail —
+    //    underrepresented lightness bins get boosted so k-means allocates
+    //    palette slots to them proportionally.
     const LC_BINS: usize = 16;
 
     // Equalization strength scales with light_boost
@@ -593,7 +537,7 @@ fn generate_palette_oklab(
 
     // --- Lightness histogram ---
     let mut l_bin_weights = [0.0f32; LC_BINS];
-    for (p, &w) in working_pixels.iter().zip(weights.iter()) {
+    for (p, &w) in oklab_pixels.iter().zip(weights.iter()) {
         let bin = ((p.l * LC_BINS as f32) as usize).min(LC_BINS - 1);
         l_bin_weights[bin] += w;
     }
@@ -606,11 +550,11 @@ fn generate_palette_oklab(
 
     // --- Chroma histogram ---
     // Find max chroma to scale bins across the image's actual range
-    let mut max_chroma = 0.0f32;
-    for p in working_pixels.iter() {
-        let c = (p.a * p.a + p.b * p.b).sqrt();
-        max_chroma = max_chroma.max(c);
-    }
+    let max_chroma = chromas
+        .iter()
+        .copied()
+        .max_by(|a, b| a.total_cmp(b))
+        .unwrap_or(0.0);
     let chroma_scale = if max_chroma > 1e-6 {
         LC_BINS as f32 / max_chroma
     } else {
@@ -618,9 +562,8 @@ fn generate_palette_oklab(
     };
 
     let mut c_bin_weights = [0.0f32; LC_BINS];
-    for (p, &w) in working_pixels.iter().zip(weights.iter()) {
-        let chroma = (p.a * p.a + p.b * p.b).sqrt();
-        let bin = ((chroma * chroma_scale) as usize).min(LC_BINS - 1);
+    for (&c, &w) in chromas.iter().zip(weights.iter()) {
+        let bin = ((c * chroma_scale) as usize).min(LC_BINS - 1);
         c_bin_weights[bin] += w;
     }
     let active_c = c_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
@@ -630,13 +573,12 @@ fn generate_palette_oklab(
         1.0
     };
 
-    // --- Blend both equalization factors via lc_priority ---
+    // --- Apply blended equalization ---
     let l_weight = 1.0 - lc_priority;
     let c_weight = lc_priority;
-    for (p, w) in working_pixels.iter().zip(weights.iter_mut()) {
-        let l_bin = ((p.l * LC_BINS as f32) as usize).min(LC_BINS - 1);
-        let chroma = (p.a * p.a + p.b * p.b).sqrt();
-        let c_bin = ((chroma * chroma_scale) as usize).min(LC_BINS - 1);
+    for (i, w) in weights.iter_mut().enumerate() {
+        let l_bin = ((oklab_pixels[i].l * LC_BINS as f32) as usize).min(LC_BINS - 1);
+        let c_bin = ((chromas[i] * chroma_scale) as usize).min(LC_BINS - 1);
 
         let l_eq = if l_bin_weights[l_bin] > 0.0 {
             (avg_l / l_bin_weights[l_bin]).powf(eq_power)
@@ -653,17 +595,11 @@ fn generate_palette_oklab(
         *w *= l_eq.powf(l_weight) * c_eq.powf(c_weight);
     }
 
-    // Precompute chroma for each working pixel (avoids repeated sqrt in distance calc)
-    let working_chromas: Vec<f32> = working_pixels
-        .iter()
-        .map(|p| (p.a * p.a + p.b * p.b).sqrt())
-        .collect();
-
-    // 2. Oklch distance metric — atan2-free using chord-based hue difference.
-    // Uses: ΔH² = Δa² + Δb² - ΔC² (standard CIEDE trick to avoid atan2).
-    // Then scales by effective_chroma² to match original weighting intent.
+    // 3. Oklch distance metric — atan2-free using chord-based hue difference.
+    //    Uses: ΔH² = Δa² + Δb² - ΔC² (standard CIEDE trick to avoid atan2).
+    //    Then scales by effective_chroma² to match original weighting intent.
     #[inline(always)]
-    fn calc_dist_fast(p: Oklab, p_c: f32, c: Oklab, c_c: f32) -> f32 {
+    fn oklch_dist(p: Oklab, p_c: f32, c: Oklab, c_c: f32) -> f32 {
         let mut effective_chroma = p_c.max(c_c);
 
         // Only apply the wedge to dark colors if they ACTUALLY have some color.
@@ -691,10 +627,10 @@ fn generate_palette_oklab(
         dl * dl + dc * dc + dh_weighted_sq
     }
 
-    // 3. K-Means++ initialization
-    let mut centroids = vec![working_pixels[0]; k];
+    // 4. K-Means++ initialization
+    let mut centroids = vec![oklab_pixels[0]; k];
     let mut centroid_chromas = vec![0.0f32; k];
-    let mut min_dists = vec![f32::MAX; working_pixels.len()]; // Cache nearest centroid distance
+    let mut min_dists = vec![f32::MAX; oklab_pixels.len()]; // Cache nearest centroid distance
 
     let mut rng_state: u64 = 0x5EED_C0DE_1234_5678;
     let mut xorshift = || -> u64 {
@@ -709,7 +645,7 @@ fn generate_palette_oklab(
     for (i, &w) in weights.iter().enumerate() {
         threshold -= w;
         if threshold <= 0.0 {
-            centroids[0] = working_pixels[i];
+            centroids[0] = oklab_pixels[i];
             break;
         }
     }
@@ -719,9 +655,9 @@ fn generate_palette_oklab(
 
     // Initial pass: populate min_dists for the first centroid
     min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
-        *d = calc_dist_fast(
-            working_pixels[i],
-            working_chromas[i],
+        *d = oklch_dist(
+            oklab_pixels[i],
+            chromas[i],
             centroids[0],
             centroid_chromas[0],
         );
@@ -748,13 +684,13 @@ fn generate_palette_oklab(
             .sum();
 
         if total <= 0.0 {
-            centroids[ki] = working_pixels[(xorshift() as usize) % working_pixels.len()];
+            centroids[ki] = oklab_pixels[(xorshift() as usize) % oklab_pixels.len()];
         } else {
             let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
-            for i in 0..working_pixels.len() {
+            for i in 0..oklab_pixels.len() {
                 target -= min_dists[i] * weights[i];
                 if target <= 0.0 {
-                    centroids[ki] = working_pixels[i];
+                    centroids[ki] = oklab_pixels[i];
                     break;
                 }
             }
@@ -768,35 +704,14 @@ fn generate_palette_oklab(
 
         // Update cached distances, ONLY checking against the newly added centroid
         min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
-            let dist = calc_dist_fast(working_pixels[i], working_chromas[i], new_c, new_c_chroma);
+            let dist = oklch_dist(oklab_pixels[i], chromas[i], new_c, new_c_chroma);
             if dist < *d {
                 *d = dist;
             }
         });
     }
 
-    // Helper for the final shift check at the end of each iteration
-    let calc_dist_centroids = |p: &Oklab, c: &Oklab| -> f32 {
-        let p_c = (p.a * p.a + p.b * p.b).sqrt();
-        let c_c = (c.a * c.a + c.b * c.b).sqrt();
-        let mut eff_chroma = p_c.max(c_c);
-        if p.l < 0.6 && c.l < 0.6 && eff_chroma > 0.015 {
-            eff_chroma = eff_chroma.max(0.04);
-        }
-        eff_chroma = eff_chroma.min(0.25);
-        let dl = (p.l - c.l) * 2.0;
-        let delta_c = p_c - c_c;
-        let dc = delta_c * 4.0;
-        let da = p.a - c.a;
-        let db = p.b - c.b;
-        let dh_sq = (da * da + db * db - delta_c * delta_c).max(0.0);
-        let cc_prod = (p_c * c_c).max(1e-8);
-        let dh_weighted_sq = dh_sq * (eff_chroma * eff_chroma * 9.0) / cc_prod;
-        dl * dl + dc * dc + dh_weighted_sq
-    };
-
-    // 4. K-Means iterations
-    let mut final_counts = vec![0.0f32; k];
+    // 5. K-Means iterations
     for _ in 0..20 {
         // Pre-pack ONLY the centroids.
         #[derive(Clone, Copy)]
@@ -827,12 +742,12 @@ fn generate_palette_oklab(
         // Extract slice so the compiler doesn't insert bounds checks in the inner loop
         let cd_slice = &cent_data[..];
 
-        // Deterministic parallel accumulation: par_chunks preserves index
-        // order in the collected Vec, so the final sequential reduction
-        // always combines partial sums in the same order regardless of
-        // thread scheduling. This avoids FP non-associativity jitter.
+        // Deterministic parallel accumulation: fixed-size chunks are processed
+        // in parallel and collected in index order, so the final sequential
+        // reduction always combines partial sums identically across runs.
+        // This avoids FP non-associativity jitter from Rayon's work-stealing.
         const CHUNK: usize = 4096;
-        let n_pixels = working_pixels.len();
+        let n_pixels = oklab_pixels.len();
         let n_chunks = (n_pixels + CHUNK - 1) / CHUNK;
         let partials: Vec<(Vec<(f32, f32, f32)>, Vec<f32>)> = (0..n_chunks)
             .into_par_iter()
@@ -842,8 +757,8 @@ fn generate_palette_oklab(
                 let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
                 let mut counts = vec![0.0f32; k];
                 for i in start..end {
-                    let p = &working_pixels[i];
-                    let p_c = working_chromas[i];
+                    let p = &oklab_pixels[i];
+                    let p_c = chromas[i];
                     let w = weights[i];
 
                     let mut min_dist = f32::MAX;
@@ -923,77 +838,27 @@ fn generate_palette_oklab(
                 let new_a = sums[i].1 / counts[i];
                 let new_b = sums[i].2 / counts[i];
 
-                let shift = calc_dist_centroids(
-                    &centroids[i],
-                    &Oklab {
-                        l: new_l,
-                        a: new_a,
-                        b: new_b,
-                    },
-                );
+                let new_ok = Oklab {
+                    l: new_l,
+                    a: new_a,
+                    b: new_b,
+                };
+                let old_c =
+                    (centroids[i].a * centroids[i].a + centroids[i].b * centroids[i].b).sqrt();
+                let new_c = (new_a * new_a + new_b * new_b).sqrt();
+                let shift = oklch_dist(centroids[i], old_c, new_ok, new_c);
 
                 max_shift = max_shift.max(shift);
-                centroids[i].l = new_l;
-                centroids[i].a = new_a;
-                centroids[i].b = new_b;
+                centroids[i] = new_ok;
             }
         }
         if max_shift < 1e-6 {
-            final_counts = counts;
             break;
         }
-        final_counts = counts;
     }
 
-    // 4.5. Anti-crowding deduplication (the tuning knob)
-    let mut clusters: Vec<(f32, Oklab)> = centroids
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| (final_counts[i], c))
-        .collect();
-
-    clusters.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut unique_centroids: Vec<Oklab> = Vec::new();
-    let mut kept_counts: Vec<f32> = Vec::new();
-    let total_pixels: f32 = clusters.iter().map(|(count, _)| count).sum();
-
-    for (count, c) in clusters {
-        if count == 0.0 {
-            continue;
-        }
-
-        let mut too_close = false;
-        // Lower the tiny spot threshold so it doesn't trigger on medium-small details
-        let is_tiny_spot = count < (total_pixels * 0.015);
-
-        for (idx, kept_c) in unique_centroids.iter().enumerate() {
-            let kept_count = kept_counts[idx];
-            let dist = calc_dist_centroids(&c, kept_c);
-
-            // Give dark colors a "shield" against aggressive merging.
-            // If both colors are dark, they must be VERY close to merge.
-            let is_dark_collision = c.l < 0.35 && kept_c.l < 0.35;
-
-            let tiny_merge_dist = if is_dark_collision { 0.0005 } else { 0.0015 };
-            let standard_merge_dist = if is_dark_collision { 0.0001 } else { 0.0003 };
-
-            if dist < standard_merge_dist
-                || (is_tiny_spot && dist < tiny_merge_dist && count < kept_count * 0.5)
-            {
-                too_close = true;
-                break;
-            }
-        }
-
-        if !too_close {
-            unique_centroids.push(c);
-            kept_counts.push(count);
-        }
-    }
-
-    // 5. Final Mapping back to sRGB [u8; 3]
-    unique_centroids
+    // 6. Final mapping back to sRGB [u8; 3]
+    centroids
         .into_iter()
         .map(|ok_c| {
             let linear = oklab_to_linear_srgb(ok_c);
