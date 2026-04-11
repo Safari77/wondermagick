@@ -728,11 +728,23 @@ fn generate_palette_oklab(
     });
 
     for ki in 1..k {
-        // Calculate the weighted sum using cached min_dists
+        // Calculate the weighted sum using cached min_dists.
+        // Deterministic parallel sum: fixed-size chunks are summed in
+        // parallel, then the chunk totals are combined sequentially in
+        // index order. This avoids FP non-associativity jitter while
+        // staying parallel for large pixel counts.
         let total: f32 = min_dists
-            .par_iter()
-            .zip(weights.par_iter())
-            .map(|(&d, &w)| d * w)
+            .par_chunks(4096)
+            .zip(weights.par_chunks(4096))
+            .map(|(d_chunk, w_chunk)| {
+                d_chunk
+                    .iter()
+                    .zip(w_chunk.iter())
+                    .map(|(&d, &w)| d * w)
+                    .sum::<f32>()
+            })
+            .collect::<Vec<f32>>()
+            .iter()
             .sum();
 
         if total <= 0.0 {
@@ -815,13 +827,25 @@ fn generate_palette_oklab(
         // Extract slice so the compiler doesn't insert bounds checks in the inner loop
         let cd_slice = &cent_data[..];
 
-        let (sums, counts) = working_pixels
-            .par_iter()
-            .zip(working_chromas.par_iter())
-            .zip(weights.par_iter())
-            .fold(
-                || (vec![(0.0f32, 0.0f32, 0.0f32); k], vec![0.0f32; k]),
-                |mut acc, ((p, &p_c), &w)| {
+        // Deterministic parallel accumulation: par_chunks preserves index
+        // order in the collected Vec, so the final sequential reduction
+        // always combines partial sums in the same order regardless of
+        // thread scheduling. This avoids FP non-associativity jitter.
+        const CHUNK: usize = 4096;
+        let n_pixels = working_pixels.len();
+        let n_chunks = (n_pixels + CHUNK - 1) / CHUNK;
+        let partials: Vec<(Vec<(f32, f32, f32)>, Vec<f32>)> = (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * CHUNK;
+                let end = (start + CHUNK).min(n_pixels);
+                let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
+                let mut counts = vec![0.0f32; k];
+                for i in start..end {
+                    let p = &working_pixels[i];
+                    let p_c = working_chromas[i];
+                    let w = weights[i];
+
                     let mut min_dist = f32::MAX;
                     let mut best_idx = 0;
 
@@ -834,7 +858,7 @@ fn generate_palette_oklab(
                     // Precalculate pixel division OUTSIDE the inner loop
                     let inv_p_c = 1.0 / p_c.max(1e-4);
 
-                    for (i, cd) in cd_slice.iter().enumerate() {
+                    for (ci, cd) in cd_slice.iter().enumerate() {
                         // ── EARLY EXIT 1: Lightness ──
                         let dl = p_l - cd.l;
                         let dl_sq = dl * dl * 4.0;
@@ -867,29 +891,30 @@ fn generate_palette_oklab(
                         let dist_sq = base_dist + dh_weighted_sq;
                         if dist_sq < min_dist {
                             min_dist = dist_sq;
-                            best_idx = i;
+                            best_idx = ci;
                         }
                     }
 
-                    acc.0[best_idx].0 += p_l * w;
-                    acc.0[best_idx].1 += p_a * w;
-                    acc.0[best_idx].2 += p_b * w;
-                    acc.1[best_idx] += w;
-                    acc
-                },
-            )
-            .reduce(
-                || (vec![(0.0f32, 0.0f32, 0.0f32); k], vec![0.0f32; k]),
-                |mut a, b| {
-                    for i in 0..k {
-                        a.0[i].0 += b.0[i].0;
-                        a.0[i].1 += b.0[i].1;
-                        a.0[i].2 += b.0[i].2;
-                        a.1[i] += b.1[i];
-                    }
-                    a
-                },
-            );
+                    sums[best_idx].0 += p_l * w;
+                    sums[best_idx].1 += p_a * w;
+                    sums[best_idx].2 += p_b * w;
+                    counts[best_idx] += w;
+                }
+                (sums, counts)
+            })
+            .collect();
+
+        // Sequential reduction in fixed order → deterministic
+        let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
+        let mut counts = vec![0.0f32; k];
+        for (ps, pc) in &partials {
+            for i in 0..k {
+                sums[i].0 += ps[i].0;
+                sums[i].1 += ps[i].1;
+                sums[i].2 += ps[i].2;
+                counts[i] += pc[i];
+            }
+        }
 
         let mut max_shift = 0.0f32;
         for i in 0..k {
