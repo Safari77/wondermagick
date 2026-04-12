@@ -1,21 +1,30 @@
 use crate::arg_parse_err::ArgParseErr;
 use std::ffi::OsStr;
+use strum::VariantNames;
 
 /// https://imagemagick.org/script/command-line-options.php#intensity
 /// Running ImageMagick 6's `convert -list intensity` shows all available methods.
-#[derive(Debug, Clone, PartialEq, strum::Display, strum::EnumString, strum::IntoStaticStr)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::VariantNames,
+)]
 #[strum(ascii_case_insensitive)]
 pub enum GrayscaleMethod {
     Average,
-    Brightness,
+    //Brightness,
     Lightness,
-    MS,
+    //MS,
     Mean,
-    RMS,
+    //RMS,
     Rec601Luma,
-    Rec601Luminance,
+    //Rec601Luminance,
     Rec709Luma,
-    Rec709Luminance,
+    //Rec709Luminance,
     OklabLuminance,
 }
 
@@ -25,7 +34,15 @@ impl TryFrom<&std::ffi::OsStr> for GrayscaleMethod {
     fn try_from(s: &OsStr) -> Result<Self, Self::Error> {
         s.to_str()
             .ok_or_else(|| ArgParseErr::with_msg("non-utf8 grayscale value"))
-            .and_then(|val| Self::try_from(val).map_err(ArgParseErr::with_msg))
+            .and_then(|val| {
+                Self::try_from(val).map_err(|_| {
+                    let valid_methods = Self::VARIANTS.join(", ");
+                    ArgParseErr::with_msg(format!(
+                        "unrecognized grayscale method `{}`. Valid methods are: {}",
+                        val, valid_methods
+                    ))
+                })
+            })
     }
 }
 
