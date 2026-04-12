@@ -174,7 +174,7 @@ impl Arg {
             Arg::EqualizeHistogram => "equalize histogram",
             Arg::Quantize => "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '32,0.2,0.2:2.6', or 'default' — bias < 0.0 uses Oklab median-cut, 0.0 uses RGB K-means, >0.0 uses Oklab K-means++ (it also supports optional light_boost:lc_priority parameters)",
             Arg::CountColors => "count the number of unique colors in the image",
-            Arg::Text => "render rotated multi-line text (format: 'effect,text,font,size,color,rotation,justify,x,y' | Effects: none, blur:<sigma>, outline:<thickness>:<#color> | e.g. 'outline:3:#000000FF,Hello,Arial,5%,#FFFFFF,45.0,center,center,80%' | QR: 'none,{QR:H:0:#00000000:https://x.com},Arial,15%,#000000,0,center,center,center')",
+            Arg::Text => "render rotated multi-line text (format: 'effect,text,font,size,color,rotation,justify,x,y' | Effects: none, blur:<sigma>, gradualblur:<sigma>, shadow:dx:dy:sigma:<#color>, outline:<thickness>:<#color> | e.g. 'outline:3:#000000FF,Hello,Arial,5%,#FFFFFF,45.0,center,center,80%' | QR: 'none,{QR:H:0:#00000000:https://x.com},Arial,15%,#000000,0,center,center,center')",
         }
     }
 }

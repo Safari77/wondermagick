@@ -180,6 +180,14 @@ pub enum TextEffect {
         thickness: u32,
         color: (u8, u8, u8, u8),
     },
+    /// Soft drop shadow behind the text glyphs, offset by (dx, dy) pixels
+    /// and gaussian-blurred to give depth.
+    Shadow {
+        dx: f32,
+        dy: f32,
+        sigma: f32,
+        color: (u8, u8, u8, u8),
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -224,6 +232,7 @@ impl TextConfig {
     ///   - `blur:5.0`             — blur background behind text (sigma=5.0)
     ///   - `gradualblur:5.0`      — blur with smooth graduated edges (sigma=5.0)
     ///   - `outline:3:#000000FF`  — subtitle-style outline (thickness 3, black)
+    ///   - `shadow:3:3:4.0:#00000080` — drop shadow (dx, dy, sigma, color)
     ///
     /// Example: "outline:3:#000000FF,Hello\\nWorld,Arial,5%,#FFFFFF,-45.0,center,center,80%"
     /// Position units: px (absolute), % (0%=start, 100%=end-aligned), em (font-size-relative), center
@@ -338,8 +347,43 @@ impl TextConfig {
             let color = parse_hex_color(color_str)?;
             return Ok(TextEffect::Outline { thickness, color });
         }
+        if let Some(rest) = s.strip_prefix("shadow:") {
+            // Format: shadow:dx:dy:sigma:#color
+            let mut parts = rest.splitn(4, ':');
+            let dx_str = parts
+                .next()
+                .ok_or_else(|| ArgParseErr::with_msg("shadow effect missing dx"))?;
+            let dy_str = parts
+                .next()
+                .ok_or_else(|| ArgParseErr::with_msg("shadow effect missing dy"))?;
+            let sigma_str = parts
+                .next()
+                .ok_or_else(|| ArgParseErr::with_msg("shadow effect missing sigma"))?;
+            let color_str = parts
+                .next()
+                .ok_or_else(|| ArgParseErr::with_msg("shadow effect missing color"))?;
+            let dx = dx_str.parse::<f32>().map_err(|_| {
+                ArgParseErr::with_msg("shadow dx must be a float (e.g. 'shadow:3:3:4.0:#00000080')")
+            })?;
+            let dy = dy_str.parse::<f32>().map_err(|_| {
+                ArgParseErr::with_msg("shadow dy must be a float (e.g. 'shadow:3:3:4.0:#00000080')")
+            })?;
+            let sigma = sigma_str.parse::<f32>().map_err(|_| {
+                ArgParseErr::with_msg(
+                    "shadow sigma must be a float (e.g. 'shadow:3:3:4.0:#00000080')",
+                )
+            })?;
+            let color = parse_hex_color(color_str)?;
+            return Ok(TextEffect::Shadow {
+                dx,
+                dy,
+                sigma,
+                color,
+            });
+        }
         Err(ArgParseErr::with_msg(
-            "effect must be 'none', 'blur:<sigma>', 'gradualblur:<sigma>', or 'outline:<thickness>:<#color>'",
+            "effect must be 'none', 'blur:<sigma>', 'gradualblur:<sigma>', \
+             'outline:<thickness>:<#color>', or 'shadow:<dx>:<dy>:<sigma>:<#color>'",
         ))
     }
 }
@@ -1019,6 +1063,51 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
 
             // Composite outline first (behind text)
             main_pixmap.draw_pixmap(0, 0, outline_pixmap.as_ref(), &paint, transform, None);
+        }
+        TextEffect::Shadow {
+            dx,
+            dy,
+            sigma,
+            color,
+        } => {
+            // Build a shadow image from the already-rendered text alpha,
+            // filled with the shadow color. This captures all glyphs
+            // including fallback-rendered ones without re-rasterizing.
+            let (sr, sg, sb, sa) = *color;
+            let mut shadow_rgba = RgbaImage::new(tw_u32, th_u32);
+            for (i, text_px) in text_pixmap.pixels().iter().enumerate() {
+                let ta = text_px.alpha() as u32;
+                if ta > 0 {
+                    // Modulate shadow alpha by the glyph alpha
+                    let final_a = ((sa as u32 * ta) / 255) as u8;
+                    let x = (i as u32) % tw_u32;
+                    let y = (i as u32) / tw_u32;
+                    shadow_rgba.put_pixel(x, y, image::Rgba([sr, sg, sb, final_a]));
+                }
+            }
+
+            // Gaussian blur the shadow to soften it
+            let shadow_dyn = DynamicImage::ImageRgba8(shadow_rgba);
+            let blurred_shadow = if *sigma > 0.0 {
+                shadow_dyn.blur(*sigma)
+            } else {
+                shadow_dyn
+            };
+            let blurred_rgba = blurred_shadow.to_rgba8();
+
+            // Convert blurred shadow back to a Pixmap for compositing
+            let mut shadow_pixmap =
+                Pixmap::new(tw_u32, th_u32).expect("Failed to allocate shadow pixmap");
+            for (src, dst) in blurred_rgba.pixels().zip(shadow_pixmap.pixels_mut()) {
+                *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+            }
+
+            // Composite shadow behind text, offset by (dx, dy) in canvas space
+            let shadow_transform =
+                Transform::from_translate(start_x + dx, start_y + dy).pre_concat(
+                    Transform::from_rotate_at(config.rotation, text_w / 2.0, text_h / 2.0),
+                );
+            main_pixmap.draw_pixmap(0, 0, shadow_pixmap.as_ref(), &paint, shadow_transform, None);
         }
     }
 
