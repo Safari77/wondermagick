@@ -190,9 +190,29 @@ pub enum TextEffect {
     },
 }
 
+/// Optional pixel-displacement layer that runs *after* the base `TextEffect`,
+/// warping the (already-effected) background before the text is composited.
+/// Append with `+` in the effect string, e.g. `blur:5.0+explode:30`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DisplacementEffect {
+    None,
+    /// Radial push from the text centroid.
+    Explode {
+        strength: f32,
+    },
+    /// Text-shape-driven displacement via a proximity field.
+    /// `direction` = -1 → omnidirectional; 0–360 → fixed bearing in degrees
+    /// (0 = right, 90 = down, 180 = left, 270 = up).
+    Meltdown {
+        strength: f32,
+        direction: f32,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextConfig {
     pub effect: TextEffect,
+    pub displacement: DisplacementEffect,
     pub text: String,
     pub font_name: String,
     pub font_size: FontSize,
@@ -227,12 +247,22 @@ fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8, u8), ArgParseErr> {
 impl TextConfig {
     /// Format: "effect,text,font_name,font_size,color,rotation,justify,x,y"
     ///
-    /// Effect values:
+    /// Effect values (base):
     ///   - `none`                 — plain text, no background effect
     ///   - `blur:5.0`             — blur background behind text (sigma=5.0)
     ///   - `gradualblur:5.0`      — blur with smooth graduated edges (sigma=5.0)
     ///   - `outline:3:#000000FF`  — subtitle-style outline (thickness 3, black)
     ///   - `shadow:3:3:4.0:#00000080` — drop shadow (dx, dy, sigma, color)
+    ///
+    /// Displacement modifiers (append with `+`):
+    ///   - `+explode:30`          — radial pixel explosion (strength in px)
+    ///   - `+meltdown:40:-1`      — text-shaped blast, omnidirectional
+    ///   - `+meltdown:40:90`      — text-shaped blast downward (0=right…360°)
+    ///
+    /// Combined examples:
+    ///   - `blur:5.0+explode:30`  — blur then explode
+    ///   - `outline:3:#000000FF+meltdown:40:-1` — outline with meltdown
+    ///   - `explode:30`           — plain text with explode (implicit `none` base)
     ///
     /// Example: "outline:3:#000000FF,Hello\\nWorld,Arial,5%,#FFFFFF,-45.0,center,center,80%"
     /// Position units: px (absolute), % (0%=start, 100%=end-aligned), em (font-size-relative), center
@@ -248,7 +278,7 @@ impl TextConfig {
         let effect_str = &s[..first_comma];
         let rest = &s[first_comma + 1..];
 
-        let effect = Self::parse_effect(effect_str)?;
+        let (effect, displacement) = Self::parse_effect_field(effect_str)?;
 
         let mut parts: Vec<&str> = rest.rsplitn(8, ',').collect();
         if parts.len() != 8 {
@@ -299,6 +329,7 @@ impl TextConfig {
 
         Ok(Self {
             effect,
+            displacement,
             text,
             font_name,
             font_size,
@@ -310,7 +341,33 @@ impl TextConfig {
         })
     }
 
-    fn parse_effect(s: &str) -> Result<TextEffect, ArgParseErr> {
+    /// Split on `+`, parse base effect and optional displacement modifier.
+    /// Standalone `explode:…` / `meltdown:…` (no `+`) is accepted as an
+    /// implicit `none` base for backward compatibility.
+    fn parse_effect_field(s: &str) -> Result<(TextEffect, DisplacementEffect), ArgParseErr> {
+        let s = s.trim();
+
+        // Check for '+' separator → base+displacement
+        if let Some(pos) = s.find('+') {
+            let base_str = &s[..pos];
+            let disp_str = &s[pos + 1..];
+            let effect = Self::parse_base_effect(base_str)?;
+            let displacement = Self::parse_displacement(disp_str)?;
+            return Ok((effect, displacement));
+        }
+
+        // No '+' — try as displacement-only first (backward compat)
+        if s.starts_with("explode:") || s.starts_with("meltdown:") {
+            let displacement = Self::parse_displacement(s)?;
+            return Ok((TextEffect::None, displacement));
+        }
+
+        // Otherwise it's a plain base effect with no displacement
+        let effect = Self::parse_base_effect(s)?;
+        Ok((effect, DisplacementEffect::None))
+    }
+
+    fn parse_base_effect(s: &str) -> Result<TextEffect, ArgParseErr> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("none") {
             return Ok(TextEffect::None);
@@ -382,8 +439,43 @@ impl TextConfig {
             });
         }
         Err(ArgParseErr::with_msg(
-            "effect must be 'none', 'blur:<sigma>', 'gradualblur:<sigma>', \
+            "base effect must be 'none', 'blur:<sigma>', 'gradualblur:<sigma>', \
              'outline:<thickness>:<#color>', or 'shadow:<dx>:<dy>:<sigma>:<#color>'",
+        ))
+    }
+
+    fn parse_displacement(s: &str) -> Result<DisplacementEffect, ArgParseErr> {
+        let s = s.trim();
+        if let Some(strength_str) = s.strip_prefix("explode:") {
+            let strength = strength_str.parse::<f32>().map_err(|_| {
+                ArgParseErr::with_msg("explode requires a float strength (e.g. 'explode:30')")
+            })?;
+            return Ok(DisplacementEffect::Explode { strength });
+        }
+        if let Some(rest) = s.strip_prefix("meltdown:") {
+            // Format: meltdown:strength:direction
+            let colon_pos = rest.find(':').ok_or_else(|| {
+                ArgParseErr::with_msg(
+                    "meltdown requires strength:direction \
+                     (e.g. 'meltdown:40:-1' or 'meltdown:40:90')",
+                )
+            })?;
+            let strength_str = &rest[..colon_pos];
+            let dir_str = &rest[colon_pos + 1..];
+            let strength = strength_str
+                .parse::<f32>()
+                .map_err(|_| ArgParseErr::with_msg("meltdown strength must be a float"))?;
+            let direction = dir_str.parse::<f32>().map_err(|_| {
+                ArgParseErr::with_msg("meltdown direction must be -1 (omni) or 0-360 (degrees)")
+            })?;
+            return Ok(DisplacementEffect::Meltdown {
+                strength,
+                direction,
+            });
+        }
+        Err(ArgParseErr::with_msg(
+            "displacement modifier must be 'explode:<strength>' \
+             or 'meltdown:<strength>:<direction>'",
         ))
     }
 }
@@ -1108,6 +1200,228 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                     Transform::from_rotate_at(config.rotation, text_w / 2.0, text_h / 2.0),
                 );
             main_pixmap.draw_pixmap(0, 0, shadow_pixmap.as_ref(), &paint, shadow_transform, None);
+        }
+    }
+
+    // --- Apply displacement modifier (warps the already-effected background) ---
+    match &config.displacement {
+        DisplacementEffect::None => {}
+        DisplacementEffect::Explode { strength } => {
+            // Compute the centroid of all rendered glyphs in the text pixmap
+            let pixels = text_pixmap.pixels();
+            let mut sum_x: f64 = 0.0;
+            let mut sum_y: f64 = 0.0;
+            let mut count: u64 = 0;
+            for py in 0..th_u32 {
+                for px in 0..tw_u32 {
+                    if pixels[(py * tw_u32 + px) as usize].alpha() > 0 {
+                        sum_x += px as f64;
+                        sum_y += py as f64;
+                        count += 1;
+                    }
+                }
+            }
+
+            if count > 0 {
+                let cx_local = (sum_x / count as f64) as f32;
+                let cy_local = (sum_y / count as f64) as f32;
+
+                // Transform the text-local centroid into canvas space,
+                // accounting for the text pixmap's translate + rotate.
+                let angle_rad = config.rotation.to_radians();
+                let cos_a = angle_rad.cos();
+                let sin_a = angle_rad.sin();
+                let rel_x = cx_local - text_w / 2.0;
+                let rel_y = cy_local - text_h / 2.0;
+                let cx = start_x + text_w / 2.0 + rel_x * cos_a - rel_y * sin_a;
+                let cy = start_y + text_h / 2.0 + rel_x * sin_a + rel_y * cos_a;
+
+                // The explosion reaches from the centroid out to the text
+                // diagonal plus extra room proportional to strength.
+                let text_diag = (actual_w * actual_w + actual_h * actual_h).sqrt();
+                let effect_radius = text_diag / 2.0 + *strength * 2.0;
+                let inv_radius = 1.0 / effect_radius;
+
+                // Snapshot the undistorted canvas so we can sample from it
+                // while writing displaced pixels in parallel.
+                let src_snap: Vec<PremultipliedColorU8> = main_pixmap.pixels().to_vec();
+                let w = img_w as usize;
+                let h = img_h as usize;
+
+                // Inverse radial displacement: for each output pixel, find the
+                // source position closer to the centroid that was "pushed" here.
+                main_pixmap
+                    .pixels_mut()
+                    .par_chunks_mut(w)
+                    .enumerate()
+                    .for_each(|(y_idx, row)| {
+                        for x_idx in 0..w {
+                            let dx = x_idx as f32 - cx;
+                            let dy = y_idx as f32 - cy;
+                            let dist = (dx * dx + dy * dy).sqrt();
+
+                            if dist >= effect_radius || dist < 0.001 {
+                                continue;
+                            }
+
+                            // Quadratic falloff: strong near center, zero at radius
+                            let t = dist * inv_radius;
+                            let displacement = *strength * (1.0 - t) * (1.0 - t);
+
+                            // Pull source position back toward centroid
+                            let scale = (dist - displacement) / dist;
+                            let src_x = (cx + dx * scale).clamp(0.0, (w - 1) as f32);
+                            let src_y = (cy + dy * scale).clamp(0.0, (h - 1) as f32);
+
+                            // Bilinear interpolation on premultiplied pixels
+                            let x0 = src_x.floor() as usize;
+                            let y0 = src_y.floor() as usize;
+                            let x1 = (x0 + 1).min(w - 1);
+                            let y1 = (y0 + 1).min(h - 1);
+                            let fx = src_x - x0 as f32;
+                            let fy = src_y - y0 as f32;
+
+                            let p00 = src_snap[y0 * w + x0];
+                            let p10 = src_snap[y0 * w + x1];
+                            let p01 = src_snap[y1 * w + x0];
+                            let p11 = src_snap[y1 * w + x1];
+
+                            let blerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+                                let top = a as f32 * (1.0 - fx) + b as f32 * fx;
+                                let bot = c as f32 * (1.0 - fx) + d as f32 * fx;
+                                (top * (1.0 - fy) + bot * fy) as u8
+                            };
+
+                            let r = blerp(p00.red(), p10.red(), p01.red(), p11.red());
+                            let g = blerp(p00.green(), p10.green(), p01.green(), p11.green());
+                            let b = blerp(p00.blue(), p10.blue(), p01.blue(), p11.blue());
+                            let a = blerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha());
+
+                            if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, a) {
+                                row[x_idx] = c;
+                            }
+                        }
+                    });
+            }
+        }
+        DisplacementEffect::Meltdown {
+            strength,
+            direction,
+        } => {
+            // --- 1. Build a binary text-shape mask in text-pixmap space ---
+            let pixels = text_pixmap.pixels();
+            let mut text_mask_src =
+                Pixmap::new(tw_u32, th_u32).expect("Failed to allocate meltdown text mask");
+            for (i, px) in pixels.iter().enumerate() {
+                if px.alpha() > 0 {
+                    text_mask_src.pixels_mut()[i] =
+                        PremultipliedColorU8::from_rgba(255, 255, 255, 255).unwrap();
+                }
+            }
+
+            // --- 2. Project mask to canvas space through the rotation transform ---
+            let mut canvas_mask =
+                Pixmap::new(img_w, img_h).expect("Failed to allocate meltdown canvas mask");
+            canvas_mask.draw_pixmap(0, 0, text_mask_src.as_ref(), &paint, transform, None);
+
+            // --- 3. Blur the mask → smooth proximity field ---
+            //     Store the alpha channel in an image so we can use the
+            //     `image` crate's gaussian blur that's already a dependency.
+            let mut mask_img = RgbaImage::new(img_w, img_h);
+            for (i, px) in canvas_mask.pixels().iter().enumerate() {
+                let a = px.alpha();
+                let x = (i as u32) % img_w;
+                let y = (i as u32) / img_w;
+                mask_img.put_pixel(x, y, image::Rgba([a, a, a, 255]));
+            }
+            let blur_sigma = (*strength * 0.4).max(1.0);
+            let blurred_mask_dyn = DynamicImage::ImageRgba8(mask_img).blur(blur_sigma);
+            let blurred_mask_rgba = blurred_mask_dyn.to_rgba8();
+
+            // Extract as a flat f32 field (red channel = blurred proximity)
+            let w = img_w as usize;
+            let h = img_h as usize;
+            let field: Vec<f32> = blurred_mask_rgba
+                .pixels()
+                .map(|px| px[0] as f32 / 255.0)
+                .collect();
+
+            // --- 4. Inverse displacement warp, parallel over rows ---
+            let src_snap: Vec<PremultipliedColorU8> = main_pixmap.pixels().to_vec();
+            let is_omni = *direction < 0.0;
+            let dir_rad = direction.to_radians();
+            let fixed_dx = dir_rad.cos();
+            let fixed_dy = dir_rad.sin();
+
+            main_pixmap
+                .pixels_mut()
+                .par_chunks_mut(w)
+                .enumerate()
+                .for_each(|(y_idx, row)| {
+                    for x_idx in 0..w {
+                        let fv = field[y_idx * w + x_idx];
+                        if fv < 0.002 {
+                            continue;
+                        }
+
+                        let displacement = *strength * fv;
+
+                        // Determine push direction
+                        let (push_dx, push_dy) = if is_omni {
+                            // Gradient of the proximity field points *toward*
+                            // the text; negate to push *away* from it.
+                            let x0 = x_idx.saturating_sub(1);
+                            let x1 = (x_idx + 1).min(w - 1);
+                            let y0 = y_idx.saturating_sub(1);
+                            let y1 = (y_idx + 1).min(h - 1);
+                            let gx = field[y_idx * w + x1] - field[y_idx * w + x0];
+                            let gy = field[y1 * w + x_idx] - field[y0 * w + x_idx];
+                            let glen = (gx * gx + gy * gy).sqrt();
+                            if glen < 1e-6 {
+                                // At a local maximum (text interior) — no clear
+                                // direction.  Text composites on top anyway.
+                                continue;
+                            }
+                            (-gx / glen, -gy / glen)
+                        } else {
+                            (fixed_dx, fixed_dy)
+                        };
+
+                        // Inverse map: find where this pixel was before the blast
+                        let src_x =
+                            (x_idx as f32 - displacement * push_dx).clamp(0.0, (w - 1) as f32);
+                        let src_y =
+                            (y_idx as f32 - displacement * push_dy).clamp(0.0, (h - 1) as f32);
+
+                        // Bilinear sample from the undistorted snapshot
+                        let sx0 = src_x.floor() as usize;
+                        let sy0 = src_y.floor() as usize;
+                        let sx1 = (sx0 + 1).min(w - 1);
+                        let sy1 = (sy0 + 1).min(h - 1);
+                        let fx = src_x - sx0 as f32;
+                        let fy = src_y - sy0 as f32;
+
+                        let p00 = src_snap[sy0 * w + sx0];
+                        let p10 = src_snap[sy0 * w + sx1];
+                        let p01 = src_snap[sy1 * w + sx0];
+                        let p11 = src_snap[sy1 * w + sx1];
+
+                        let blerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+                            let top = a as f32 * (1.0 - fx) + b as f32 * fx;
+                            let bot = c as f32 * (1.0 - fx) + d as f32 * fx;
+                            (top * (1.0 - fy) + bot * fy) as u8
+                        };
+
+                        let r = blerp(p00.red(), p10.red(), p01.red(), p11.red());
+                        let g = blerp(p00.green(), p10.green(), p01.green(), p11.green());
+                        let b = blerp(p00.blue(), p10.blue(), p01.blue(), p11.blue());
+                        let a = blerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha());
+
+                        if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, a) {
+                            row[x_idx] = c;
+                        }
+                    }
+                });
         }
     }
 
