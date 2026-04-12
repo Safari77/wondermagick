@@ -172,6 +172,9 @@ pub enum TextEffect {
     None,
     /// Gaussian-blur the region behind the text bounding box.
     Blur { sigma: f32 },
+    /// Like Blur, but the edges of the blurred region graduate smoothly
+    /// into the unblurred background instead of cutting off sharply.
+    GradualBlur { sigma: f32 },
     /// Subtitle-style outline via morphological dilation of the text alpha mask.
     Outline {
         thickness: u32,
@@ -219,6 +222,7 @@ impl TextConfig {
     /// Effect values:
     ///   - `none`                 — plain text, no background effect
     ///   - `blur:5.0`             — blur background behind text (sigma=5.0)
+    ///   - `gradualblur:5.0`      — blur with smooth graduated edges (sigma=5.0)
     ///   - `outline:3:#000000FF`  — subtitle-style outline (thickness 3, black)
     ///
     /// Example: "outline:3:#000000FF,Hello\\nWorld,Arial,5%,#FFFFFF,-45.0,center,center,80%"
@@ -308,6 +312,14 @@ impl TextConfig {
             })?;
             return Ok(TextEffect::Blur { sigma });
         }
+        if let Some(sigma_str) = s.strip_prefix("gradualblur:") {
+            let sigma = sigma_str.parse::<f32>().map_err(|_| {
+                ArgParseErr::with_msg(
+                    "gradualblur effect requires a float sigma (e.g. 'gradualblur:5.0')",
+                )
+            })?;
+            return Ok(TextEffect::GradualBlur { sigma });
+        }
         if let Some(rest) = s.strip_prefix("outline:") {
             // Format: outline:thickness:#color
             let colon_pos = rest.find(':').ok_or_else(|| {
@@ -327,7 +339,7 @@ impl TextConfig {
             return Ok(TextEffect::Outline { thickness, color });
         }
         Err(ArgParseErr::with_msg(
-            "effect must be 'none', 'blur:<sigma>', or 'outline:<thickness>:<#color>'",
+            "effect must be 'none', 'blur:<sigma>', 'gradualblur:<sigma>', or 'outline:<thickness>:<#color>'",
         ))
     }
 }
@@ -857,6 +869,110 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
 
                 // Rotate around the same pivot as the text pixmap so blur stays aligned.
                 // Text pivots at (start_x + text_w/2, start_y + text_h/2) in canvas space.
+                let pivot_x = start_x + text_w / 2.0 - mask_x;
+                let pivot_y = start_y + text_h / 2.0 - mask_y;
+                let mask_transform = Transform::from_translate(mask_x, mask_y)
+                    .pre_concat(Transform::from_rotate_at(config.rotation, pivot_x, pivot_y));
+
+                apply_blur_under_rotated_region(
+                    &mut main_pixmap,
+                    image,
+                    &mask_src,
+                    mask_transform,
+                    *sigma,
+                    img_w,
+                    img_h,
+                );
+            }
+        }
+        TextEffect::GradualBlur { sigma } => {
+            // Same tight glyph bounding box scan as Blur
+            let pixels = text_pixmap.pixels();
+            let mut min_x = tw_u32;
+            let mut max_x = 0u32;
+            let mut min_y = th_u32;
+            let mut max_y = 0u32;
+            for py in 0..th_u32 {
+                for px in 0..tw_u32 {
+                    if pixels[(py * tw_u32 + px) as usize].alpha() > 0 {
+                        min_x = min_x.min(px);
+                        max_x = max_x.max(px);
+                        min_y = min_y.min(py);
+                        max_y = max_y.max(py);
+                    }
+                }
+            }
+
+            if max_x >= min_x && max_y >= min_y {
+                let glyph_w = (max_x - min_x + 1) as f32;
+                let glyph_h = (max_y - min_y + 1) as f32;
+
+                // Inner margin where alpha is fully opaque (same as Blur's margin)
+                let inner_margin = font_size * 0.3;
+                // Outer falloff zone where alpha graduates from 255 to 0.
+                // Using 3*sigma covers the vast majority of a gaussian bell.
+                let falloff = (*sigma * 3.0).max(font_size * 0.5);
+                let total_margin = inner_margin + falloff;
+
+                let mask_w = (glyph_w + total_margin * 2.0).ceil() as u32;
+                let mask_h = (glyph_h + total_margin * 2.0).ceil() as u32;
+                let mut mask_src = Pixmap::new(mask_w.max(1), mask_h.max(1))
+                    .expect("Failed to allocate gradual blur mask pixmap");
+
+                // Build a mask with gaussian-faded edges:
+                // - Inside (glyph bounds + inner_margin): alpha = 255
+                // - Outside that: alpha = 255 * exp(-dist² / (2 * falloff_sigma²))
+                let falloff_sigma = falloff / 3.0; // so exp(-0.5 * (3σ/σ)²) ≈ 0
+                let inv_2sig2 = 1.0 / (2.0 * falloff_sigma * falloff_sigma);
+
+                // The inner rectangle within the mask where alpha stays 255
+                let inner_x0 = total_margin - inner_margin;
+                let inner_y0 = total_margin - inner_margin;
+                let inner_x1 = inner_x0 + glyph_w + inner_margin * 2.0;
+                let inner_y1 = inner_y0 + glyph_h + inner_margin * 2.0;
+
+                for my in 0..mask_h {
+                    for mx in 0..mask_w {
+                        let fx = mx as f32;
+                        let fy = my as f32;
+
+                        // Distance from the inner rectangle edge (0 if inside)
+                        let dx = if fx < inner_x0 {
+                            inner_x0 - fx
+                        } else if fx > inner_x1 {
+                            fx - inner_x1
+                        } else {
+                            0.0
+                        };
+                        let dy = if fy < inner_y0 {
+                            inner_y0 - fy
+                        } else if fy > inner_y1 {
+                            fy - inner_y1
+                        } else {
+                            0.0
+                        };
+
+                        let dist_sq = dx * dx + dy * dy;
+                        let alpha = if dist_sq <= 0.0 {
+                            255u8
+                        } else {
+                            (255.0 * (-dist_sq * inv_2sig2).exp()) as u8
+                        };
+
+                        if alpha > 0 {
+                            let idx = (my * mask_w + mx) as usize;
+                            mask_src.pixels_mut()[idx] =
+                                PremultipliedColorU8::from_rgba(alpha, alpha, alpha, alpha)
+                                    .unwrap();
+                        }
+                    }
+                }
+
+                // Position the mask so it's centered on the glyph bounds
+                let mask_x = start_x + min_x as f32 - total_margin;
+                let mask_y = start_y + min_y as f32 - total_margin;
+
+                // Rotate around the same pivot as the text pixmap so blur stays aligned
                 let pivot_x = start_x + text_w / 2.0 - mask_x;
                 let pivot_y = start_y + text_h / 2.0 - mask_y;
                 let mask_transform = Transform::from_translate(mask_x, mask_y)
