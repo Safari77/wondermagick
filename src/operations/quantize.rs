@@ -112,8 +112,10 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
     // Flatten pixels to a slice of [u8; 3] for fast Rayon iteration
     let pixels: Vec<[u8; 3]> = input.pixels().map(|p| p.0).collect();
 
-    // 1 & 2. Generate Palette using Classic RGB K-Means, Oklab K-Means++, or Oklab Median-Cut
-    let palette = if config.bias < 0.0 {
+    // 1 & 2. Generate Palette using MacQueen K-Means, Classic RGB K-Means, Oklab K-Means++, or Oklab Median-Cut
+    let palette = if config.bias <= -2.0 {
+        generate_palette_macqueen(&pixels, config.colors as usize, width, config.dither_level)
+    } else if config.bias < 0.0 {
         generate_palette_median_cut(&pixels, config.colors as usize)
     } else if config.bias > 0.0 {
         generate_palette_oklab(
@@ -250,6 +252,134 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
 
     image.pixels = DynamicImage::ImageRgb8(output);
     Ok(())
+}
+
+/// MacQueen K-Means clustering natively in Oklab perceptual space.
+/// Stochastic online updates allow rapid convergence and escape from local minima.
+/// Includes blue noise jitter integration during the generation assignments to
+/// gently break up uniform structural biases.
+fn generate_palette_macqueen(
+    rgb_pixels: &[[u8; 3]],
+    k: usize,
+    width: usize,
+    dither_level: f32,
+) -> Vec<[u8; 3]> {
+    let k = k.max(1);
+    let n_pixels = rgb_pixels.len();
+    if n_pixels == 0 {
+        return vec![[0, 0, 0]; k];
+    }
+
+    let oklab_pixels: Vec<Oklab> = rgb_pixels.par_iter().map(|&p| srgb_to_oklab(p)).collect();
+
+    // 1. Thread-local compatible fast xorshift PRNG
+    let mut rng_state: u64 = 0x1234_BEEF;
+    let mut xorshift = || -> u64 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+
+    // 2. Initial centroids
+    let mut centroids = vec![
+        Oklab {
+            l: 0.0,
+            a: 0.0,
+            b: 0.0
+        };
+        k
+    ];
+    for c in &mut centroids {
+        let idx = (xorshift() as usize) % n_pixels;
+        *c = oklab_pixels[idx];
+    }
+
+    let mut counts = vec![0u32; k];
+    let batch_size = 4096;
+    let samples = n_pixels.min(512 * 512); // Sample cap to prevent infinite loops on massive inputs
+    let noise_spread = dither_level * 0.1; // Reduced multiplier due to tight Oklab ranges
+
+    // 3. MacQueen iterations
+    for _ in 0..(samples / batch_size) {
+        // Collect our batch indices
+        let mut batch_indices = vec![0usize; batch_size];
+        for idx in &mut batch_indices {
+            *idx = (xorshift() as usize) % n_pixels;
+        }
+
+        // Step 1: In parallel, sample colors and find their nearest current centroid
+        let assignments: Vec<usize> = batch_indices
+            .par_iter()
+            .map(|&idx| {
+                let mut p = oklab_pixels[idx];
+
+                // Blue noise jitter injection to assist with structural dispersion
+                if noise_spread > 0.0 {
+                    let x = (idx % width) as u32;
+                    let y = (idx / width) as u32;
+                    let noise_u8 = get_noise(x, y);
+                    let noise = (noise_u8 as f32 / 255.0) - 0.5;
+                    let jitter = noise * noise_spread;
+                    p.l = (p.l + jitter).clamp(0.0, 1.0);
+                    p.a += jitter;
+                    p.b += jitter;
+                }
+
+                let mut min_dist = f32::MAX;
+                let mut best_c = 0;
+                for (ci, c) in centroids.iter().enumerate() {
+                    let dl = p.l - c.l;
+                    let da = p.a - c.a;
+                    let db = p.b - c.b;
+                    let dist = dl * dl + da * da + db * db;
+                    if dist < min_dist {
+                        min_dist = dist;
+                        best_c = ci;
+                    }
+                }
+                best_c
+            })
+            .collect();
+
+        // Step 2: Sequentially update the original centroids based on assignments
+        for (i, &idx) in batch_indices.iter().enumerate() {
+            let c_idx = assignments[i];
+            let mut p = oklab_pixels[idx];
+
+            if noise_spread > 0.0 {
+                let x = (idx % width) as u32;
+                let y = (idx / width) as u32;
+                let noise_u8 = get_noise(x, y);
+                let noise = (noise_u8 as f32 / 255.0) - 0.5;
+                let jitter = noise * noise_spread;
+                p.l = (p.l + jitter).clamp(0.0, 1.0);
+                p.a += jitter;
+                p.b += jitter;
+            }
+
+            counts[c_idx] += 1;
+            // Adaptive learning rate: 1.0 / sqrt(count)
+            let rate = 1.0 / (counts[c_idx] as f32).sqrt();
+
+            centroids[c_idx].l += rate * (p.l - centroids[c_idx].l);
+            centroids[c_idx].a += rate * (p.a - centroids[c_idx].a);
+            centroids[c_idx].b += rate * (p.b - centroids[c_idx].b);
+        }
+    }
+
+    // 4. Final mapping back to sRGB [u8; 3]
+    centroids
+        .into_iter()
+        .map(|ok_c| {
+            let linear = oklab_to_linear_srgb(ok_c);
+            [
+                (linear_to_srgb(linear[0]).clamp(0.0, 1.0) * 255.0).round() as u8,
+                (linear_to_srgb(linear[1]).clamp(0.0, 1.0) * 255.0).round() as u8,
+                (linear_to_srgb(linear[2]).clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]
+        })
+        .collect()
 }
 
 /// Original Fast RGB K-Means (used when bias == 0.0)
@@ -491,7 +621,7 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
         .collect()
 }
 
-/// K-means++ clustering in Oklab with Oklch distance (used when bias > 0.0).
+/// K-means++ clustering in Oklab with Oklab Euclidean distance (used when bias > 0.0).
 ///
 /// Histogram equalization across lightness and chroma ensures dark areas and
 /// minority colors get fair palette representation. sat_bias boosts saturated
@@ -511,9 +641,13 @@ fn generate_palette_oklab(
         return vec![[0, 0, 0]; k];
     }
 
-    // 1. Per-pixel weights: uniform base with chroma boost controlled by sat_bias.
-    //    No pixels are culled — every pixel participates in clustering so the
-    //    final palette can represent the full image faithfully.
+    // 1. Per-pixel weights: uniform base with optional linear chroma boost.
+    //    sat_bias = 1.0 acts as the neutral floor (all pixels get a weight of 1.0),
+    //    relying purely on `oklch_weighted_dist` to preserve vibrant colors.
+    //    Values > 1.0 (e.g., 4.0) apply a gentle linear multiplier to
+    //    artificially inflate the importance of highly saturated pixels.
+    let chroma_multiplier = (sat_bias - 1.0).max(0.0);
+
     let chromas: Vec<f32> = oklab_pixels
         .iter()
         .map(|p| (p.a * p.a + p.b * p.b).sqrt())
@@ -521,7 +655,7 @@ fn generate_palette_oklab(
 
     let mut weights: Vec<f32> = chromas
         .iter()
-        .map(|&c| 1.0 + (c * 15.0).powf(1.5) * sat_bias)
+        .map(|&c| 1.0 + (c * chroma_multiplier))
         .collect();
 
     // 2. Histogram equalization across lightness and chroma.
@@ -595,41 +729,32 @@ fn generate_palette_oklab(
         *w *= l_eq.powf(l_weight) * c_eq.powf(c_weight);
     }
 
-    // 3. Oklch distance metric — atan2-free using chord-based hue difference.
-    //    Uses: ΔH² = Δa² + Δb² - ΔC² (standard CIEDE trick to avoid atan2).
-    //    Then scales by effective_chroma² to match original weighting intent.
+    // 3. Pure Perceptual Euclidean distance in Oklab.
     #[inline(always)]
-    fn oklch_dist(p: Oklab, p_c: f32, c: Oklab, c_c: f32) -> f32 {
-        let mut effective_chroma = p_c.max(c_c);
+    fn oklch_weighted_dist(p: Oklab, c: Oklab) -> f32 {
+        let p_c = (p.a * p.a + p.b * p.b).sqrt();
+        let c_c = (c.a * c.a + c.b * c.b).sqrt();
 
-        // Only apply the wedge to dark colors if they ACTUALLY have some color.
-        // If it's practically pure grey (chroma < 0.015), let it stay grey!
-        if p.l < 0.6 && c.l < 0.6 && effective_chroma > 0.015 {
-            effective_chroma = effective_chroma.max(0.04);
-        }
-        effective_chroma = effective_chroma.min(0.25);
+        // 1. Lightness difference
+        let dl = p.l - c.l;
 
-        // Lightness
-        let dl = (p.l - c.l) * 2.0;
-        // Chroma distance
-        let delta_c = p_c - c_c;
-        let dc = delta_c * 4.0;
+        // 2. Chroma difference
+        let dc = p_c - c_c;
 
-        // Chord-based hue difference: ΔH² = Δa² + Δb² - ΔC²
+        // 3. Hue difference (chord length trick to avoid expensive atan2)
         let da = p.a - c.a;
         let db = p.b - c.b;
-        let dh_sq = (da * da + db * db - delta_c * delta_c).max(0.0);
+        let dh_sq = (da * da + db * db - dc * dc).max(0.0);
 
-        // For perceptual equivalence we scale chord² by (eff_chroma² * 9) / max(Cp*Cc, ε).
-        let cc_product = (p_c * c_c).max(1e-8);
-        let dh_weighted_sq = dh_sq * (effective_chroma * effective_chroma * 9.0) / cc_product;
-
-        dl * dl + dc * dc + dh_weighted_sq
+        // Perceptual Weights:
+        // 1.0 for Lightness, 4.0 for Chroma, 4.0 for Hue.
+        // This forces the algorithm to preserve vibrant gradients instead
+        // of settling for mathematically safe but pale averages.
+        (dl * dl * 1.0) + (dc * dc * 4.0) + (dh_sq * 4.0)
     }
 
     // 4. K-Means++ initialization
     let mut centroids = vec![oklab_pixels[0]; k];
-    let mut centroid_chromas = vec![0.0f32; k];
     let mut min_dists = vec![f32::MAX; oklab_pixels.len()]; // Cache nearest centroid distance
 
     let mut rng_state: u64 = 0x5EED_C0DE_1234_5678;
@@ -650,17 +775,9 @@ fn generate_palette_oklab(
         }
     }
 
-    centroid_chromas[0] =
-        (centroids[0].a * centroids[0].a + centroids[0].b * centroids[0].b).sqrt();
-
     // Initial pass: populate min_dists for the first centroid
     min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
-        *d = oklch_dist(
-            oklab_pixels[i],
-            chromas[i],
-            centroids[0],
-            centroid_chromas[0],
-        );
+        *d = oklch_weighted_dist(oklab_pixels[i], centroids[0]);
     });
 
     for ki in 1..k {
@@ -696,15 +813,11 @@ fn generate_palette_oklab(
             }
         }
 
-        // Precompute centroid chromas for this round
-        centroid_chromas[ki] =
-            (centroids[ki].a * centroids[ki].a + centroids[ki].b * centroids[ki].b).sqrt();
         let new_c = centroids[ki];
-        let new_c_chroma = centroid_chromas[ki];
 
         // Update cached distances, ONLY checking against the newly added centroid
         min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
-            let dist = oklch_dist(oklab_pixels[i], chromas[i], new_c, new_c_chroma);
+            let dist = oklch_weighted_dist(oklab_pixels[i], new_c);
             if dist < *d {
                 *d = dist;
             }
@@ -713,34 +826,8 @@ fn generate_palette_oklab(
 
     // 5. K-Means iterations
     for _ in 0..20 {
-        // Pre-pack ONLY the centroids.
-        #[derive(Clone, Copy)]
-        struct CentroidData {
-            l: f32,
-            a: f32,
-            b: f32,
-            c: f32,
-            inv_c: f32,
-            is_dark: bool,
-        }
-
-        let cent_data: Vec<CentroidData> = centroids
-            .iter()
-            .map(|c| {
-                let ch = (c.a * c.a + c.b * c.b).sqrt();
-                CentroidData {
-                    l: c.l,
-                    a: c.a,
-                    b: c.b,
-                    c: ch,
-                    inv_c: 1.0 / ch.max(1e-4), // Precalculate centroid division
-                    is_dark: c.l < 0.6,
-                }
-            })
-            .collect();
-
         // Extract slice so the compiler doesn't insert bounds checks in the inner loop
-        let cd_slice = &cent_data[..];
+        let cd_slice = &centroids[..];
 
         // Deterministic parallel accumulation: fixed-size chunks are processed
         // in parallel and collected in index order, so the final sequential
@@ -748,7 +835,7 @@ fn generate_palette_oklab(
         // This avoids FP non-associativity jitter from Rayon's work-stealing.
         const CHUNK: usize = 4096;
         let n_pixels = oklab_pixels.len();
-        let n_chunks = (n_pixels + CHUNK - 1) / CHUNK;
+        let n_chunks = n_pixels.div_ceil(CHUNK);
         let partials: Vec<(Vec<(f32, f32, f32)>, Vec<f32>)> = (0..n_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
@@ -758,7 +845,6 @@ fn generate_palette_oklab(
                 let mut counts = vec![0.0f32; k];
                 for i in start..end {
                     let p = &oklab_pixels[i];
-                    let p_c = chromas[i];
                     let w = weights[i];
 
                     let mut min_dist = f32::MAX;
@@ -768,42 +854,13 @@ fn generate_palette_oklab(
                     let p_l = p.l;
                     let p_a = p.a;
                     let p_b = p.b;
-                    let p_is_dark = p_l < 0.6;
-
-                    // Precalculate pixel division OUTSIDE the inner loop
-                    let inv_p_c = 1.0 / p_c.max(1e-4);
 
                     for (ci, cd) in cd_slice.iter().enumerate() {
-                        // ── EARLY EXIT 1: Lightness ──
                         let dl = p_l - cd.l;
-                        let dl_sq = dl * dl * 4.0;
-                        if dl_sq >= min_dist {
-                            continue;
-                        } // Lightness difference alone is worse
-
-                        // ── EARLY EXIT 2: Chroma ──
-                        let delta_c = p_c - cd.c;
-                        let dc_sq = delta_c * delta_c * 16.0;
-                        let base_dist = dl_sq + dc_sq;
-                        if base_dist >= min_dist {
-                            continue;
-                        } // Lightness + Chroma is worse
-
-                        let mut eff_chroma = p_c.max(cd.c);
-                        if p_is_dark && cd.is_dark && eff_chroma > 0.015 {
-                            eff_chroma = eff_chroma.max(0.04);
-                        }
-                        eff_chroma = eff_chroma.min(0.25);
-
                         let da = p_a - cd.a;
                         let db = p_b - cd.b;
-                        let dh_sq = da * da + db * db - delta_c * delta_c;
-                        let dh_sq_pos = dh_sq.max(0.0);
+                        let dist_sq = dl * dl + da * da + db * db;
 
-                        let inv_cc = inv_p_c * cd.inv_c;
-                        let dh_weighted_sq = dh_sq_pos * (eff_chroma * eff_chroma * 9.0) * inv_cc;
-
-                        let dist_sq = base_dist + dh_weighted_sq;
                         if dist_sq < min_dist {
                             min_dist = dist_sq;
                             best_idx = ci;
@@ -834,20 +891,13 @@ fn generate_palette_oklab(
         let mut max_shift = 0.0f32;
         for i in 0..k {
             if counts[i] > 0.0 {
-                let new_l = sums[i].0 / counts[i];
-                let new_a = sums[i].1 / counts[i];
-                let new_b = sums[i].2 / counts[i];
-
                 let new_ok = Oklab {
-                    l: new_l,
-                    a: new_a,
-                    b: new_b,
+                    l: sums[i].0 / counts[i],
+                    a: sums[i].1 / counts[i],
+                    b: sums[i].2 / counts[i],
                 };
-                let old_c =
-                    (centroids[i].a * centroids[i].a + centroids[i].b * centroids[i].b).sqrt();
-                let new_c = (new_a * new_a + new_b * new_b).sqrt();
-                let shift = oklch_dist(centroids[i], old_c, new_ok, new_c);
 
+                let shift = oklch_weighted_dist(centroids[i], new_ok);
                 max_shift = max_shift.max(shift);
                 centroids[i] = new_ok;
             }
