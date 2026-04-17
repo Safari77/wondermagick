@@ -902,7 +902,7 @@ fn generate_palette_oklab(
                 centroids[i] = new_ok;
             }
         }
-        if max_shift < 1e-6 {
+        if max_shift < 1e-4 {
             break;
         }
     }
