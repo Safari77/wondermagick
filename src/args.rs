@@ -89,6 +89,7 @@ pub enum Arg {
     Quantize,
     Text,
     CountColors,
+    Fx,
 }
 
 impl Arg {
@@ -132,6 +133,7 @@ impl Arg {
             Arg::Quantize => true,
             Arg::CountColors => false,
             Arg::Text => true,
+            Arg::Fx => true,
         }
     }
 
@@ -145,6 +147,7 @@ impl Arg {
             Arg::Despeckle => "despeckle image",
             Arg::Format => "output formatted image characteristics",
             Arg::Filter => "use this filter when resizing an image",
+            Arg::Fx => "apply custom RGB rules (format: op,r,g,b,repl_r,repl_g,repl_b | ops: le, ge | e.g. 'le,5,5,5,0,0,0')",
             Arg::Flip => "flip image vertically",
             Arg::Flop => "flop image horizontally",
             Arg::Blur => "reduce image noise and reduce detail levels",

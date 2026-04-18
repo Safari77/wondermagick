@@ -36,6 +36,8 @@ pub use quantize::QuantizeConfig;
 mod text;
 pub use text::TextConfig;
 mod countcolors;
+mod fx;
+pub use fx::FxConfig;
 
 use crate::{
     arg_parsers::{
@@ -80,6 +82,7 @@ pub enum Operation {
     Quantize(QuantizeConfig),
     Text(TextConfig),
     CountColors,
+    Fx(FxConfig),
 }
 
 impl Operation {
@@ -120,6 +123,7 @@ impl Operation {
             Operation::Quantize(config) => quantize::quantize(image, config),
             Operation::CountColors => countcolors::countcolors(image),
             Operation::Text(config) => text::render_text(image, config),
+            Operation::Fx(config) => fx::fx(image, config),
         }
     }
 
@@ -160,6 +164,7 @@ impl Operation {
             Quantize(_) => (),
             Text(_) => (),
             CountColors => (),
+            Fx(_) => (),
         }
     }
 }

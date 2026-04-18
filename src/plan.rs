@@ -18,9 +18,9 @@ use crate::{
     error::MagickError,
     operations::Axis,
     operations::{
-        Bm3dConfig, ConnectedComponentsConfig, DespeckleConfig, MonochromeConfig, MorphologyConfig,
-        NormalizeBackgroundConfig, Operation, PhansalkarConfig, PruneConfig, QuantizeConfig,
-        RewriteOperation, SauvolaConfig, TextConfig, WolfJolionConfig,
+        Bm3dConfig, ConnectedComponentsConfig, DespeckleConfig, FxConfig, MonochromeConfig,
+        MorphologyConfig, NormalizeBackgroundConfig, Operation, PhansalkarConfig, PruneConfig,
+        QuantizeConfig, RewriteOperation, SauvolaConfig, TextConfig, WolfJolionConfig,
     },
     wm_try,
 };
@@ -274,6 +274,14 @@ impl ExecutionPlan {
                     .ok_or_else(|| ArgParseErr::with_msg("text: value is not valid UTF-8"))?;
                 let config = TextConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Text(config));
+            }
+            Arg::Fx => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("fx: value is not valid UTF-8"))?;
+                let config = FxConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::Fx(config));
             }
             Arg::Negate => self.add_operation(Operation::Negate),
             Arg::Quality => self.modifiers.quality = Some(parse_numeric_arg(value.unwrap())?),
