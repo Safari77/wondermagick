@@ -108,6 +108,7 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
 
     let input = image.pixels.to_rgb8();
     let width = input.width() as usize;
+    let height = input.height() as usize;
 
     // Flatten pixels to a slice of [u8; 3] for fast Rayon iteration
     let pixels: Vec<[u8; 3]> = input.pixels().map(|p| p.0).collect();
@@ -140,110 +141,145 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
     // neighboring pixels. The parallel path is used when dithering is disabled.
     let mut output = RgbImage::new(input.width(), input.height());
 
+    // Palette cached in Oklab once. Mapping uses the same oklch_weighted_dist
+    // the palette was generated under, so the selection metric is consistent end-to-end.
+    let palette_oklab: Vec<Oklab> = palette.iter().map(|&c| srgb_to_oklab(c)).collect();
+
     if config.dither_level > 0.0 {
         // ── Hybrid blue-noise + Sierra Lite error diffusion ──
         // Matches the approach in monochrome.rs: error diffusion preserves tonal
         // accuracy while blue noise breaks up the regular patterns that pure
         // error diffusion creates on smooth gradients.
-        // Error buffer has +2 width padding for boundary-safe neighbor access.
+        // Diffusion runs in Oklab so the propagated "error" is perceptually
+        // meaningful and lives in the same space as the selection metric.
         let padded_w = width + 2;
-        let mut errors_r = vec![0.0f32; padded_w * (input.height() as usize)];
-        let mut errors_g = vec![0.0f32; padded_w * (input.height() as usize)];
-        let mut errors_b = vec![0.0f32; padded_w * (input.height() as usize)];
+        let mut errors_l = vec![0.0f32; padded_w * height];
+        let mut errors_a = vec![0.0f32; padded_w * height];
+        let mut errors_b = vec![0.0f32; padded_w * height];
+
+        // Convert source image to Oklab once. Per-pixel dither state is then
+        // pixels_oklab[i] + accumulated diffused error + jitter.
+        let pixels_oklab: Vec<Oklab> = pixels.par_iter().map(|&p| srgb_to_oklab(p)).collect();
 
         // Blue noise amplitude: dither_level scales how much the noise
         // jitters the pixel before nearest-color search.
-        let noise_spread = config.dither_level * 64.0;
+        let noise_spread = config.dither_level * 0.1;
 
-        for y in 0..input.height() {
-            for x in 0..input.width() {
-                let i = (y as usize) * width + (x as usize);
-                let idx = (y as usize) * padded_w + (x as usize) + 1;
+        // Per-pixel error clamp applied at READ.
+        const ERR_CLAMP_L: f32 = 0.2;
+        const ERR_CLAMP_AB: f32 = 0.05;
+
+        for y in 0..height {
+            // Serpentine: even rows scan left→right, odd rows right→left.
+            let ltr = y % 2 == 0;
+            let fwd_dx: i32 = if ltr { 1 } else { -1 };
+            let diag_dx: i32 = -fwd_dx;
+
+            for step in 0..width {
+                let xs = if ltr { step } else { width - 1 - step };
+                let i = y * width + xs;
+                let idx = y * padded_w + xs + 1;
 
                 // Current pixel + accumulated diffused error, clamped to valid
                 // range to prevent unbounded error accumulation that causes
                 // bright areas to bleed large one-color blobs into dark areas.
-                let r = (pixels[i][0] as f32 + errors_r[idx]).clamp(0.0, 255.0);
-                let g = (pixels[i][1] as f32 + errors_g[idx]).clamp(0.0, 255.0);
-                let b = (pixels[i][2] as f32 + errors_b[idx]).clamp(0.0, 255.0);
+                let p = pixels_oklab[i];
+                let el = errors_l[idx].clamp(-ERR_CLAMP_L, ERR_CLAMP_L);
+                let ea = errors_a[idx].clamp(-ERR_CLAMP_AB, ERR_CLAMP_AB);
+                let eb = errors_b[idx].clamp(-ERR_CLAMP_AB, ERR_CLAMP_AB);
 
                 // Blue noise jitter — shifts decision boundaries between palette
                 // colors, breaking up the structured patterns of pure error diffusion.
-                let noise_u8 = get_noise(x, y);
+                // Applied along L (the gray-axis analogue in Oklab), matching the
+                // effect of the previous sRGB same-value-on-R/G/B jitter.
+                let noise_u8 = get_noise(xs as u32, y as u32);
                 let noise = (noise_u8 as f32 / 255.0) - 0.5;
                 let jitter = noise * noise_spread;
 
-                let jr = (r + jitter).clamp(0.0, 255.0);
-                let jg = (g + jitter).clamp(0.0, 255.0);
-                let jb = (b + jitter).clamp(0.0, 255.0);
+                let jp = Oklab {
+                    l: p.l + el + jitter,
+                    a: p.a + ea,
+                    b: p.b + eb,
+                };
 
                 // Find nearest palette color using the jittered values
                 let mut min_dist = f32::MAX;
-                let mut best_color = palette[0];
-                for color in &palette {
-                    let dr = jr - color[0] as f32;
-                    let dg = jg - color[1] as f32;
-                    let db = jb - color[2] as f32;
-                    let dist = dr * dr + dg * dg + db * db;
-                    if dist < min_dist {
-                        min_dist = dist;
-                        best_color = *color;
+                let mut best_idx: usize = 0;
+                for (ci, &c_ok) in palette_oklab.iter().enumerate() {
+                    let d = oklch_weighted_dist(jp, c_ok);
+                    if d < min_dist {
+                        min_dist = d;
+                        best_idx = ci;
                     }
                 }
 
-                output.put_pixel(x, y, image::Rgb(best_color));
+                output.put_pixel(xs as u32, y as u32, image::Rgb(palette[best_idx]));
 
-                // Quantization error computed from the jittered values — the same
-                // values used for palette selection — so there is no systematic
-                // bias between what was chosen and what error is propagated.
-                let err_r = jr - best_color[0] as f32;
-                let err_g = jg - best_color[1] as f32;
-                let err_b = jb - best_color[2] as f32;
+                // Quantization error EXCLUDES the jitter term. Jitter's role is to
+                // perturb which palette entry wins (it's the whole point of blue
+                // noise here), but propagating jitter into the error buffer turns
+                // that buffer into a bounded random walk across flat regions — and
+                // on long runs the walk eventually reaches the clamp limit, at
+                // which point (source + clamped_err + jitter) lands close enough
+                // to a distant palette entry (dark blue → skin-tone red) that the
+                // wrong entry wins for a single pixel before the correction
+                // propagates. Using (p + el) here matches the no-jitter path's
+                // error formula exactly.
+                let chosen = palette_oklab[best_idx];
+                let err_l = (p.l + el) - chosen.l;
+                let err_a = (p.a + ea) - chosen.a;
+                let err_b = (p.b + eb) - chosen.b;
 
                 // Sierra Lite distribution (same as monochrome.rs):
                 //   current → [right: 2/4, bottom-left: 1/4, bottom: 1/4]
-                if x < input.width() - 1 {
-                    errors_r[idx + 1] += err_r * 0.5;
-                    errors_g[idx + 1] += err_g * 0.5;
-                    errors_b[idx + 1] += err_b * 0.5;
-                }
-                if y < input.height() - 1 {
-                    let below = idx + padded_w;
-                    errors_r[below - 1] += err_r * 0.25;
-                    errors_g[below - 1] += err_g * 0.25;
-                    errors_b[below - 1] += err_b * 0.25;
-                    errors_r[below] += err_r * 0.25;
-                    errors_g[below] += err_g * 0.25;
-                    errors_b[below] += err_b * 0.25;
+                // On R→L rows the pattern is mirrored:
+                //   current → [left: 2/4, bottom-right: 1/4, bottom: 1/4]
+                // so error always propagates in the scan direction. Edge
+                // pixels write into the left/right padding column (which is
+                // never read), so no explicit x-bounds check is needed.
+                let fwd_col = (xs as i32 + fwd_dx + 1) as usize;
+                let fwd_idx = y * padded_w + fwd_col;
+                errors_l[fwd_idx] += err_l * 0.5;
+                errors_a[fwd_idx] += err_a * 0.5;
+                errors_b[fwd_idx] += err_b * 0.5;
+
+                if y + 1 < height {
+                    let below_row = (y + 1) * padded_w;
+                    let diag_col = (xs as i32 + diag_dx + 1) as usize;
+                    let diag_idx = below_row + diag_col;
+                    errors_l[diag_idx] += err_l * 0.25;
+                    errors_a[diag_idx] += err_a * 0.25;
+                    errors_b[diag_idx] += err_b * 0.25;
+                    let below_idx = below_row + xs + 1;
+                    errors_l[below_idx] += err_l * 0.25;
+                    errors_a[below_idx] += err_a * 0.25;
+                    errors_b[below_idx] += err_b * 0.25;
                 }
             }
         }
     } else {
         // ── No dithering: parallel nearest-color mapping ──
+        // Each pixel is converted to Oklab and matched against palette_oklab
+        // under the same weighted distance used for palette generation.
         let raw_out = output.as_mut();
         raw_out
             .par_chunks_exact_mut(3)
             .enumerate()
             .for_each(|(i, pixel_out)| {
-                let r = pixels[i][0] as i32;
-                let g = pixels[i][1] as i32;
-                let b = pixels[i][2] as i32;
+                let p = srgb_to_oklab(pixels[i]);
 
-                let mut min_dist = u32::MAX;
-                let mut best_color = palette[0];
+                let mut min_dist = f32::MAX;
+                let mut best_idx: usize = 0;
 
-                for color in &palette {
-                    let dr = r - color[0] as i32;
-                    let dg = g - color[1] as i32;
-                    let db = b - color[2] as i32;
-                    let dist = (dr * dr + dg * dg + db * db) as u32;
-
-                    if dist < min_dist {
-                        min_dist = dist;
-                        best_color = *color;
+                for (ci, &c_ok) in palette_oklab.iter().enumerate() {
+                    let d = oklch_weighted_dist(p, c_ok);
+                    if d < min_dist {
+                        min_dist = d;
+                        best_idx = ci;
                     }
                 }
 
+                let best_color = palette[best_idx];
                 pixel_out[0] = best_color[0];
                 pixel_out[1] = best_color[1];
                 pixel_out[2] = best_color[2];
@@ -784,30 +820,6 @@ fn generate_palette_oklab(
         *w *= l_eq.powf(l_weight) * c_eq.powf(c_weight);
     }
 
-    // 3. Pure Perceptual Euclidean distance in Oklab.
-    #[inline(always)]
-    fn oklch_weighted_dist(p: Oklab, c: Oklab) -> f32 {
-        let p_c = (p.a * p.a + p.b * p.b).sqrt();
-        let c_c = (c.a * c.a + c.b * c.b).sqrt();
-
-        // 1. Lightness difference
-        let dl = p.l - c.l;
-
-        // 2. Chroma difference
-        let dc = p_c - c_c;
-
-        // 3. Hue difference (chord length trick to avoid expensive atan2)
-        let da = p.a - c.a;
-        let db = p.b - c.b;
-        let dh_sq = (da * da + db * db - dc * dc).max(0.0);
-
-        // Perceptual Weights:
-        // 1.0 for Lightness, 4.0 for Chroma, 4.0 for Hue.
-        // This forces the algorithm to preserve vibrant gradients instead
-        // of settling for mathematically safe but pale averages.
-        (dl * dl * 1.0) + (dc * dc * 4.0) + (dh_sq * 4.0)
-    }
-
     // 4. K-Means++ initialization
     //    Initial fallback value matches the pre-dedup first-pixel Oklab
     //    (the Oklab of rgb_pixels[0]), NOT unique index 0 which is now
@@ -911,23 +923,19 @@ fn generate_palette_oklab(
         // first-index tie-breaking, so the selected best_idx is identical to
         // what the pre-dedup per-pixel loop would have chosen for every
         // duplicate of this color.
+        // Assignment uses the same oklch_weighted_dist as k-means++ init and
+        // the final mapping pass — one metric end-to-end keeps centroids
+        // out of the "hue-distant but plain-Euclidean-close" traps that
+        // previously left them unclaimed and drifting stale.
         let best_per_unique: Vec<u32> = (0..n_unique)
             .into_par_iter()
             .map(|u| {
-                let p = &oklab_pixels[u];
-
-                // Hoist pixel properties out of the centroid loop
-                let p_l = p.l;
-                let p_a = p.a;
-                let p_b = p.b;
+                let p = oklab_pixels[u];
 
                 let mut min_dist = f32::MAX;
                 let mut best_idx = 0u32;
                 for (ci, cd) in cd_slice.iter().enumerate() {
-                    let dl = p_l - cd.l;
-                    let da = p_a - cd.a;
-                    let db = p_b - cd.b;
-                    let dist_sq = dl * dl + da * da + db * db;
+                    let dist_sq = oklch_weighted_dist(p, *cd);
 
                     if dist_sq < min_dist {
                         min_dist = dist_sq;
@@ -999,6 +1007,60 @@ fn generate_palette_oklab(
                 centroids[i] = new_ok;
             }
         }
+
+        // Empty-cluster reseed. Any centroid with counts == 0 got no pixels
+        // assigned this iteration, so the update loop above left it at its
+        // stale position. In the mapping pass that stale centroid can still
+        // be oklch-nearest to some pixels and show up as a stray hue. Reseed
+        // each empty centroid to the unique colour currently furthest from
+        // any filled centroid — the same heuristic k-means++ uses for init.
+        let mut reseeded = false;
+        for empty_idx in 0..k {
+            if counts[empty_idx] > 0.0 {
+                continue;
+            }
+            // Parallel per-unique "distance to nearest filled centroid", then
+            // sequential argmax for deterministic tie-breaking. Empty
+            // centroids are handled one at a time so that each subsequent
+            // reseed sees the previous one as "filled" and avoids landing
+            // every empty slot on the same outlier.
+            let min_d_per_u: Vec<f32> = (0..n_unique)
+                .into_par_iter()
+                .map(|u| {
+                    let p = oklab_pixels[u];
+                    let mut min_d = f32::MAX;
+                    for (ci, cd) in centroids.iter().enumerate() {
+                        if counts[ci] <= 0.0 {
+                            continue;
+                        }
+                        let d = oklch_weighted_dist(p, *cd);
+                        if d < min_d {
+                            min_d = d;
+                        }
+                    }
+                    min_d
+                })
+                .collect();
+
+            let (best_u, _) =
+                min_d_per_u
+                    .iter()
+                    .enumerate()
+                    .fold(
+                        (0usize, f32::MIN),
+                        |(bu, bd), (u, &d)| if d > bd { (u, d) } else { (bu, bd) },
+                    );
+
+            centroids[empty_idx] = oklab_pixels[best_u];
+            counts[empty_idx] = 1.0; // mark filled for later reseeds this pass
+            reseeded = true;
+        }
+        if reseeded {
+            // Force another iteration so reseeded centroids actually get
+            // pixels assigned to them before the convergence test can fire.
+            max_shift = max_shift.max(1.0);
+        }
+
         if max_shift < 1e-4 {
             break;
         }
@@ -1026,6 +1088,29 @@ struct Oklab {
     l: f32,
     a: f32,
     b: f32,
+}
+
+#[inline(always)]
+fn oklch_weighted_dist(p: Oklab, c: Oklab) -> f32 {
+    let p_c = (p.a * p.a + p.b * p.b).sqrt();
+    let c_c = (c.a * c.a + c.b * c.b).sqrt();
+
+    // 1. Lightness difference
+    let dl = p.l - c.l;
+
+    // 2. Chroma difference
+    let dc = p_c - c_c;
+
+    // 3. Hue difference (chord length trick to avoid expensive atan2)
+    let da = p.a - c.a;
+    let db = p.b - c.b;
+    let dh_sq = (da * da + db * db - dc * dc).max(0.0);
+
+    // Perceptual Weights:
+    // 1.0 for Lightness, 4.0 for Chroma, 4.0 for Hue.
+    // This forces the algorithm to preserve vibrant gradients instead
+    // of settling for mathematically safe but pale averages.
+    (dl * dl * 1.0) + (dc * dc * 4.0) + (dh_sq * 4.0)
 }
 
 /// Precomputed lookup table: sRGB u8 → linear f32.
