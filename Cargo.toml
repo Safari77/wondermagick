@@ -27,6 +27,8 @@ imageproc = { git = "https://github.com/Safari77/imageproc" }
 cosmic-text = "0.18"
 tiny-skia = "0.12"
 qrcode = "0.14"
+kurbo = "0.13"
+getrandom = "0.4"
 
 [features]
 default = ["hardened_malloc", "default-formats"]
