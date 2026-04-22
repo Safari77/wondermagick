@@ -66,8 +66,8 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         assert_eq!(
-            GrayscaleMethod::from_str("rec709luminance"),
-            Ok(GrayscaleMethod::Rec709Luminance)
+            GrayscaleMethod::from_str("rec709lumA"),
+            Ok(GrayscaleMethod::Rec709Luma)
         );
     }
 
