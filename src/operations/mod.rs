@@ -38,6 +38,8 @@ pub use text::TextConfig;
 mod countcolors;
 mod fx;
 pub use fx::FxConfig;
+pub mod canvas;
+pub use canvas::{canvas, CanvasConfig};
 
 use crate::{
     arg_parsers::{
@@ -83,6 +85,7 @@ pub enum Operation {
     Text(TextConfig),
     CountColors,
     Fx(FxConfig),
+    Canvas(CanvasConfig),
 }
 
 impl Operation {
@@ -124,6 +127,7 @@ impl Operation {
             Operation::CountColors => countcolors::countcolors(image),
             Operation::Text(config) => text::render_text(image, config),
             Operation::Fx(config) => fx::fx(image, config),
+            Operation::Canvas(config) => crate::operations::canvas(image, config),
         }
     }
 
@@ -165,6 +169,7 @@ impl Operation {
             Text(_) => (),
             CountColors => (),
             Fx(_) => (),
+            Canvas(_) => (),
         }
     }
 }

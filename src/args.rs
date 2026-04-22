@@ -11,6 +11,7 @@ use std::{
 use crate::{
     arg_parsers::{FileFormat, InputFileArg, Location},
     error::MagickError,
+    operations::CanvasConfig,
     plan::ExecutionPlan,
     wm_err,
 };
@@ -90,6 +91,7 @@ pub enum Arg {
     Text,
     CountColors,
     Fx,
+    Canvas,
 }
 
 impl Arg {
@@ -134,6 +136,7 @@ impl Arg {
             Arg::CountColors => false,
             Arg::Text => true,
             Arg::Fx => true,
+            Arg::Canvas => true,
         }
     }
 
@@ -178,6 +181,7 @@ impl Arg {
             Arg::Quantize => "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '32,0.2,0.2:2.6', or 'default' — bias -2.0 uses MacQueen kmeans, -1.0 uses Oklab median-cut, 0.0 uses RGB K-means, >=1.0 uses Oklab K-means++ with pure Perceptual Euclidean distance in Oklab with chroma multiplier (it also supports optional light_boost:lc_priority parameters)",
             Arg::CountColors => "count the number of unique colors in the image",
             Arg::Text => "render rotated multi-line text (format: 'effect,text,font,size,color,rotation,justify,x,y' | Effects: none, blur:<sigma>, gradualblur:<sigma>, shadow:dx:dy:sigma:<#color>, outline:<thickness>:<#color>, explode:strength, meltdown:strength:direction (-1=omnidirectional, 0-360=direction) | meltdown and explode can be added as displacement effect or used with plain text only, e.g. 'outline:3:#000000FF,Hello,Arial,5%,#FFFFFF,45.0,center,center,80%', 'outline:10:a0101080+explode:90,AAEEIIOO,Iosevka,10%,#EEEEEEF0,5,center,center,70%' | QR: 'none,{QR:H:0:#00000000:https://x.com},Arial,15%,#000000,0,center,center,center')",
+            Arg::Canvas => "create a canvas of given size filled with a solid color or gradient (format: WxH,solid|linear|radial,...)",
         }
     }
 }
@@ -271,7 +275,23 @@ pub fn parse_args(mut args: Vec<OsString>) -> Result<ExecutionPlan, MagickError>
             };
             plan.apply_arg(SignedArg { sign, arg }, value.as_deref(), &ctx)?;
         } else {
-            plan.add_input_file(InputFileArg::parse(&raw_arg)?);
+            // Check if the "filename" is actually a generator pseudo-file
+            let arg_str = raw_arg.to_string_lossy();
+            if arg_str.starts_with("xc:") || arg_str.starts_with("canvas:") {
+                // Strip the prefix to get the spec (e.g. "size:100x100,solid,#ff0000")
+                let spec_str = if arg_str.starts_with("xc:") {
+                    &arg_str[3..]
+                } else {
+                    &arg_str[7..]
+                };
+
+                let config = CanvasConfig::parse_arg(spec_str).map_err(|e| {
+                    wm_err!("{}", e.display_with_arg("canvas", OsStr::new(spec_str)))
+                })?;
+                plan.add_canvas(config);
+            } else {
+                plan.add_input_file(InputFileArg::parse(&raw_arg)?);
+            }
         }
     }
     Ok(plan)

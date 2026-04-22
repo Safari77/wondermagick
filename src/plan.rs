@@ -18,9 +18,9 @@ use crate::{
     error::MagickError,
     operations::Axis,
     operations::{
-        Bm3dConfig, ConnectedComponentsConfig, DespeckleConfig, FxConfig, MonochromeConfig,
-        MorphologyConfig, NormalizeBackgroundConfig, Operation, PhansalkarConfig, PruneConfig,
-        QuantizeConfig, RewriteOperation, SauvolaConfig, TextConfig, WolfJolionConfig,
+        Bm3dConfig, CanvasConfig, ConnectedComponentsConfig, DespeckleConfig, FxConfig,
+        MonochromeConfig, MorphologyConfig, NormalizeBackgroundConfig, Operation, PhansalkarConfig,
+        PruneConfig, QuantizeConfig, RewriteOperation, SauvolaConfig, TextConfig, WolfJolionConfig,
     },
     wm_try,
 };
@@ -81,6 +81,7 @@ enum ExecutionStep {
     /// magick -extract 20x20 rose: +write 'null:' out.png # out is a 20x20 file
     /// ```
     InputFile(FilePlan),
+    Canvas(CanvasConfig, Vec<Operation>),
     Write(Location, Option<FileFormat>),
 }
 
@@ -283,6 +284,19 @@ impl ExecutionPlan {
                 let config = FxConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Fx(config));
             }
+            Arg::Canvas => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("canvas: value is not valid UTF-8"))?;
+                let config = CanvasConfig::parse_arg(val_str)?;
+
+                if config.size.is_some() {
+                    self.add_canvas(config); // Generates a new image sequence item
+                } else {
+                    self.add_operation(Operation::Canvas(config)); // Overlays onto existing images
+                }
+            }
             Arg::Negate => self.add_operation(Operation::Negate),
             Arg::Quality => self.modifiers.quality = Some(parse_numeric_arg(value.unwrap())?),
             Arg::Resize => self.add_operation(Operation::Resize(
@@ -345,6 +359,18 @@ impl ExecutionPlan {
         } else {
             self.execution.push(ExecutionStep::Map(op));
         }
+    }
+
+    pub fn add_canvas(&mut self, config: CanvasConfig) {
+        // Grab operations defined before this canvas was added
+        let mut ops = self.global_ops.clone();
+
+        // Apply current modifiers (like -quality, -filter) to the operations
+        for op in &mut ops {
+            op.apply_modifiers(&self.modifiers);
+        }
+
+        self.execution.push(ExecutionStep::Canvas(config, ops));
     }
 
     fn add_rewrite(&mut self, op: RewriteOperation) -> Result<(), ArgParseErr> {
@@ -445,6 +471,32 @@ impl ExecutionPlan {
 
                     sequence.push(image);
                 }
+                ExecutionStep::Canvas(config, ops) => {
+                    // 1. Generate a blank Image container
+                    // The dummy 1x1 buffer will be immediately overwritten by `canvas()`
+                    let mut image = Image {
+                        format: None,
+                        exif: None,
+                        icc: None,
+                        pixels: image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1)),
+                        properties: crate::image::InputProperties {
+                            filename: OsString::from("canvas"),
+                            color_type: image::ExtendedColorType::Rgba8,
+                        },
+                    };
+
+                    // Execute the canvas operation to allocate and fill the buffer
+                    crate::operations::canvas(&mut image, config)?;
+
+                    // 2. Apply any global operations that preceded the -canvas argument
+                    for operation in ops {
+                        operation.execute(&mut image)?;
+                    }
+
+                    // 3. Append to the image stack
+                    sequence.push(image);
+                }
+
                 ExecutionStep::Rewrite(op) => {
                     op.execute(&mut sequence)?;
                 }
