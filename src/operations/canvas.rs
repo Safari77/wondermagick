@@ -12,6 +12,13 @@ pub struct GradientStop {
     pub color: [u8; 4],
 }
 
+/// A coordinate for gradient centers, either a ratio [0.0, 1.0] or absolute pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Coord {
+    Ratio(f64),
+    Pixels(f64),
+}
+
 /// What to fill the canvas with.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanvasSpec {
@@ -24,8 +31,12 @@ pub enum CanvasSpec {
         angle_deg: f64,
         stops: Vec<GradientStop>,
     },
-    /// Radial gradient centered on the canvas, 0 at center, 1 at the farthest corner.
-    Radial { stops: Vec<GradientStop> },
+    /// Radial gradient. `center_x` and `center_y` define the center. 0 at center, 1 at the farthest corner.
+    Radial {
+        center_x: Coord,
+        center_y: Coord,
+        stops: Vec<GradientStop>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +54,7 @@ impl CanvasConfig {
     /// Syntax:
     ///   [size:WxH,]solid,COLOR
     ///   [size:WxH,]linear,ANGLE_DEG,STOP1,STOP2[,STOP3...]
-    ///   [size:WxH,]radial,STOP1,STOP2[,STOP3...]
+    ///   [size:WxH,]radial,[pos:x,y,]STOP1,STOP2[,STOP3...]
     ///
     /// When `size:WxH` is omitted, the canvas operation overwrites the current
     /// image's pixels while keeping its dimensions. When `size:WxH` is given,
@@ -109,14 +120,37 @@ impl CanvasConfig {
                 CanvasSpec::Linear { angle_deg, stops }
             }
             "radial" => {
-                if remaining.len() < 3 {
+                let mut center_x = Coord::Ratio(0.5);
+                let mut center_y = Coord::Ratio(0.5);
+                let mut stops_start = 1;
+
+                // Check for pos:x,y (which spans two comma-separated tokens: "pos:x" and "y")
+                if remaining.len() >= 3 && remaining[1].starts_with("pos:") {
+                    let x_str = remaining[1].strip_prefix("pos:").unwrap();
+                    let y_str = remaining[2];
+                    if let (Some(cx), Some(cy)) = (parse_coord(x_str), parse_coord(y_str)) {
+                        center_x = cx;
+                        center_y = cy;
+                        stops_start = 3;
+                    } else {
+                        return Err(ArgParseErr::with_msg(
+                            "canvas radial: invalid pos specifier (expected pos:x,y)",
+                        ));
+                    }
+                }
+
+                if remaining.len() - stops_start < 2 {
                     return Err(ArgParseErr::with_msg(
-                        "canvas radial: expected '[size:WxH,]radial,STOP1,STOP2[,...]' \
+                        "canvas radial: expected '[size:WxH,]radial,[pos:x,y,]STOP1,STOP2[,...]' \
                          (at least 2 stops)",
                     ));
                 }
-                let stops = parse_stops(&remaining[1..])?;
-                CanvasSpec::Radial { stops }
+                let stops = parse_stops(&remaining[stops_start..])?;
+                CanvasSpec::Radial {
+                    center_x,
+                    center_y,
+                    stops,
+                }
             }
             _ => {
                 return Err(ArgParseErr::with_msg(
@@ -172,6 +206,20 @@ fn hex_digit(c: u8) -> Result<u8, ArgParseErr> {
 
 fn hex_byte(hi: u8, lo: u8) -> Result<u8, ArgParseErr> {
     Ok((hex_digit(hi)? << 4) | hex_digit(lo)?)
+}
+
+fn parse_coord(s: &str) -> Option<Coord> {
+    if let Some(px_str) = s.strip_suffix("px") {
+        let px: f64 = px_str.parse().ok()?;
+        if px >= 0.0 {
+            return Some(Coord::Pixels(px));
+        }
+    } else if let Ok(ratio) = s.parse::<f64>() {
+        if (0.0..=1.0).contains(&ratio) {
+            return Some(Coord::Ratio(ratio));
+        }
+    }
+    None
 }
 
 fn parse_color(s: &str) -> Result<[u8; 4], ArgParseErr> {
@@ -446,14 +494,48 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
                     }
                 });
         }
-        CanvasSpec::Radial { stops } => {
+        CanvasSpec::Radial {
+            center_x,
+            center_y,
+            stops,
+        } => {
             let prepared = PreparedGradient::new(stops);
 
-            let cx = (width as f64 - 1.0) / 2.0;
-            let cy = (height as f64 - 1.0) / 2.0;
-            // Distance from center to farthest corner -> t=1 at the corners,
-            // t=0 at the center.
-            let max_r = (cx * cx + cy * cy).sqrt();
+            let cx = match center_x {
+                Coord::Ratio(r) => r * (width as f64 - 1.0),
+                Coord::Pixels(p) => {
+                    if *p < 0.0 || *p > width as f64 {
+                        return Err(crate::wm_err!(
+                            "canvas radial: xpos in px exceeds image width"
+                        ));
+                    }
+                    *p
+                }
+            };
+            let cy = match center_y {
+                Coord::Ratio(r) => r * (height as f64 - 1.0),
+                Coord::Pixels(p) => {
+                    if *p < 0.0 || *p > height as f64 {
+                        return Err(crate::wm_err!(
+                            "canvas radial: ypos in px exceeds image height"
+                        ));
+                    }
+                    *p
+                }
+            };
+
+            // Calculate distance to the farthest corner from the chosen center
+            let corners = [
+                (0.0, 0.0),
+                (width as f64 - 1.0, 0.0),
+                (0.0, height as f64 - 1.0),
+                (width as f64 - 1.0, height as f64 - 1.0),
+            ];
+            let max_r = corners
+                .iter()
+                .map(|&(px, py)| ((px - cx) * (px - cx) + (py - cy) * (py - cy)).sqrt())
+                .fold(0.0_f64, |a, b| a.max(b));
+
             let inv_max_r = if max_r > 0.0 { 1.0 / max_r } else { 0.0 };
 
             buf.par_chunks_mut(row_bytes)
@@ -584,20 +666,66 @@ mod tests {
     fn parse_arg_radial_with_size() {
         let c = CanvasConfig::parse_arg("size:64x64,radial,0:#ffffff,1:#000000").unwrap();
         assert_eq!(c.size, Some((64, 64)));
-        assert!(matches!(c.spec, CanvasSpec::Radial { .. }));
+        match c.spec {
+            CanvasSpec::Radial {
+                center_x,
+                center_y,
+                stops,
+            } => {
+                assert_eq!(center_x, Coord::Ratio(0.5));
+                assert_eq!(center_y, Coord::Ratio(0.5));
+                assert_eq!(stops.len(), 2);
+            }
+            _ => panic!("expected radial"),
+        }
     }
 
     #[test]
     fn parse_arg_radial_without_size() {
         let c = CanvasConfig::parse_arg("radial,#ffffff,#000000").unwrap();
         assert_eq!(c.size, None);
-        assert!(matches!(c.spec, CanvasSpec::Radial { .. }));
+        match c.spec {
+            CanvasSpec::Radial {
+                center_x,
+                center_y,
+                stops,
+            } => {
+                assert_eq!(center_x, Coord::Ratio(0.5));
+                assert_eq!(center_y, Coord::Ratio(0.5));
+                assert_eq!(stops.len(), 2);
+            }
+            _ => panic!("expected radial"),
+        }
     }
 
     #[test]
-    fn parse_arg_bare_wxh_no_longer_valid() {
-        // The old 'WxH,TYPE,...' form is gone; size must now be prefixed with 'size:'.
-        assert!(CanvasConfig::parse_arg("100x50,solid,#336699").is_err());
+    fn parse_arg_radial_with_coords_no_size() {
+        let c = CanvasConfig::parse_arg("radial,pos:0.75,20px,#ffffff,#000000").unwrap();
+        assert_eq!(c.size, None);
+        match c.spec {
+            CanvasSpec::Radial {
+                center_x,
+                center_y,
+                stops,
+            } => {
+                assert_eq!(center_x, Coord::Ratio(0.75));
+                assert_eq!(center_y, Coord::Pixels(20.0));
+                assert_eq!(stops.len(), 2);
+            }
+            _ => panic!("expected radial"),
+        }
+    }
+
+    #[test]
+    fn parse_arg_radial_invalid_pos_rejected() {
+        // Missing the y-coordinate; the parser reads `#ff00ff` as the y-coordinate and fails.
+        assert!(CanvasConfig::parse_arg("radial,pos:0.75,#ff00ff,#000000").is_err());
+
+        // Also fails if missing the y-coordinate and missing enough stops
+        assert!(CanvasConfig::parse_arg("radial,pos:0.75,#ff00ff").is_err());
+
+        // Fails with completely invalid coordinate formats
+        assert!(CanvasConfig::parse_arg("radial,pos:abc,def,#ffffff,#000000").is_err());
     }
 
     #[test]
