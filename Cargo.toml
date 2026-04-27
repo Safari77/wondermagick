@@ -24,7 +24,7 @@ ndarray = "0.17"
 rayon = "1"
 #imageproc = "0.26"
 imageproc = { git = "https://github.com/Safari77/imageproc" }
-cosmic-text = "0.18"
+cosmic-text = "0.19"
 tiny-skia = "0.12"
 qrcode = "0.14"
 kurbo = "0.13"
