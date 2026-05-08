@@ -40,7 +40,7 @@ hardened_malloc = ["mimalloc/secure"]
 asm = ["image/nasm"]
 
 # These features enable/disable support for specific image formats at compile time
-default-formats = ["avif", "bmp", "exr", "ff", "gif", "hdr", "ico", "jpeg", "jpeg2000", "jxl", "otb", "pcx", "png", "pnm", "qoi", "sgi", "tga", "tiff", "webp", "xbm", "xpm"]
+default-formats = ["avif", "bmp", "exr", "ff", "gif", "hdr", "ico", "jpeg", "jpeg2000", "jxl", "png", "pnm", "qoi", "tga", "tiff", "webp"]
 avif = ["image/avif"]
 bmp = ["image/bmp"]
 exr = ["image/exr"]
@@ -81,6 +81,6 @@ panic = "abort"
 opt-level = 3
 
 [patch.crates-io]
-image = {git = "https://github.com/image-rs/image.git"}
+image = {git = "https://github.com/image-rs/image.git", rev = "89c008d5c3710f4aae3d2a669366e41c9028ded4"}
 # https://github.com/tirr-c/jxl-oxide/pull/488
 jxl-oxide = {git = "https://github.com/tirr-c/jxl-oxide.git"}
