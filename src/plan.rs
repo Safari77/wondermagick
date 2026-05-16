@@ -82,7 +82,7 @@ enum ExecutionStep {
     /// ```
     InputFile(FilePlan),
     Canvas(CanvasConfig, Vec<Operation>),
-    Write(Location, Option<FileFormat>),
+    Write(Location, Option<FileFormat>, Modifiers),
 }
 
 impl ExecutionPlan {
@@ -390,7 +390,8 @@ impl ExecutionPlan {
         }
 
         let (loc, format) = ctx.parse_output_file(loc);
-        self.execution.push(ExecutionStep::Write(loc, format));
+        self.execution
+            .push(ExecutionStep::Write(loc, format, self.modifiers.clone()));
         Ok(())
     }
 
@@ -453,7 +454,11 @@ impl ExecutionPlan {
 
         let mut sequence: Vec<Image> = vec![];
 
-        let output = ExecutionStep::Write(self.output_file.clone(), self.output_format);
+        let output = ExecutionStep::Write(
+            self.output_file.clone(),
+            self.output_format,
+            self.modifiers.clone(),
+        );
 
         for step in self.execution.iter().chain([&output]) {
             match step {
@@ -477,6 +482,7 @@ impl ExecutionPlan {
                     let mut image = Image {
                         format: None,
                         exif: None,
+                        xmp: None,
                         icc: None,
                         pixels: image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1)),
                         properties: crate::image::InputProperties {
@@ -500,10 +506,10 @@ impl ExecutionPlan {
                 ExecutionStep::Rewrite(op) => {
                     op.execute(&mut sequence)?;
                 }
-                ExecutionStep::Write(location, format) => {
+                ExecutionStep::Write(location, format, modifiers) => {
                     let output_locations = Self::output_locations(location, &sequence);
                     for (image, specific_location) in sequence.iter_mut().zip(output_locations) {
-                        encode::encode(image, &specific_location, *format, &self.modifiers)?;
+                        encode::encode(image, &specific_location, *format, modifiers)?;
                     }
                 }
             }
@@ -549,7 +555,7 @@ pub struct FilePlan {
     pub ops: Vec<Operation>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Modifiers {
     pub quality: Option<f64>,
     pub strip: Strip,
@@ -561,8 +567,9 @@ pub struct Modifiers {
 #[derive(Debug, Default, Copy, Clone)] // bools default to false
 pub struct Strip {
     pub exif: bool,
+    pub xmp: bool,
     pub icc: bool,
-    // TODO: XMP, etc: https://imagemagick.org/script/command-line-options.php#profile
+    // TODO: IPTC, etc: https://imagemagick.org/script/command-line-options.php#profile
 }
 
 impl Strip {
@@ -570,6 +577,7 @@ impl Strip {
         // enumerate the fields exhaustively so that the compiler complains if we miss any
         *self = Self {
             exif: new_val,
+            xmp: new_val,
             icc: new_val,
         };
     }
@@ -593,6 +601,7 @@ mod tests {
             Image {
                 format: None,
                 exif: None,
+                xmp: None,
                 icc: None,
                 pixels: image::DynamicImage::new_rgb8(1, 1),
                 properties: input.clone(),
@@ -600,6 +609,7 @@ mod tests {
             Image {
                 format: Some(ImageFormat::Jpeg),
                 exif: None,
+                xmp: None,
                 icc: None,
                 pixels: image::DynamicImage::new_rgb8(1, 1),
                 properties: input.clone(),
