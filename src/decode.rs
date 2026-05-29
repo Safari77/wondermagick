@@ -1,6 +1,6 @@
 use std::io::{BufReader, Seek};
 
-use image::{DynamicImage, ImageDecoder, ImageReader};
+use image::{DynamicImage, ImageReaderOptions};
 
 use crate::{
     arg_parsers::{FileFormat, Location},
@@ -18,7 +18,7 @@ pub fn decode(location: &Location, format: Option<FileFormat>) -> Result<Image, 
     };
 
     let mut reader = match location {
-        Location::Path(path) => ImageReader::open(path)
+        Location::Path(path) => ImageReaderOptions::open(path)
             .map_err(|error| wm_err!("unable to open image '{}': {error}", path.display()))?,
         Location::Stdio => {
             // The decoder requires Seek, which Stdout doesn't implement.
@@ -26,7 +26,7 @@ pub fn decode(location: &Location, format: Option<FileFormat>) -> Result<Image, 
             let mut file = wm_try!(tempfile::tempfile());
             wm_try!(std::io::copy(&mut std::io::stdin(), &mut file));
             wm_try!(file.seek(std::io::SeekFrom::Start(0)));
-            ImageReader::new(BufReader::new(file))
+            ImageReaderOptions::new(BufReader::new(file))
         }
     };
 
@@ -40,12 +40,17 @@ pub fn decode(location: &Location, format: Option<FileFormat>) -> Result<Image, 
             reader.format()
         }
     };
-    let mut decoder = wm_try!(reader.into_decoder());
-    let exif = decoder.exif_metadata().unwrap_or(None);
-    let xmp = decoder.xmp_metadata().unwrap_or(None);
-    let icc = decoder.icc_profile().unwrap_or(None);
-    let color_type = decoder.original_color_type();
-    let pixels = wm_try!(DynamicImage::from_decoder(decoder));
+    let mut reader = wm_try!(reader.into_reader());
+    let (pixels, mut metadata) = wm_try!(reader.decode());
+    let exif = metadata.exif_metadata().unwrap_or(None);
+    let xmp = metadata.xmp_metadata().unwrap_or(None);
+    let icc = metadata.icc_profile().unwrap_or(None);
+    // `original_color_type` is now only an optional hint, set when the decoded data differs
+    // from the source. When absent, the original matches the decoded image's color type.
+    let color_type = metadata
+        .attributes()
+        .original_color_type
+        .unwrap_or_else(|| pixels.color().into());
     let properties = InputProperties {
         filename: location.to_filename(),
         color_type,

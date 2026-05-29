@@ -769,7 +769,7 @@ fn render_qr_block(
 
     // Build a tiny_skia pixmap from the supersampled QR image
     let mut qr_pixmap = Pixmap::new(ss_w, ss_h).expect("Failed to allocate QR pixmap");
-    for (src, dst) in qr_rgba.pixels().zip(qr_pixmap.pixels_mut()) {
+    for (src, dst) in qr_rgba.pixels().into_iter().zip(qr_pixmap.pixels_mut()) {
         *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
     }
 
@@ -804,7 +804,7 @@ fn render_qr_block(
 
     // Start with the original image as the base
     let mut main_pixmap = Pixmap::new(img_w, img_h).expect("Failed to allocate main pixmap");
-    for (src, dst) in rgba_img.pixels().zip(main_pixmap.pixels_mut()) {
+    for (src, dst) in rgba_img.pixels().into_iter().zip(main_pixmap.pixels_mut()) {
         *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
     }
 
@@ -1104,7 +1104,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
     }
 
     let mut main_pixmap = Pixmap::new(img_w, img_h).expect("Failed to allocate main pixmap");
-    for (src, dst) in rgba_img.pixels().zip(main_pixmap.pixels_mut()) {
+    for (src, dst) in rgba_img.pixels().into_iter().zip(main_pixmap.pixels_mut()) {
         *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
     }
 
@@ -1237,7 +1237,11 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
             // Convert blurred shadow back to a Pixmap for compositing
             let mut shadow_pixmap =
                 Pixmap::new(tw_u32, th_u32).expect("Failed to allocate shadow pixmap");
-            for (src, dst) in blurred_rgba.pixels().zip(shadow_pixmap.pixels_mut()) {
+            for (src, dst) in blurred_rgba
+                .pixels()
+                .into_iter()
+                .zip(shadow_pixmap.pixels_mut())
+            {
                 *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
             }
 
@@ -1390,6 +1394,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
             let h = img_h as usize;
             let field: Vec<f32> = blurred_mask_rgba
                 .pixels()
+                .into_iter()
                 .map(|px| px[0] as f32 / 255.0)
                 .collect();
 

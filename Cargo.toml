@@ -24,6 +24,7 @@ ndarray = "0.17"
 rayon = "1"
 #imageproc = "0.26"
 imageproc = { git = "https://github.com/Safari77/imageproc" }
+#imageproc = { git = "https://github.com/image-rs/imageproc" }
 cosmic-text = "0.19"
 tiny-skia = "0.12"
 qrcode = "0.14"
@@ -40,7 +41,7 @@ hardened_malloc = ["mimalloc/secure"]
 asm = ["image/nasm"]
 
 # These features enable/disable support for specific image formats at compile time
-default-formats = ["avif", "bmp", "exr", "ff", "gif", "hdr", "ico", "jpeg", "jpeg2000", "jxl", "png", "pnm", "qoi", "tga", "tiff", "webp"]
+default-formats = ["avif", "bmp", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"]
 avif = ["image/avif"]
 bmp = ["image/bmp"]
 exr = ["image/exr"]
@@ -81,6 +82,6 @@ panic = "abort"
 opt-level = 3
 
 [patch.crates-io]
-image = {git = "https://github.com/image-rs/image.git", rev = "89c008d5c3710f4aae3d2a669366e41c9028ded4"}
+image = {git = "https://github.com/image-rs/image.git"}
 # https://github.com/tirr-c/jxl-oxide/pull/488
 jxl-oxide = {git = "https://github.com/tirr-c/jxl-oxide.git"}

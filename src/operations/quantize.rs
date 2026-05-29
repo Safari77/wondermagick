@@ -111,7 +111,7 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
     let height = input.height() as usize;
 
     // Flatten pixels to a slice of [u8; 3] for fast Rayon iteration
-    let pixels: Vec<[u8; 3]> = input.pixels().map(|p| p.0).collect();
+    let pixels: Vec<[u8; 3]> = input.pixels().into_iter().map(|p| p.0).collect();
 
     // 1 & 2. Generate Palette using MacQueen K-Means, Classic RGB K-Means, Oklab K-Means++, or Oklab Median-Cut
     let palette = if config.bias <= -2.0 {
