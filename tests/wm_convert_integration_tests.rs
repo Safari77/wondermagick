@@ -56,7 +56,13 @@ fn test_identify_reports_current_color_type() {
 
     let binary = env!("CARGO_BIN_EXE_wm-convert");
     let identify = Command::new(binary)
-        .args(["./tests/sample.png", "-monochrome", "-identify", "null:"])
+        .args([
+            "./tests/sample.png",
+            "-monochrome",
+            "default",
+            "-identify",
+            "null:",
+        ])
         .output()
         .expect("convert did not exit successfully");
 
