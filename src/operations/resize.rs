@@ -223,7 +223,7 @@ where
     P::Subpixel:
         Copy + PartialEq + BitXor<P::Subpixel, Output = P::Subpixel> + AddAssign + Into<u64>,
 {
-    let first_pixel_alpha = *match img.pixels().first() {
+    let first_pixel_alpha = *match img.pixels().iter().next() {
         Some(pixel) => pixel.channels().last().unwrap(), // there doesn't seem to be a better way to retrieve the alpha channel
         None => return true,                             // empty input image
     };
@@ -249,12 +249,12 @@ where
 #[must_use]
 fn has_constant_alpha_f32(img: &ImageBuffer<image::Rgba<f32>, Vec<f32>>) -> bool {
     // Optimizing correctly in presence of NaNs and infinities is tricky, so just do the naive thing for now
-    let first_pixel_alpha = match img.pixels().first() {
+    let first_pixel_alpha = match img.pixels().iter().next() {
         Some(pixel) => pixel.alpha(),
         None => return true, // empty input image
     };
     img.pixels()
-        .into_iter()
+        .iter()
         .map(|pixel| pixel.channels().last().unwrap())
         .all(|alpha| *alpha == first_pixel_alpha)
 }
