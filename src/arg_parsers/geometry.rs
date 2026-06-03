@@ -90,14 +90,13 @@ impl TryFrom<&OsStr> for Geometry {
             return Err(ArgParseErr::new());
         }
 
-        if let Some(next_char) = ascii.first() {
-            if ![b'x', b'+', b'-'].contains(next_char) {
+        if let Some(next_char) = ascii.first()
+            && ![b'x', b'+', b'-'].contains(next_char) {
                 result.width = Some(read_positive_float(&mut ascii).ok_or(ArgParseErr::new())?);
             }
-        }
         let mut found_x = false;
-        if let Some(next_char) = ascii.first() {
-            if next_char == &b'x' {
+        if let Some(next_char) = ascii.first()
+            && next_char == &b'x' {
                 ascii = &ascii[1..]; // skip the 'x'
                 found_x = true;
 
@@ -109,23 +108,20 @@ impl TryFrom<&OsStr> for Geometry {
                     }
                 }
             }
-        }
 
         // imagemagick permits "+15+20" and "5x+15+20" but not "5+15+20"
         if result.width.is_none() && result.height.is_none() || found_x {
             // We try to read signed offsets afterwards ONLY if there was an 'x' to mimic imagemagick
-            if let Some(next_char) = ascii.first() {
-                if [b'+', b'-'].contains(next_char) {
+            if let Some(next_char) = ascii.first()
+                && [b'+', b'-'].contains(next_char) {
                     let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
                     result.xoffset = Some(offset);
                 }
-            }
-            if let Some(next_char) = ascii.first() {
-                if [b'+', b'-'].contains(next_char) {
+            if let Some(next_char) = ascii.first()
+                && [b'+', b'-'].contains(next_char) {
                     let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
                     result.yoffset = Some(offset);
                 }
-            }
         }
 
         if !ascii.is_empty() {

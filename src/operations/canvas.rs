@@ -197,7 +197,7 @@ impl CoonsPatch {
 
             // If the solver wanders wildly outside the 0.0-1.0 UV space,
             // the pixel is outside the patch geometry.
-            if u < -0.2 || u > 1.2 || v < -0.2 || v > 1.2 {
+            if !(-0.2..=1.2).contains(&u) || !(-0.2..=1.2).contains(&v) {
                 return None;
             }
         }
@@ -385,12 +385,11 @@ impl CanvasConfig {
         for &token in remaining {
             if let Some(ease_str) = token.strip_prefix("ease:") {
                 let pts: Result<Vec<f64>, _> = ease_str.split(':').map(|n| n.parse()).collect();
-                if let Ok(p) = pts {
-                    if p.len() == 4 {
+                if let Ok(p) = pts
+                    && p.len() == 4 {
                         easing = Some(CssEasing::new(p[0], p[1], p[2], p[3]));
                         continue;
                     }
-                }
                 return Err(ArgParseErr::with_msg(
                     "canvas: invalid easing format (expected ease:x1:y1:x2:y2)",
                 ));
@@ -628,7 +627,7 @@ impl CanvasConfig {
 
 fn parse_size(s: &str) -> Result<(u32, u32), ArgParseErr> {
     // accept both 'x' and 'X' as separator
-    let mut it = s.splitn(2, |c| c == 'x' || c == 'X');
+    let mut it = s.splitn(2, ['x', 'X']);
     let w_str = it
         .next()
         .ok_or_else(|| ArgParseErr::with_msg("canvas size: missing width"))?;
@@ -650,7 +649,7 @@ fn parse_size(s: &str) -> Result<(u32, u32), ArgParseErr> {
     let bytes = (w as u64)
         .checked_mul(h as u64)
         .and_then(|p| p.checked_mul(4));
-    if bytes.map_or(true, |b| b > (isize::MAX as u64)) {
+    if bytes.is_none_or(|b| b > (isize::MAX as u64)) {
         return Err(ArgParseErr::with_msg(
             "canvas size: dimensions are too large for this platform",
         ));
@@ -677,11 +676,10 @@ fn parse_coord(s: &str) -> Option<Coord> {
         if px >= 0.0 {
             return Some(Coord::Pixels(px));
         }
-    } else if let Ok(ratio) = s.parse::<f64>() {
-        if (0.0..=1.0).contains(&ratio) {
+    } else if let Ok(ratio) = s.parse::<f64>()
+        && (0.0..=1.0).contains(&ratio) {
             return Some(Coord::Ratio(ratio));
         }
-    }
     None
 }
 

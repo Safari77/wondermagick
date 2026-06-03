@@ -223,14 +223,12 @@ impl ArgParseCtx {
         // "png:-" is parsed as:
         //   - (Path("png:-"), None) if a file or dir named "png:-" exists.
         //   - (Stdio, Some("png")) otherwise.
-        if let Location::Path(path) = &output_file {
-            if !exists(path) {
-                if let Some((path, format)) = crate::arg_parsers::parse_path_and_format(input) {
+        if let Location::Path(path) = &output_file
+            && !exists(path)
+                && let Some((path, format)) = crate::arg_parsers::parse_path_and_format(input) {
                     output_file = Location::from_arg(&path);
                     output_format = Some(format);
                 }
-            }
-        }
         (output_file, output_format)
     }
 }

@@ -769,7 +769,7 @@ fn render_qr_block(
 
     // Build a tiny_skia pixmap from the supersampled QR image
     let mut qr_pixmap = Pixmap::new(ss_w, ss_h).expect("Failed to allocate QR pixmap");
-    for (src, dst) in qr_rgba.pixels().into_iter().zip(qr_pixmap.pixels_mut()) {
+    for (src, dst) in qr_rgba.pixels().iter().zip(qr_pixmap.pixels_mut()) {
         *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
     }
 
@@ -804,7 +804,7 @@ fn render_qr_block(
 
     // Start with the original image as the base
     let mut main_pixmap = Pixmap::new(img_w, img_h).expect("Failed to allocate main pixmap");
-    for (src, dst) in rgba_img.pixels().into_iter().zip(main_pixmap.pixels_mut()) {
+    for (src, dst) in rgba_img.pixels().iter().zip(main_pixmap.pixels_mut()) {
         *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
     }
 
@@ -873,11 +873,10 @@ pub fn render_text(image: &mut Image, config: &TextConfig) -> Result<(), MagickE
     let segments = parse_text_segments(&config.text).map_err(|e| wm_err!("{:?}", e.message))?;
 
     // If the entire text is a single QR block, render only the QR code
-    if segments.len() == 1 {
-        if let TextSegment::Qr(ref qr) = segments[0] {
+    if segments.len() == 1
+        && let TextSegment::Qr(ref qr) = segments[0] {
             return render_qr_block(image, config, qr);
         }
-    }
 
     // For mixed content or plain text, render QR blocks first (each one composited),
     // then render the remaining plain text on top.
@@ -1104,7 +1103,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
     }
 
     let mut main_pixmap = Pixmap::new(img_w, img_h).expect("Failed to allocate main pixmap");
-    for (src, dst) in rgba_img.pixels().into_iter().zip(main_pixmap.pixels_mut()) {
+    for (src, dst) in rgba_img.pixels().iter().zip(main_pixmap.pixels_mut()) {
         *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
     }
 
@@ -1239,7 +1238,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                 Pixmap::new(tw_u32, th_u32).expect("Failed to allocate shadow pixmap");
             for (src, dst) in blurred_rgba
                 .pixels()
-                .into_iter()
+                .iter()
                 .zip(shadow_pixmap.pixels_mut())
             {
                 *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
@@ -1394,7 +1393,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
             let h = img_h as usize;
             let field: Vec<f32> = blurred_mask_rgba
                 .pixels()
-                .into_iter()
+                .iter()
                 .map(|px| px[0] as f32 / 255.0)
                 .collect();
 

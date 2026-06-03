@@ -524,8 +524,8 @@ impl ExecutionPlan {
     ///
     /// FIXME: handle animated/sequence output
     fn output_locations(output: &Location, images: &[Image]) -> Vec<Location> {
-        if images.len() > 1 {
-            if let Location::Path(output_file) = output {
+        if images.len() > 1
+            && let Location::Path(output_file) = output {
                 let mut locations = Vec::new();
                 for i in 1..=images.len() {
                     let suffix = OsString::from(format!("-{i}")); // indexing for output images starts at 1
@@ -535,7 +535,6 @@ impl ExecutionPlan {
                 }
                 return locations;
             }
-        }
 
         vec![output.clone(); images.len()]
     }

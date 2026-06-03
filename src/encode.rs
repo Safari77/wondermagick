@@ -147,11 +147,10 @@ fn choose_encoding_format(
         return Ok(format);
     }
     // if format was not explicitly specified, guess based on the output path
-    if let Location::Path(path) = location {
-        if let Ok(format) = ImageFormat::from_path(path) {
+    if let Location::Path(path) = location
+        && let Ok(format) = ImageFormat::from_path(path) {
             return Ok(format);
         }
-    }
     // if that fails, use the input format (like ImageMagick)
     if let Some(format) = image.format {
         return Ok(format);
