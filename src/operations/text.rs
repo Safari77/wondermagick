@@ -882,7 +882,7 @@ pub fn render_text(image: &mut Image, config: &TextConfig) -> Result<(), MagickE
     // For mixed content or plain text, render QR blocks first (each one composited),
     // then render the remaining plain text on top.
     for seg in &segments {
-        if let TextSegment::Qr(ref qr) = seg {
+        if let TextSegment::Qr(qr) = seg {
             render_qr_block(image, config, qr)?;
         }
     }

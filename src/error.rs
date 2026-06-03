@@ -38,7 +38,7 @@ macro_rules! wm_err {
                 let name = type_name_of(f);
                 // transform the full path that ends with "::f" to indicate a function
                 // into the name of the function
-                &name.rsplit("::").nth(1).unwrap_or("unknown")
+                name.rsplit("::").nth(1).unwrap_or("unknown")
             },
             line!(),
         ))
