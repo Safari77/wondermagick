@@ -13,7 +13,7 @@ image = { version = "0.25", default-features = false, features = ["rayon", "avif
 pic-scale-safe = { version = "0.1", features = ["rayon"] }
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
-webpx = { version = "0.3.3", default-features = false, optional = true, features = ["encode", "std", "icc"] }
+webpx = { version = "0.4", default-features = false, optional = true, features = ["encode", "std", "icc"] }
 mimalloc = { version = "0.1", optional = true }
 hayro-jpeg2000 = { version = "0.3", optional = true }
 image-extras = { version = "0.1", optional = true, default-features = false }
