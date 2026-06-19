@@ -40,6 +40,9 @@ pub fn decode(location: &Location, format: Option<FileFormat>) -> Result<Image, 
             reader.format()
         }
     };
+    // Disable the `image` crate's default decoding limits (notably the 512 MiB
+    // `max_alloc` cap) so arbitrarily large images can be decoded.
+    reader.no_limits();
     let mut reader = wm_try!(reader.into_reader());
     let (pixels, mut metadata) = wm_try!(reader.decode());
     let exif = metadata.exif_metadata().unwrap_or(None);
