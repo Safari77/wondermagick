@@ -43,6 +43,7 @@ asm = ["image/nasm"]
 default-formats = ["avif", "bmp", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"]
 avif = ["image/avif"]
 bmp = ["image/bmp"]
+#dds = ["image/dds"] # moved to unreleased image-extras. TODO: re-enable.
 exr = ["image/exr"]
 ff = ["image/ff"]
 gif = ["image/gif"]
