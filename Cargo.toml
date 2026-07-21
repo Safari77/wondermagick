@@ -29,6 +29,8 @@ tiny-skia = "0.12"
 qrcode = "0.14"
 kurbo = "0.13"
 getrandom = "0.4"
+gainforge = "0.5"
+moxcms = "0.8"
 
 [features]
 default = ["hardened_malloc", "default-formats"]

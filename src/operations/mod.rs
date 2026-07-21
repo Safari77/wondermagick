@@ -40,6 +40,8 @@ mod fx;
 pub use fx::FxConfig;
 pub mod canvas;
 pub use canvas::{canvas, CanvasConfig};
+mod tonemap;
+pub use tonemap::TonemapConfig;
 
 use crate::{
     arg_parsers::{
@@ -86,6 +88,7 @@ pub enum Operation {
     CountColors,
     Fx(FxConfig),
     Canvas(CanvasConfig),
+    Tonemap(TonemapConfig),
 }
 
 impl Operation {
@@ -128,6 +131,7 @@ impl Operation {
             Operation::Text(config) => text::render_text(image, config),
             Operation::Fx(config) => fx::fx(image, config),
             Operation::Canvas(config) => crate::operations::canvas(image, config),
+            Operation::Tonemap(config) => tonemap::tonemap(image, config),
         }
     }
 
@@ -170,6 +174,7 @@ impl Operation {
             CountColors => (),
             Fx(_) => (),
             Canvas(_) => (),
+            Tonemap(_) => (),
         }
     }
 }

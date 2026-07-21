@@ -20,7 +20,7 @@ use crate::{
     operations::{
         Bm3dConfig, CanvasConfig, ConnectedComponentsConfig, DespeckleConfig, FxConfig,
         MonochromeConfig, MorphologyConfig, NormalizeBackgroundConfig, Operation, PhansalkarConfig,
-        PruneConfig, QuantizeConfig, RewriteOperation, SauvolaConfig, TextConfig, WolfJolionConfig,
+        PruneConfig, QuantizeConfig, RewriteOperation, SauvolaConfig, TextConfig, WolfJolionConfig, TonemapConfig,
     },
     wm_try,
 };
@@ -296,6 +296,15 @@ impl ExecutionPlan {
                 } else {
                     self.add_operation(Operation::Canvas(config)); // Overlays onto existing images
                 }
+            }
+            Arg::Tonemap => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("tonemap: value is not valid UTF-8"))?;
+                let config = TonemapConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::Tonemap(config));
+                self.modifiers.strip.set_all(true);
             }
             Arg::Negate => self.add_operation(Operation::Negate),
             Arg::Quality => self.modifiers.quality = Some(parse_numeric_arg(value.unwrap())?),
