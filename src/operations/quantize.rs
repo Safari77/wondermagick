@@ -1183,6 +1183,8 @@ fn oklab_to_linear_srgb(ok: Oklab) -> [f32; 3] {
 // -----------------------------------------------------------------------------
 const NOISE_DATA: &[u8] = include_bytes!("blue-noise-256.bin");
 const NOISE_DATA_WIDTH_AND_HEIGHT: usize = 256;
+const _: () =
+    assert!(NOISE_DATA.len() == NOISE_DATA_WIDTH_AND_HEIGHT * NOISE_DATA_WIDTH_AND_HEIGHT);
 
 #[inline]
 fn get_noise(x: u32, y: u32) -> u8 {

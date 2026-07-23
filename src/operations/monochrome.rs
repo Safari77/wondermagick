@@ -366,6 +366,8 @@ pub fn apply_blue_noise_scatter(image: &mut GrayImage, config: &MonochromeConfig
 //  * Copy the binary next to this source file.
 const NOISE_DATA: &[u8] = include_bytes!("blue-noise-256.bin");
 const NOISE_DATA_WIDTH_AND_HEIGHT: usize = 256;
+const _: () =
+    assert!(NOISE_DATA.len() == NOISE_DATA_WIDTH_AND_HEIGHT * NOISE_DATA_WIDTH_AND_HEIGHT);
 
 /// Get the noise value at the given coordinates. If the coordinates are out of bounds,
 /// they will wrap around. Means we don't need a noise texture as large as the image.
