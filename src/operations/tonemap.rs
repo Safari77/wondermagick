@@ -370,13 +370,12 @@ impl TonemapConfig {
                 "max_luma must be positive and finite",
             ));
         }
-        if let Some(cb) = config.content_brightness {
-            if !cb.is_finite() || cb <= 0.0 {
+        if let Some(cb) = config.content_brightness
+            && (!cb.is_finite() || cb <= 0.0) {
                 return Err(ArgParseErr::with_msg(
                     "content_brightness must be positive and finite",
                 ));
             }
-        }
         // Filmic-spline and AgX knobs feed straight into gainforge, so range-check
         // them here too rather than trusting the mapper to handle garbage.
         config.filmic_spline.validate()?;

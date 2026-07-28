@@ -871,7 +871,7 @@ fn apply_blur_under_rotated_region(
     img_w: u32,
     img_h: u32,
 ) -> Result<(), MagickError> {
-    if !(sigma > 0.0) {
+    if sigma <= 0.0 || sigma.is_nan() {
         return Ok(());
     }
 
@@ -1405,7 +1405,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
             }
 
             // Nothing measurable to fit; also keeps the ratios below finite.
-            if !(tw > 0.0) || !(th > 0.0) {
+            if tw <= 0.0 || tw.is_nan() || th <= 0.0 || th.is_nan() {
                 break (tw, th, lh);
             }
 

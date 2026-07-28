@@ -91,7 +91,7 @@ impl TryFrom<&OsStr> for Geometry {
         }
 
         if let Some(next_char) = ascii.first()
-            && ![b'x', b'+', b'-'].contains(next_char) {
+            && !b"x+-".contains(next_char) {
                 result.width = Some(read_positive_float(&mut ascii).ok_or(ArgParseErr::new())?);
             }
         let mut found_x = false;
@@ -102,7 +102,7 @@ impl TryFrom<&OsStr> for Geometry {
 
                 if let Some(next_char) = ascii.first() {
                     // width cannot be signed, if there's a sign it's an offset
-                    if ![b'+', b'-'].contains(next_char) {
+                    if !b"+-".contains(next_char) {
                         result.height =
                             Some(read_positive_float(&mut ascii).ok_or(ArgParseErr::new())?);
                     }
@@ -113,12 +113,12 @@ impl TryFrom<&OsStr> for Geometry {
         if result.width.is_none() && result.height.is_none() || found_x {
             // We try to read signed offsets afterwards ONLY if there was an 'x' to mimic imagemagick
             if let Some(next_char) = ascii.first()
-                && [b'+', b'-'].contains(next_char) {
+                && b"+-".contains(next_char) {
                     let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
                     result.xoffset = Some(offset);
                 }
             if let Some(next_char) = ascii.first()
-                && [b'+', b'-'].contains(next_char) {
+                && b"+-".contains(next_char) {
                     let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
                     result.yoffset = Some(offset);
                 }
