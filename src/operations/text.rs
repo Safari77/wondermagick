@@ -1298,6 +1298,7 @@ fn render_qr_block(
 }
 
 pub fn render_text(image: &mut Image, config: &TextConfig) -> Result<(), MagickError> {
+    //eprintln!("text: input color type = {:?}", image.pixels.color());
     // Parse text for QR blocks and escape sequences. `TextConfig::parse_arg`
     // already validated this, so a failure here means the config was built by
     // hand rather than parsed.
