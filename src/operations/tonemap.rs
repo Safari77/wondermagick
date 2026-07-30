@@ -1,9 +1,9 @@
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image, wm_err};
 use gainforge::{
-    create_tone_mapper_rgb, create_tone_mapper_rgb16, create_tone_mapper_rgba,
-    create_tone_mapper_rgba16, AgxCustomLook, AgxLook, CommonToneMapperParameters,
-    FilmicSplineParameters, ForgeError, GainHdrMetadata, GamutClipping, JzazbzToneMapperParameters,
-    MappingColorSpace, RgbToneMapperParameters, ToneMappingMethod,
+    AgxCustomLook, AgxLook, CommonToneMapperParameters, FilmicSplineParameters, ForgeError,
+    GainHdrMetadata, GamutClipping, JzazbzToneMapperParameters, MappingColorSpace,
+    RgbToneMapperParameters, ToneMappingMethod, create_tone_mapper_rgb, create_tone_mapper_rgb16,
+    create_tone_mapper_rgba, create_tone_mapper_rgba16,
 };
 use image::{DynamicImage, ImageBuffer, Rgb as ImgRgb, RgbImage, Rgba as ImgRgba, RgbaImage};
 use moxcms::{ColorProfile, Rgb};
@@ -54,16 +54,8 @@ impl FilmicSplineConfig {
     /// out-of-range value fails at parse time instead of producing garbage or
     /// panicking deep inside the mapper.
     fn validate(&self) -> Result<(), ArgParseErr> {
-        check_positive_finite(
-            self.output_power,
-            "fs_output_power must be positive and finite",
-        )?;
-        check_range(
-            self.latitude,
-            0.01,
-            99.0,
-            "fs_latitude out of range (0.01 .. 99)",
-        )?;
+        check_positive_finite(self.output_power, "fs_output_power must be positive and finite")?;
+        check_range(self.latitude, 0.01, 99.0, "fs_latitude out of range (0.01 .. 99)")?;
         check_range(
             self.white_point_source,
             0.1,
@@ -77,36 +69,16 @@ impl FilmicSplineConfig {
             "fs_black_source out of range (-16 .. -0.1)",
         )?;
         check_range(self.contrast, 0.0, 5.0, "fs_contrast out of range (0 .. 5)")?;
-        check_range(
-            self.black_point_target,
-            0.0,
-            20.0,
-            "fs_black_target out of range (0 .. 20)",
-        )?;
-        check_range(
-            self.grey_point_target,
-            1.0,
-            50.0,
-            "fs_grey_target out of range (1 .. 50)",
-        )?;
+        check_range(self.black_point_target, 0.0, 20.0, "fs_black_target out of range (0 .. 20)")?;
+        check_range(self.grey_point_target, 1.0, 50.0, "fs_grey_target out of range (1 .. 50)")?;
         check_range(
             self.white_point_target,
             0.0,
             1600.0,
             "fs_white_target out of range (0 .. 1600)",
         )?;
-        check_range(
-            self.balance,
-            -50.0,
-            50.0,
-            "fs_balance out of range (-50 .. 50)",
-        )?;
-        check_range(
-            self.saturation,
-            -200.0,
-            200.0,
-            "fs_saturation out of range (-200 .. 200)",
-        )?;
+        check_range(self.balance, -50.0, 50.0, "fs_balance out of range (-50 .. 50)")?;
+        check_range(self.saturation, -200.0, 200.0, "fs_saturation out of range (-200 .. 200)")?;
         Ok(())
     }
 }
@@ -141,23 +113,17 @@ impl AgxCustomLookConfig {
     fn validate(&self) -> Result<(), ArgParseErr> {
         for &v in self.slope.iter() {
             if !v.is_finite() || v < 0.0 {
-                return Err(ArgParseErr::with_msg(
-                    "agx_slope values must be finite and >= 0",
-                ));
+                return Err(ArgParseErr::with_msg("agx_slope values must be finite and >= 0"));
             }
         }
         for &v in self.power.iter() {
             if !v.is_finite() || v <= 0.0 {
-                return Err(ArgParseErr::with_msg(
-                    "agx_power values must be finite and > 0",
-                ));
+                return Err(ArgParseErr::with_msg("agx_power values must be finite and > 0"));
             }
         }
         for &v in self.saturation.iter() {
             if !v.is_finite() || v < 0.0 {
-                return Err(ArgParseErr::with_msg(
-                    "agx_saturation values must be finite and >= 0",
-                ));
+                return Err(ArgParseErr::with_msg("agx_saturation values must be finite and >= 0"));
             }
         }
         for &v in self.offset.iter() {
@@ -219,9 +185,9 @@ impl Default for TonemapConfig {
 
 impl TonemapConfig {
     /// Parse from string format:
-    ///
-    ///     `cicp=9,16,0,1,nits=1000,tonemapping=itu2408,exposure=1.2,colorspace=yrg`
-    ///
+    /// ```text
+    /// cicp=9,16,0,1,nits=1000,tonemapping=itu2408,exposure=1.2,colorspace=yrg
+    /// ```
     /// Or the literal `default`.
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
@@ -265,33 +231,27 @@ impl TonemapConfig {
                 }
             } else if let Some(val) = part.strip_prefix("nits=") {
                 config.nits = parse_f32(val, "invalid nits value (must be float)")?;
-            } else if let Some(val) = part
-                .strip_prefix("tonemapping=")
-                .or_else(|| part.strip_prefix("method="))
+            } else if let Some(val) =
+                part.strip_prefix("tonemapping=").or_else(|| part.strip_prefix("method="))
             {
                 config.method = val.to_lowercase();
             } else if let Some(val) = part.strip_prefix("exposure=") {
                 config.exposure = parse_f32(val, "invalid exposure value (must be float)")?;
-            } else if let Some(val) = part
-                .strip_prefix("colorspace=")
-                .or_else(|| part.strip_prefix("cs="))
+            } else if let Some(val) =
+                part.strip_prefix("colorspace=").or_else(|| part.strip_prefix("cs="))
             {
                 config.color_space = val.to_lowercase();
-            } else if let Some(val) = part
-                .strip_prefix("gamut_clipping=")
-                .or_else(|| part.strip_prefix("gc="))
+            } else if let Some(val) =
+                part.strip_prefix("gamut_clipping=").or_else(|| part.strip_prefix("gc="))
             {
                 config.gamut_clipping = val.to_lowercase();
             } else if let Some(val) = part.strip_prefix("max_luma=") {
                 config.max_luma = parse_f32(val, "invalid max_luma value (must be float)")?;
-            } else if let Some(val) = part
-                .strip_prefix("content_brightness=")
-                .or_else(|| part.strip_prefix("cb="))
+            } else if let Some(val) =
+                part.strip_prefix("content_brightness=").or_else(|| part.strip_prefix("cb="))
             {
-                config.content_brightness = Some(parse_f32(
-                    val,
-                    "invalid content_brightness value (must be float)",
-                )?);
+                config.content_brightness =
+                    Some(parse_f32(val, "invalid content_brightness value (must be float)")?);
             } else if let Some(val) = part
                 .strip_prefix("display_max_brightness=")
                 .or_else(|| part.strip_prefix("display_nits="))
@@ -351,14 +311,10 @@ impl TonemapConfig {
 
         // Sanity-check the most important numericals.
         if !config.nits.is_finite() || config.nits <= 0.0 {
-            return Err(ArgParseErr::with_msg(
-                "nits must be a positive, finite number",
-            ));
+            return Err(ArgParseErr::with_msg("nits must be a positive, finite number"));
         }
         if !config.exposure.is_finite() || config.exposure <= 0.0 {
-            return Err(ArgParseErr::with_msg(
-                "exposure must be a positive, finite number",
-            ));
+            return Err(ArgParseErr::with_msg("exposure must be a positive, finite number"));
         }
         if !config.display_max_brightness.is_finite() || config.display_max_brightness <= 0.0 {
             return Err(ArgParseErr::with_msg(
@@ -366,16 +322,13 @@ impl TonemapConfig {
             ));
         }
         if config.max_luma <= 0.0 || !config.max_luma.is_finite() {
-            return Err(ArgParseErr::with_msg(
-                "max_luma must be positive and finite",
-            ));
+            return Err(ArgParseErr::with_msg("max_luma must be positive and finite"));
         }
         if let Some(cb) = config.content_brightness
-            && (!cb.is_finite() || cb <= 0.0) {
-                return Err(ArgParseErr::with_msg(
-                    "content_brightness must be positive and finite",
-                ));
-            }
+            && (!cb.is_finite() || cb <= 0.0)
+        {
+            return Err(ArgParseErr::with_msg("content_brightness must be positive and finite"));
+        }
         // Filmic-spline and AgX knobs feed straight into gainforge, so range-check
         // them here too rather than trusting the mapper to handle garbage.
         config.filmic_spline.validate()?;
@@ -389,9 +342,7 @@ impl TonemapConfig {
 // -----------------------------------------------------------------------------
 
 fn parse_f32(val: &str, err_label: &'static str) -> Result<f32, ArgParseErr> {
-    val.trim()
-        .parse::<f32>()
-        .map_err(|_| ArgParseErr::with_msg(err_label))
+    val.trim().parse::<f32>().map_err(|_| ArgParseErr::with_msg(err_label))
 }
 
 /// Parse a 3-tuple either as a broadcast `v` or as `r:g:b`.
@@ -484,17 +435,11 @@ fn validate_cicp(cicp: [u8; 4]) -> Result<(), MagickError> {
     // PNG (and our RGB pipeline) only supports Matrix Coefficients = 0 (identity / RGB).
     // Any other value would mean YCbCr/ICtCp-coded samples, which we cannot have here.
     if cicp[2] != 0 {
-        return Err(wm_err!(
-            "unsupported cICP matrix coefficients {} (must be 0 / RGB)",
-            cicp[2]
-        ));
+        return Err(wm_err!("unsupported cICP matrix coefficients {} (must be 0 / RGB)", cicp[2]));
     }
     // Video Full Range Flag is a boolean: 0 = narrow (16-235 scaled), 1 = full.
     if cicp[3] > 1 {
-        return Err(wm_err!(
-            "invalid cICP video full range flag {} (must be 0 or 1)",
-            cicp[3]
-        ));
+        return Err(wm_err!("invalid cICP video full range flag {} (must be 0 or 1)", cicp[3]));
     }
     Ok(())
 }
@@ -507,11 +452,9 @@ fn get_color_profile(cicp: [u8; 4]) -> Result<ColorProfile, MagickError> {
         (9, 18) => Ok(ColorProfile::new_bt2020_hlg()),
         (1, 13) => Ok(ColorProfile::new_srgb()),
         (12, 16) => Ok(ColorProfile::new_display_p3_pq()),
-       // TODO: moxcms 0.8 ships no ready-made Display P3 HLG profile. Build one via
-       // ColorProfile::new_from_cicp once we map raw cICP bytes to the moxcms CICP enums.
-        (12, 18) => Err(wm_err!(
-            "Display P3 + HLG (cICP 12-18) is not supported yet"
-        )),
+        // TODO: moxcms 0.8 ships no ready-made Display P3 HLG profile. Build one via
+        // ColorProfile::new_from_cicp once we map raw cICP bytes to the moxcms CICP enums.
+        (12, 18) => Err(wm_err!("Display P3 + HLG (cICP 12-18) is not supported yet")),
         _ => Err(wm_err!(
             "Unsupported cICP profile: primaries={}, transfer={}. Common: 9-16 (BT.2020 PQ), 9-18 (BT.2020 HLG), 12-16 (Display P3 PQ), 1-13 (sRGB)",
             cicp[0],
@@ -555,11 +498,7 @@ fn expand_narrow_range(image: &mut Image) -> Result<(), MagickError> {
         DynamicImage::ImageRgba16(buf) => expand_narrow_lane_u16(buf, 4, 3),
         DynamicImage::ImageLuma16(buf) => expand_narrow_lane_u16(buf, 1, 1),
         DynamicImage::ImageLumaA16(buf) => expand_narrow_lane_u16(buf, 2, 1),
-        _ => {
-            return Err(wm_err!(
-                "narrow range expansion is not supported for this pixel format"
-            ))
-        }
+        _ => return Err(wm_err!("narrow range expansion is not supported for this pixel format")),
     }
     Ok(())
 }
@@ -575,10 +514,8 @@ fn map_rows<T: Copy + Default>(
     mut lane: impl FnMut(&[T], &mut [T]) -> Result<(), ForgeError>,
 ) -> Result<Vec<T>, MagickError> {
     let mut dst = vec![T::default(); src.len()];
-    for (y, (src_row, dst_row)) in src
-        .chunks_exact(row_len)
-        .zip(dst.chunks_exact_mut(row_len))
-        .enumerate()
+    for (y, (src_row, dst_row)) in
+        src.chunks_exact(row_len).zip(dst.chunks_exact_mut(row_len)).enumerate()
     {
         lane(src_row, dst_row).map_err(|e| wm_err!("Tone mapping failed on row {}: {}", y, e))?;
     }
@@ -623,9 +560,9 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
 
         // Same as Reinhard but scaled to the full dynamic range of the image
         // (max_luma is in linear scene-referred units, e.g. 3.0 = ~3x nominal exposure).
-        "extended_reinhard" | "extended" => ToneMappingMethod::ExtendedReinhard {
-            max_luma: config.max_luma,
-        },
+        "extended_reinhard" | "extended" => {
+            ToneMappingMethod::ExtendedReinhard { max_luma: config.max_luma }
+        }
 
         // Reinhard + colour preservation hybrid.
         "reinhard_jodie" | "reinhardjodie" | "jodie" => ToneMappingMethod::ReinhardJodie,
@@ -675,12 +612,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
     let gamut_clipping = match config.gamut_clipping.as_str() {
         "noclip" | "none" | "off" | "false" => GamutClipping::NoClip,
         "clip" | "soft" | "on" | "true" => GamutClipping::Clip,
-        other => {
-            return Err(wm_err!(
-                "unsupported gamut_clipping: {} (use noclip or clip)",
-                other
-            ))
-        }
+        other => return Err(wm_err!("unsupported gamut_clipping: {} (use noclip or clip)", other)),
     };
 
     let exposure = config.exposure;
@@ -691,24 +623,19 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
         "yrg" | "default" => ColorSpaceKind::Yrg,
         "jzazbz" | "jz_azbz" | "jzczaz" => ColorSpaceKind::Jzazbz,
         other => {
-            return Err(wm_err!(
-                "unsupported color_space: {} (use rgb, yrg, or jzazbz)",
-                other
-            ))
+            return Err(wm_err!("unsupported color_space: {} (use rgb, yrg, or jzazbz)", other));
         }
     };
 
     // We construct a fresh `MappingColorSpace` per call site so the type
     // doesn't need to be `Copy`.
     let make_mapping = || match color_space_kind {
-        ColorSpaceKind::Rgb => MappingColorSpace::Rgb(RgbToneMapperParameters {
-            gamut_clipping,
-            exposure,
-        }),
-        ColorSpaceKind::Yrg => MappingColorSpace::Yrg(CommonToneMapperParameters {
-            exposure,
-            gamut_clipping,
-        }),
+        ColorSpaceKind::Rgb => {
+            MappingColorSpace::Rgb(RgbToneMapperParameters { gamut_clipping, exposure })
+        }
+        ColorSpaceKind::Yrg => {
+            MappingColorSpace::Yrg(CommonToneMapperParameters { exposure, gamut_clipping })
+        }
         ColorSpaceKind::Jzazbz => MappingColorSpace::Jzazbz(JzazbzToneMapperParameters {
             content_brightness,
             exposure,
@@ -752,9 +679,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                 make_mapping(),
             )
             .map_err(map_creation_err)?;
-            let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| {
-                mapper.tonemap_lane(s, d)
-            })?;
+            let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| mapper.tonemap_lane(s, d))?;
             DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, dst).ok_or_else(alloc_err)?)
         }
 
@@ -767,9 +692,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                 make_mapping(),
             )
             .map_err(map_creation_err)?;
-            let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| {
-                mapper.tonemap_lane(s, d)
-            })?;
+            let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| mapper.tonemap_lane(s, d))?;
             DynamicImage::ImageRgba8(RgbaImage::from_raw(width, height, dst).ok_or_else(alloc_err)?)
         }
 
@@ -782,9 +705,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                 make_mapping(),
             )
             .map_err(map_creation_err)?;
-            let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| {
-                mapper.tonemap_lane(s, d)
-            })?;
+            let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| mapper.tonemap_lane(s, d))?;
             DynamicImage::ImageRgb16(
                 ImageBuffer::<ImgRgb<u16>, Vec<u16>>::from_raw(width, height, dst)
                     .ok_or_else(alloc_err)?,
@@ -800,9 +721,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                 make_mapping(),
             )
             .map_err(map_creation_err)?;
-            let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| {
-                mapper.tonemap_lane(s, d)
-            })?;
+            let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| mapper.tonemap_lane(s, d))?;
             DynamicImage::ImageRgba16(
                 ImageBuffer::<ImgRgba<u16>, Vec<u16>>::from_raw(width, height, dst)
                     .ok_or_else(alloc_err)?,
@@ -825,9 +744,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                 make_mapping(),
             )
             .map_err(map_creation_err)?;
-            let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| {
-                mapper.tonemap_lane(s, d)
-            })?;
+            let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| mapper.tonemap_lane(s, d))?;
             DynamicImage::ImageRgb16(
                 ImageBuffer::<ImgRgb<u16>, Vec<u16>>::from_raw(width, height, dst)
                     .ok_or_else(alloc_err)?,
@@ -844,9 +761,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                 make_mapping(),
             )
             .map_err(map_creation_err)?;
-            let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| {
-                mapper.tonemap_lane(s, d)
-            })?;
+            let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| mapper.tonemap_lane(s, d))?;
             DynamicImage::ImageRgba16(
                 ImageBuffer::<ImgRgba<u16>, Vec<u16>>::from_raw(width, height, dst)
                     .ok_or_else(alloc_err)?,
@@ -866,9 +781,8 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                     make_mapping(),
                 )
                 .map_err(map_creation_err)?;
-                let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| {
-                    mapper.tonemap_lane(s, d)
-                })?;
+                let dst =
+                    map_rows(buf.as_raw(), width as usize * 4, |s, d| mapper.tonemap_lane(s, d))?;
                 DynamicImage::ImageRgba16(
                     ImageBuffer::<ImgRgba<u16>, Vec<u16>>::from_raw(width, height, dst)
                         .ok_or_else(alloc_err)?,
@@ -883,9 +797,8 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                     make_mapping(),
                 )
                 .map_err(map_creation_err)?;
-                let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| {
-                    mapper.tonemap_lane(s, d)
-                })?;
+                let dst =
+                    map_rows(buf.as_raw(), width as usize * 3, |s, d| mapper.tonemap_lane(s, d))?;
                 DynamicImage::ImageRgb16(
                     ImageBuffer::<ImgRgb<u16>, Vec<u16>>::from_raw(width, height, dst)
                         .ok_or_else(alloc_err)?,
@@ -951,7 +864,7 @@ fn build_agx_look(config: &TonemapConfig) -> Result<AgxLook, MagickError> {
             return Err(wm_err!(
                 "unsupported agx_look: {} (use default, punchy, golden, or custom)",
                 other
-            ))
+            ));
         }
     };
     Ok(look)
