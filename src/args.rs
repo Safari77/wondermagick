@@ -145,23 +145,31 @@ impl Arg {
     pub fn help_text(&self) -> &'static str {
         match self {
             Arg::AutoOrient => "automagically orient (rotate) image",
-            Arg::Bm3d => "apply BM3D denoising in Oklab color space (use 'default' or sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches)",
+            Arg::Bm3d => {
+                "apply BM3D denoising in Oklab color space (use 'default' or sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches)"
+            }
             Arg::Colorspace => "specify the colorspace of created images",
             Arg::Combine => "create an image channel by channel from separate greyscale inputs",
             Arg::Crop => "cut out a rectangular region of the image",
             Arg::Despeckle => "despeckle image",
             Arg::Format => "output formatted image characteristics",
             Arg::Filter => "use this filter when resizing an image",
-            Arg::Fx => "apply custom RGB rules (format: op,r,g,b,repl_r,repl_g,repl_b | ops: le, ge | e.g. 'le,5,5,5,0,0,0')",
+            Arg::Fx => {
+                "apply custom RGB rules (format: op,r,g,b,repl_r,repl_g,repl_b | ops: le, ge | e.g. 'le,5,5,5,0,0,0')"
+            }
             Arg::Flip => "flip image vertically",
             Arg::Flop => "flop image horizontally",
             Arg::Blur => "reduce image noise and reduce detail levels",
             Arg::GaussianBlur => "reduce image noise and reduce detail levels",
             Arg::Grayscale => "convert image to grayscale",
             Arg::Identify => "identify the format and characteristics of the image",
-            Arg::Monochrome => "transform image to black and white (use 'default' or noise,shadow,highlight,brightness,contrast,gamma)",
+            Arg::Monochrome => {
+                "transform image to black and white (use 'default' or noise,shadow,highlight,brightness,contrast,gamma)"
+            }
             Arg::Negate => "replace every pixel with its complementary color",
-            Arg::NormalizeBackground => "flatten uneven lighting and shadows (use 'default' or blur radius like '50')",
+            Arg::NormalizeBackground => {
+                "flatten uneven lighting and shadows (use 'default' or blur radius like '50')"
+            }
             Arg::Quality => "JPEG/MIFF/PNG compression level", // I'm so sorry
             Arg::Resize => "resize the image",
             Arg::Sample => "scale image with pixel sampling",
@@ -170,21 +178,43 @@ impl Arg {
             Arg::Thumbnail => "create a thumbnail of the image",
             Arg::Unsharp => "sharpen the image",
             Arg::Write => "write current image sequence to an output file",
-            Arg::Sauvola => "apply Sauvola local adaptive thresholding (use 'default' or window_size,k,r)",
-            Arg::WolfJolion => "apply Wolf-Jolion local adaptive thresholding (use 'default' or window_size,k)",
-            Arg::Phansalkar => "apply Phansalkar local adaptive thresholding (use 'default' or window_size,k,r,p,q)",
-            Arg::ConnectedComponents => "label connected components and remove small blobs (use 'default' or area_threshold)",
-            Arg::Morphology => "apply mathematical morphology (format: method,shape,size | Methods: erode, dilate, open, close, tophat, bottomhat | Shapes: square, cross, circle, ellipse, rectangle | Size: odd int or WxH | e.g., 'close,cross,3' or 'bottomhat,ellipse,3x7')",
-            Arg::Skeleton => "reduce binary shapes to a 1-pixel wide skeleton (Zhang-Suen thinning)",
-            Arg::Prune => "remove short branches from a skeletonized image (use 'default' [3] or number of iterations)",
+            Arg::Sauvola => {
+                "apply Sauvola local adaptive thresholding (use 'default' or window_size,k,r)"
+            }
+            Arg::WolfJolion => {
+                "apply Wolf-Jolion local adaptive thresholding (use 'default' or window_size,k)"
+            }
+            Arg::Phansalkar => {
+                "apply Phansalkar local adaptive thresholding (use 'default' or window_size,k,r,p,q)"
+            }
+            Arg::ConnectedComponents => {
+                "label connected components and remove small blobs (use 'default' or area_threshold)"
+            }
+            Arg::Morphology => {
+                "apply mathematical morphology (format: method,shape,size | Methods: erode, dilate, open, close, tophat, bottomhat | Shapes: square, cross, circle, ellipse, rectangle | Size: odd int or WxH | e.g., 'close,cross,3' or 'bottomhat,ellipse,3x7')"
+            }
+            Arg::Skeleton => {
+                "reduce binary shapes to a 1-pixel wide skeleton (Zhang-Suen thinning)"
+            }
+            Arg::Prune => {
+                "remove short branches from a skeletonized image (use 'default' [3] or number of iterations)"
+            }
             Arg::Otsu => "otsu threshold",
             Arg::Kapur => "kapur threshold",
             Arg::EqualizeHistogram => "equalize histogram",
-            Arg::Quantize => "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '32,0.2,0.2:2.6', or 'default' — bias -2.0 uses MacQueen kmeans, -1.0 uses Oklab median-cut, 0.0 uses RGB K-means, >=1.0 uses Oklab K-means++ with pure Perceptual Euclidean distance in Oklab with chroma multiplier (it also supports optional light_boost:lc_priority parameters)",
+            Arg::Quantize => {
+                "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '32,0.2,0.2:2.6', or 'default' — bias -2.0 uses MacQueen kmeans, -1.0 uses Oklab median-cut, 0.0 uses RGB K-means, >=1.0 uses Oklab K-means++ with pure Perceptual Euclidean distance in Oklab with chroma multiplier (it also supports optional light_boost:lc_priority parameters)"
+            }
             Arg::CountColors => "count the number of unique colors in the image",
-            Arg::Text => "render rotated multi-line text (format: 'effect,text,font,size,color,rotation,justify,x,y' | Effects: none, blur:<sigma>, gradualblur:<sigma>, shadow:dx:dy:sigma:<#color>, outline:<thickness>:<#color>, explode:strength, meltdown:strength:direction (-1=omnidirectional, 0-360=direction) | meltdown and explode can be added as displacement effect or used with plain text only, e.g. 'outline:3:#000000FF,Hello,Arial,5%,#FFFFFF,45.0,center,center,80%', 'outline:10:a0101080+explode:90,AAEEIIOO,Iosevka,10%,#EEEEEEF0,5,center,center,70%' | QR: 'none,{QR:H:0:#00000000:https://x.com},Arial,15%,#000000,0,center,center,center')",
-            Arg::Canvas => "create a canvas of given size filled with a solid color or gradient (format: WxH,solid|linear|radial,...)",
-            Arg::Tonemap => "tonemap HDR image to SDR (use 'default' or cicp=9,16,0,1,nits=1000,tonemapping=rec2408)",
+            Arg::Text => {
+                "render rotated multi-line text (format: 'effect,text,font,size,color,rotation,justify,x,y' | Effects: none, blur:<sigma>, gradualblur:<sigma>, shadow:dx:dy:sigma:<#color>, outline:<thickness>:<#color>, explode:strength, meltdown:strength:direction (-1=omnidirectional, 0-360=direction) | meltdown and explode can be added as displacement effect or used with plain text only, e.g. 'outline:3:#000000FF,Hello,Arial,5%,#FFFFFF,45.0,center,center,80%', 'outline:10:a0101080+explode:90,AAEEIIOO,Iosevka,10%,#EEEEEEF0,5,center,center,70%' | QR: 'none,{QR:H:0:#00000000:https://x.com},Arial,15%,#000000,0,center,center,center')"
+            }
+            Arg::Canvas => {
+                "create a canvas of given size filled with a solid color or gradient (format: WxH,solid|linear|radial,mesh,coons,voronoi,fbm,flow,lowpoly,flame)"
+            }
+            Arg::Tonemap => {
+                "tonemap HDR image to SDR (use 'default' or cicp=9,16,0,1,nits=1000,tonemapping=rec2408)"
+            }
         }
     }
 }
@@ -228,10 +258,11 @@ impl ArgParseCtx {
         //   - (Stdio, Some("png")) otherwise.
         if let Location::Path(path) = &output_file
             && !exists(path)
-                && let Some((path, format)) = crate::arg_parsers::parse_path_and_format(input) {
-                    output_file = Location::from_arg(&path);
-                    output_format = Some(format);
-                }
+            && let Some((path, format)) = crate::arg_parsers::parse_path_and_format(input)
+        {
+            output_file = Location::from_arg(&path);
+            output_format = Some(format);
+        }
         (output_file, output_format)
     }
 }
@@ -250,10 +281,7 @@ pub fn parse_args(mut args: Vec<OsString>) -> Result<ExecutionPlan, MagickError>
     let output_filename = args.pop().unwrap();
     // imagemagick rejects output filenames that look like arguments
     if optionlike(&output_filename) {
-        return Err(wm_err!(
-            "missing output filename `{}'",
-            output_filename.to_string_lossy()
-        ));
+        return Err(wm_err!("missing output filename `{}'", output_filename.to_string_lossy()));
     }
 
     let ctx = ArgParseCtx::with_file_system();
@@ -269,22 +297,15 @@ pub fn parse_args(mut args: Vec<OsString>) -> Result<ExecutionPlan, MagickError>
             let (sign, string_arg) = sign_and_arg_name(raw_arg)?;
             let arg = Arg::try_from(string_arg.as_str())
                 .map_err(|_| wm_err!("unrecognized option `{}'", string_arg))?;
-            let value = if arg.needs_value(&sign) {
-                iter.next()
-            } else {
-                None
-            };
+            let value = if arg.needs_value(&sign) { iter.next() } else { None };
             plan.apply_arg(SignedArg { sign, arg }, value.as_deref(), &ctx)?;
         } else {
             // Check if the "filename" is actually a generator pseudo-file
             let arg_str = raw_arg.to_string_lossy();
             if arg_str.starts_with("xc:") || arg_str.starts_with("canvas:") {
                 // Strip the prefix to get the spec (e.g. "size:100x100,solid,#ff0000")
-                let spec_str = if arg_str.starts_with("xc:") {
-                    &arg_str[3..]
-                } else {
-                    &arg_str[7..]
-                };
+                let spec_str =
+                    if arg_str.starts_with("xc:") { &arg_str[3..] } else { &arg_str[7..] };
 
                 let config = CanvasConfig::parse_arg(spec_str).map_err(|e| {
                     wm_err!("{}", e.display_with_arg("canvas", OsStr::new(spec_str)))
@@ -300,10 +321,7 @@ pub fn parse_args(mut args: Vec<OsString>) -> Result<ExecutionPlan, MagickError>
 
 /// Checks if the string starts with a `-` or a `+`, followed by an ASCII letter
 fn optionlike(arg: &OsStr) -> bool {
-    matches!(
-        arg.as_encoded_bytes(),
-        [b'-' | b'+', b'a'..=b'z' | b'A'..=b'Z', ..],
-    )
+    matches!(arg.as_encoded_bytes(), [b'-' | b'+', b'a'..=b'z' | b'A'..=b'Z', ..],)
 }
 
 /// Splits the string into a sign (- or +) and argument name
@@ -322,9 +340,7 @@ struct ExistsFn {
 
 impl core::fmt::Debug for ExistsFn {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ExistsFn")
-            .field("debug_name", &self.debug)
-            .finish_non_exhaustive()
+        f.debug_struct("ExistsFn").field("debug_name", &self.debug).finish_non_exhaustive()
     }
 }
 

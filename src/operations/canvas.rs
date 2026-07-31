@@ -1,7 +1,11 @@
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
+use delaunator::{Point as DelaunayPoint, triangulate};
 use image::{DynamicImage, ImageBuffer, Rgba};
 use kurbo::{CubicBez, ParamCurve, Point};
-use oklab::{Oklab, Rgb, oklab_to_srgb_f32, srgb_f32_to_oklab};
+use noise::{Fbm, MultiFractal, NoiseFn, Perlin, utils::PlaneMapBuilder};
+use oklab::{
+    Oklab, Rgb, linear_srgb_to_oklab, oklab_to_linear_srgb, oklab_to_srgb_f32, srgb_f32_to_oklab,
+};
 use rayon::prelude::*;
 
 /// 16-bit RGBA image buffer. `image` keeps its own `Rgba16Image` alias
@@ -42,6 +46,15 @@ fn quantize16(v: f32) -> u16 {
 fn oklab_to_rgb16(c: Oklab) -> [u16; 3] {
     let rgb = oklab_to_srgb_f32(c);
     [quantize16(rgb.r), quantize16(rgb.g), quantize16(rgb.b)]
+}
+
+/// Gamma-encodes a linear-light sRGB triple to 16-bit sRGB. Round-tripping
+/// through Oklab uses the crate's public conversions in both directions
+/// instead of hand-rolling the sRGB transfer function; the detour costs about
+/// one code point of accuracy at 16 bits.
+#[inline]
+fn linear_rgb_to_rgb16(r: f32, g: f32, b: f32) -> [u16; 3] {
+    oklab_to_rgb16(linear_srgb_to_oklab(Rgb { r, g, b }))
 }
 
 /// Converts a straight-alpha 16-bit sRGB color to `(Oklab, alpha)`.
@@ -318,6 +331,16 @@ pub enum Coord {
     Pixels(f64),
 }
 
+/// Edge treatment for the `voronoi` canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoronoiStyle {
+    /// Nearest-seed lookup: each cell is a flat polygon with hard edges.
+    Sharp,
+    /// Distance-weighted blend of the surrounding seeds, which rounds the cell
+    /// boundaries off into organic, metaball-like blobs.
+    Blob,
+}
+
 /// What to fill the canvas with.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanvasSpec {
@@ -353,6 +376,82 @@ pub enum CanvasSpec {
         /// pixels far from them get `t=max` (most transparent).
         transparency: Option<(f64, f64)>,
     },
+    /// Voronoi cells over a jittered grid, either flat-shaded with hard edges
+    /// or blended into blobs.
+    Voronoi {
+        seed: Option<u64>,
+        /// Number of cells across the short edge of the canvas.
+        cells: u32,
+        style: VoronoiStyle,
+        /// Blob mode only: blend width between neighbouring cells, in cell
+        /// widths. Small values approach `sharp`, large values smear together.
+        softness: f64,
+        /// Explicit cell palette. If `None`, a harmonious one is generated.
+        colors: Option<Vec<[u16; 4]>>,
+    },
+    /// Fractal Brownian motion -- summed Perlin octaves from the `noise`
+    /// crate -- mapped through a color ramp.
+    Fbm {
+        seed: Option<u64>,
+        octaves: usize,
+        frequency: f64,
+        lacunarity: f64,
+        persistence: f64,
+        /// Half-extent of the sampled noise domain across the short edge.
+        /// Larger values zoom out and pack in more detail.
+        zoom: f64,
+        /// Make the field tile seamlessly across the canvas edges.
+        seamless: bool,
+        /// Ramp the noise value is mapped through. If `None`, one is generated
+        /// from the seed.
+        stops: Option<Vec<GradientStop>>,
+        easing: Option<CssEasing>,
+    },
+    /// Hair-like streamlines traced through a Perlin flow field.
+    Flow {
+        seed: Option<u64>,
+        /// Approximate strand count; the real count is rounded to a grid.
+        strands: u32,
+        /// Integration steps per strand, i.e. how long a strand can grow.
+        steps: u32,
+        /// Length of one integration step, in pixels.
+        step_len: f64,
+        /// Half-extent of the noise domain; larger means finer, curlier flow.
+        zoom: f64,
+        /// How many half-turns the field angle spans.
+        turns: f64,
+        /// Strand thickness in pixels.
+        width: f64,
+        /// Per-step strand opacity in [0, 1].
+        alpha: f64,
+        colors: Option<Vec<[u16; 4]>>,
+    },
+    /// Low-poly facets: a Delaunay triangulation of jittered points, each
+    /// triangle filled from an underlying color field.
+    LowPoly {
+        seed: Option<u64>,
+        /// Approximate number of interior points.
+        points: u32,
+        /// Interpolate across each triangle instead of flat-filling it.
+        smooth: bool,
+        colors: Option<Vec<[u16; 4]>>,
+    },
+    /// Fractal flame: an iterated function system rendered through a
+    /// log-density histogram.
+    Flame {
+        seed: Option<u64>,
+        /// Chaos-game iterations per pixel. Higher is smoother and slower.
+        quality: u32,
+        /// Number of affine transforms in the system.
+        transforms: u32,
+        /// Tone-mapping gamma. Higher lifts the faint density regions.
+        gamma: f64,
+        /// Restrict the variation pool to the cut-free set, so the image has
+        /// no hard seams. Off by default, which keeps the full set -- and the
+        /// output of every seed rendered before this option existed.
+        continuous: bool,
+        colors: Option<Vec<[u16; 4]>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -373,6 +472,13 @@ impl CanvasConfig {
     ///   [size:WxH,]radial,[pos:x,y,]STOP1,STOP2[,STOP3...]
     ///   [size:WxH,]mesh,TL_COLOR,TR_COLOR,BL_COLOR,BR_COLOR
     ///   [size:WxH,]coons[,seed:N][,transparency:MIN-MAX][,TL_COLOR,TR_COLOR,BL_COLOR,BR_COLOR]
+    ///   [size:WxH,]voronoi[,sharp|blob][,cells:N][,softness:F][,seed:N][,COLOR...]
+    ///   [size:WxH,]fbm[,seed:N][,octaves:N][,freq:F][,lacunarity:F][,persistence:F]
+    ///                 [,zoom:F][,seamless][,STOP...]
+    ///   [size:WxH,]flow[,seed:N][,strands:N][,steps:N][,step:F][,zoom:F][,turns:F]
+    ///                  [,width:F][,alpha:F][,COLOR...]
+    ///   [size:WxH,]lowpoly[,seed:N][,points:N][,smooth][,COLOR...]
+    ///   [size:WxH,]flame[,seed:N][,quality:N][,transforms:N][,gamma:F][,continuous][,COLOR...]
     ///
     /// When `size:WxH` is omitted, the canvas operation overwrites the current
     /// image's pixels while keeping its dimensions. When `size:WxH` is given,
@@ -389,6 +495,11 @@ impl CanvasConfig {
     ///       non-positional stops cannot be mixed in one spec.
     ///
     /// ANGLE_DEG: fractional degrees, e.g. `16.514`.
+    ///
+    /// Every generator that takes a `seed:` reports an auto-chosen seed on
+    /// stderr, so an interesting result can be pinned down and reproduced.
+    /// Their options may appear in any order, and any color list they accept
+    /// replaces the palette that would otherwise be generated from the seed.
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
         let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
@@ -406,7 +517,8 @@ impl CanvasConfig {
 
         if remaining.is_empty() {
             return Err(ArgParseErr::with_msg(
-                "canvas: missing type (expected 'solid', 'linear', or 'radial')",
+                "canvas: missing type (expected 'solid', 'linear', 'radial', 'mesh', \
+             'coons', 'voronoi', 'fbm', 'flow', 'lowpoly', or 'flame')",
             ));
         }
 
@@ -623,9 +735,234 @@ impl CanvasConfig {
 
                 CanvasSpec::Coons { seed, colors, easing, transparency }
             }
+            "voronoi" => {
+                let mut tok = SpecTokens::split(&remaining[1..]);
+                let style = if tok.flag("blob") {
+                    VoronoiStyle::Blob
+                } else {
+                    // `sharp` is the default; accepting it explicitly keeps
+                    // the two styles symmetrical in the syntax.
+                    tok.flag("sharp");
+                    VoronoiStyle::Sharp
+                };
+                let seed = opt_seed(tok.take("seed"))?;
+                let cells = opt_u32(
+                    tok.take("cells"),
+                    12,
+                    1,
+                    4096,
+                    "canvas voronoi: invalid 'cells' (expected an integer in [1, 4096])",
+                )?;
+                let softness = opt_f64(
+                    tok.take("softness"),
+                    0.25,
+                    0.001,
+                    4.0,
+                    "canvas voronoi: invalid 'softness' (expected a number in [0.001, 4.0])",
+                )?;
+                let colors = parse_color_list(
+                    &tok.colors,
+                    "canvas voronoi: needs at least 2 colors when colors are given",
+                )?;
+                tok.finish(
+                    "canvas voronoi: unknown or repeated option (expected \
+                     'sharp', 'blob', 'cells:N', 'softness:F', 'seed:N')",
+                )?;
+                CanvasSpec::Voronoi { seed, cells, style, softness, colors }
+            }
+            "fbm" => {
+                let mut tok = SpecTokens::split(&remaining[1..]);
+                let seamless = tok.flag("seamless");
+                let seed = opt_seed(tok.take("seed"))?;
+                let octaves = opt_u32(
+                    tok.take("octaves"),
+                    6,
+                    1,
+                    32,
+                    "canvas fbm: invalid 'octaves' (expected an integer in [1, 32])",
+                )? as usize;
+                let frequency = opt_f64(
+                    tok.take("freq"),
+                    1.0,
+                    1e-6,
+                    1e6,
+                    "canvas fbm: invalid 'freq' (expected a positive number)",
+                )?;
+                let lacunarity = opt_f64(
+                    tok.take("lacunarity"),
+                    std::f64::consts::PI * 2.0 / 3.0,
+                    1.0,
+                    8.0,
+                    "canvas fbm: invalid 'lacunarity' (expected a number in [1.0, 8.0])",
+                )?;
+                let persistence = opt_f64(
+                    tok.take("persistence"),
+                    0.5,
+                    0.01,
+                    1.0,
+                    "canvas fbm: invalid 'persistence' (expected a number in [0.01, 1.0])",
+                )?;
+                let zoom = opt_f64(
+                    tok.take("zoom"),
+                    3.0,
+                    1e-3,
+                    1e4,
+                    "canvas fbm: invalid 'zoom' (expected a positive number)",
+                )?;
+                // The tail is a gradient, so it goes through the same stop
+                // parser the linear and radial gradients use.
+                let stops =
+                    if tok.colors.is_empty() { None } else { Some(parse_stops(&tok.colors)?) };
+                tok.finish(
+                    "canvas fbm: unknown or repeated option (expected 'seed:N', \
+                     'octaves:N', 'freq:F', 'lacunarity:F', 'persistence:F', \
+                     'zoom:F', 'seamless')",
+                )?;
+                CanvasSpec::Fbm {
+                    seed,
+                    octaves,
+                    frequency,
+                    lacunarity,
+                    persistence,
+                    zoom,
+                    seamless,
+                    stops,
+                    easing,
+                }
+            }
+            "flow" => {
+                let mut tok = SpecTokens::split(&remaining[1..]);
+                let seed = opt_seed(tok.take("seed"))?;
+                let strands = opt_u32(
+                    tok.take("strands"),
+                    2000,
+                    1,
+                    1_000_000,
+                    "canvas flow: invalid 'strands' (expected an integer in [1, 1000000])",
+                )?;
+                let steps = opt_u32(
+                    tok.take("steps"),
+                    300,
+                    1,
+                    100_000,
+                    "canvas flow: invalid 'steps' (expected an integer in [1, 100000])",
+                )?;
+                let step_len = opt_f64(
+                    tok.take("step"),
+                    1.5,
+                    0.05,
+                    64.0,
+                    "canvas flow: invalid 'step' (expected a number in [0.05, 64.0])",
+                )?;
+                let zoom = opt_f64(
+                    tok.take("zoom"),
+                    2.0,
+                    1e-3,
+                    1e4,
+                    "canvas flow: invalid 'zoom' (expected a positive number)",
+                )?;
+                let turns = opt_f64(
+                    tok.take("turns"),
+                    2.0,
+                    0.0,
+                    64.0,
+                    "canvas flow: invalid 'turns' (expected a number in [0.0, 64.0])",
+                )?;
+                let width = opt_f64(
+                    tok.take("width"),
+                    1.0,
+                    0.5,
+                    64.0,
+                    "canvas flow: invalid 'width' (expected a number in [0.5, 64.0])",
+                )?;
+                let alpha = opt_f64(
+                    tok.take("alpha"),
+                    0.35,
+                    0.0,
+                    1.0,
+                    "canvas flow: invalid 'alpha' (expected a number in [0.0, 1.0])",
+                )?;
+                let colors = parse_color_list(
+                    &tok.colors,
+                    "canvas flow: needs at least 2 colors when colors are given",
+                )?;
+                tok.finish(
+                    "canvas flow: unknown or repeated option (expected 'seed:N', \
+                     'strands:N', 'steps:N', 'step:F', 'zoom:F', 'turns:F', \
+                     'width:F', 'alpha:F')",
+                )?;
+                CanvasSpec::Flow {
+                    seed,
+                    strands,
+                    steps,
+                    step_len,
+                    zoom,
+                    turns,
+                    width,
+                    alpha,
+                    colors,
+                }
+            }
+            "lowpoly" => {
+                let mut tok = SpecTokens::split(&remaining[1..]);
+                let smooth = tok.flag("smooth");
+                let seed = opt_seed(tok.take("seed"))?;
+                let points = opt_u32(
+                    tok.take("points"),
+                    150,
+                    3,
+                    200_000,
+                    "canvas lowpoly: invalid 'points' (expected an integer in [3, 200000])",
+                )?;
+                let colors = parse_color_list(
+                    &tok.colors,
+                    "canvas lowpoly: needs at least 2 colors when colors are given",
+                )?;
+                tok.finish(
+                    "canvas lowpoly: unknown or repeated option (expected 'seed:N', \
+                     'points:N', 'smooth')",
+                )?;
+                CanvasSpec::LowPoly { seed, points, smooth, colors }
+            }
+            "flame" => {
+                let mut tok = SpecTokens::split(&remaining[1..]);
+                let continuous = tok.flag("continuous");
+                let seed = opt_seed(tok.take("seed"))?;
+                let quality = opt_u32(
+                    tok.take("quality"),
+                    12,
+                    1,
+                    4096,
+                    "canvas flame: invalid 'quality' (expected an integer in [1, 4096])",
+                )?;
+                let transforms = opt_u32(
+                    tok.take("transforms"),
+                    3,
+                    2,
+                    12,
+                    "canvas flame: invalid 'transforms' (expected an integer in [2, 12])",
+                )?;
+                let gamma = opt_f64(
+                    tok.take("gamma"),
+                    2.2,
+                    0.1,
+                    10.0,
+                    "canvas flame: invalid 'gamma' (expected a number in [0.1, 10.0])",
+                )?;
+                let colors = parse_color_list(
+                    &tok.colors,
+                    "canvas flame: needs at least 2 colors when colors are given",
+                )?;
+                tok.finish(
+                    "canvas flame: unknown or repeated option (expected 'seed:N', \
+                     'quality:N', 'transforms:N', 'gamma:F', 'continuous')",
+                )?;
+                CanvasSpec::Flame { seed, quality, transforms, gamma, continuous, colors }
+            }
             _ => {
                 return Err(ArgParseErr::with_msg(
-                    "canvas: type must be 'solid', 'linear', 'radial', 'mesh', or 'coons'",
+                    "canvas: type must be 'solid', 'linear', 'radial', 'mesh', 'coons', \
+                     'voronoi', 'fbm', 'flow', 'lowpoly', or 'flame'",
                 ));
             }
         };
@@ -814,6 +1151,143 @@ fn parse_stops(tokens: &[&str]) -> Result<Vec<GradientStop>, ArgParseErr> {
     Ok(stops)
 }
 
+/// Type-specific tokens split into `key:value` options, bare flag words, and
+/// colors. Every generator accepts its options in any order, so they all share
+/// this instead of hand-rolling a scan each.
+struct SpecTokens<'a> {
+    opts: Vec<(&'a str, &'a str)>,
+    flags: Vec<&'a str>,
+    colors: Vec<&'a str>,
+}
+
+impl<'a> SpecTokens<'a> {
+    fn split(tokens: &[&'a str]) -> Self {
+        let mut opts = Vec::new();
+        let mut flags = Vec::new();
+        let mut colors = Vec::new();
+        for &t in tokens {
+            if t.starts_with('#') {
+                colors.push(t);
+            } else if let Some((k, v)) = t.split_once(':') {
+                if v.trim_start().starts_with('#') {
+                    // A positional gradient stop like `0.5:#ff0000`, not an
+                    // option -- hand it to `parse_stops` intact.
+                    colors.push(t);
+                } else {
+                    opts.push((k.trim(), v.trim()));
+                }
+            } else if !t.is_empty() {
+                flags.push(t);
+            }
+        }
+        Self { opts, flags, colors }
+    }
+
+    /// Removes the first `key:value` with this key and returns its value.
+    /// A repeat is deliberately left behind so `finish` rejects it, which
+    /// means duplicates and typos are caught by the same check.
+    fn take(&mut self, key: &str) -> Option<&'a str> {
+        let mut found = None;
+        self.opts.retain(|(k, v)| {
+            if found.is_none() && *k == key {
+                found = Some(*v);
+                false
+            } else {
+                true
+            }
+        });
+        found
+    }
+
+    /// Removes a bare flag word, reporting whether it was present.
+    fn flag(&mut self, name: &str) -> bool {
+        let before = self.flags.len();
+        self.flags.retain(|f| !f.eq_ignore_ascii_case(name));
+        self.flags.len() != before
+    }
+
+    /// Errors if anything was left unconsumed.
+    fn finish(&self, err: &'static str) -> Result<(), ArgParseErr> {
+        if self.opts.is_empty() && self.flags.is_empty() {
+            Ok(())
+        } else {
+            Err(ArgParseErr::with_msg(err))
+        }
+    }
+}
+
+/// Parses an optional integer option, range-checked, falling back to `default`.
+fn opt_u32(
+    v: Option<&str>,
+    default: u32,
+    min: u32,
+    max: u32,
+    err: &'static str,
+) -> Result<u32, ArgParseErr> {
+    match v {
+        None => Ok(default),
+        Some(s) => {
+            let n: u32 = s.trim().parse().map_err(|_| ArgParseErr::with_msg(err))?;
+            if n < min || n > max {
+                return Err(ArgParseErr::with_msg(err));
+            }
+            Ok(n)
+        }
+    }
+}
+
+/// Parses an optional float option, range-checked, falling back to `default`.
+fn opt_f64(
+    v: Option<&str>,
+    default: f64,
+    min: f64,
+    max: f64,
+    err: &'static str,
+) -> Result<f64, ArgParseErr> {
+    match v {
+        None => Ok(default),
+        Some(s) => {
+            let x: f64 = s.trim().parse().map_err(|_| ArgParseErr::with_msg(err))?;
+            if !x.is_finite() || x < min || x > max {
+                return Err(ArgParseErr::with_msg(err));
+            }
+            Ok(x)
+        }
+    }
+}
+
+/// Parses the shared `seed:N` option.
+fn opt_seed(v: Option<&str>) -> Result<Option<u64>, ArgParseErr> {
+    match v {
+        None => Ok(None),
+        Some(s) => s.trim().parse::<u64>().map(Some).map_err(|_| {
+            ArgParseErr::with_msg(
+                "canvas: invalid seed (expected non-negative integer fitting in u64)",
+            )
+        }),
+    }
+}
+
+/// Parses a generator's optional palette. An empty list means "generate one
+/// from the seed"; a list of one color is rejected, since every generator that
+/// takes a palette needs at least two entries to interpolate between.
+fn parse_color_list(
+    tokens: &[&str],
+    err: &'static str,
+) -> Result<Option<Vec<[u16; 4]>>, ArgParseErr> {
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    if tokens.len() < 2 {
+        return Err(ArgParseErr::with_msg(err));
+    }
+    let mut out = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        out.push(parse_color(t)?);
+    }
+    Ok(Some(out))
+}
+
 /// A gradient pre-converted to Oklab for fast per-pixel evaluation.
 /// Interpolating in Oklab gives perceptually uniform, visually pleasing
 /// transitions (no muddy midpoints between complementary hues).
@@ -832,6 +1306,12 @@ impl PreparedGradient {
             })
             .collect();
         Self { stops: prepared }
+    }
+
+    /// Builds a ramp directly from Oklab stops, skipping the sRGB round-trip
+    /// `new` performs. Stops must already be sorted by position.
+    fn from_oklab(stops: Vec<(f64, Oklab, u16)>) -> Self {
+        Self { stops }
     }
 
     #[inline]
@@ -1052,6 +1532,136 @@ fn random_coons_colors(rng: &mut SplitMix64) -> PatchColors {
     }
 }
 
+/// A harmonious palette of `n` Oklab colors, alpha at full 16-bit scale.
+///
+/// This is the same hue-harmony idea as `random_coons_colors`, generalized to
+/// any count. It is kept as a separate function rather than folding that one
+/// into it, because changing the order `random_coons_colors` draws from the
+/// PRNG would change the image every existing `coons,seed:N` produces.
+fn random_palette(n: usize, rng: &mut SplitMix64) -> Vec<(Oklab, f32)> {
+    use std::f64::consts::{PI, TAU};
+
+    let n = n.max(1);
+    let base_hue = rng.range(0.0, TAU);
+
+    // Total hue sweep across the palette, picked from the same classical
+    // schemes the coons palette uses.
+    let scheme = rng.next_f64();
+    let span = if scheme < 0.40 {
+        rng.range(0.5, 1.2) // analogous -- calmest
+    } else if scheme < 0.70 {
+        PI + rng.range(-0.6, 0.6) // split-complementary
+    } else if scheme < 0.90 {
+        TAU * 2.0 / 3.0 // triadic
+    } else {
+        TAU // full wheel, most vibrant
+    };
+
+    let base_l = rng.range(0.42, 0.78) as f32;
+    let l_span = rng.range(0.10, 0.36) as f32;
+    let base_chroma = rng.range(0.05, 0.15) as f32;
+
+    (0..n)
+        .map(|i| {
+            let t = if n > 1 { i as f64 / (n - 1) as f64 } else { 0.5 };
+            let hue = base_hue + span * t;
+            // Ramp lightness across the palette so generators that read it as
+            // a gradient get contrast, not just a hue shift.
+            let l =
+                (base_l + l_span * (t as f32 - 0.5) * 2.0 + (rng.range(-1.0, 1.0) as f32) * 0.04)
+                    .clamp(0.20, 0.96);
+            let c = base_chroma * (rng.range(0.75, 1.25) as f32);
+            (Oklab { l, a: c * hue.cos() as f32, b: c * hue.sin() as f32 }, MAX16)
+        })
+        .collect()
+}
+
+/// Resolves a generator's palette: the caller's colors when given, otherwise a
+/// generated one with `n` entries.
+fn resolve_palette(
+    colors: &Option<Vec<[u16; 4]>>,
+    n: usize,
+    rng: &mut SplitMix64,
+) -> Vec<(Oklab, f32)> {
+    match colors {
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .map(|c| {
+                let (lab, a) = rgba16_to_oklab(*c);
+                (lab, a as f32)
+            })
+            .collect(),
+        _ => random_palette(n, rng),
+    }
+}
+
+/// Samples a palette as a continuous ramp at `t` in [0, 1].
+#[inline]
+fn palette_sample(palette: &[(Oklab, f32)], t: f64) -> (Oklab, f32) {
+    match palette.len() {
+        0 => (Oklab { l: 0.5, a: 0.0, b: 0.0 }, MAX16),
+        1 => palette[0],
+        n => {
+            let scaled = t.clamp(0.0, 1.0) * (n - 1) as f64;
+            let i = (scaled.floor() as usize).min(n - 2);
+            let f = (scaled - i as f64) as f32;
+            let (c0, a0) = palette[i];
+            let (c1, a1) = palette[i + 1];
+            (
+                Oklab {
+                    l: c0.l + (c1.l - c0.l) * f,
+                    a: c0.a + (c1.a - c0.a) * f,
+                    b: c0.b + (c1.b - c0.b) * f,
+                },
+                a0 + (a1 - a0) * f,
+            )
+        }
+    }
+}
+
+/// The darkest entry in a palette, used as a backdrop by the generators that
+/// draw light marks on a dark field.
+fn palette_darkest(palette: &[(Oklab, f32)]) -> Oklab {
+    palette
+        .iter()
+        .map(|(c, _)| *c)
+        .min_by(|a, b| a.l.partial_cmp(&b.l).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(Oklab { l: 0.15, a: 0.0, b: 0.0 })
+}
+
+/// Deterministic 2D -> 64-bit hash (the SplitMix64 finalizer over a mixed
+/// key). Used instead of a stateful PRNG so any pixel can look up any cell's
+/// data directly, in any order, from any thread.
+#[inline]
+fn hash2d(ix: i64, iy: i64, seed: u64) -> u64 {
+    let mut z = (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (iy as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Two independent floats in [0.0, 1.0) sliced out of one hash.
+#[inline]
+fn hash_unit2(h: u64) -> (f64, f64) {
+    const SCALE: f64 = 1.0 / (1u64 << 26) as f64;
+    ((h >> 38) as f64 * SCALE, ((h >> 12) & 0x03FF_FFFF) as f64 * SCALE)
+}
+
+/// Resolves a generator seed, reporting an auto-chosen one on stderr so the
+/// user can capture an interesting output and reproduce it with `seed:N`.
+fn resolve_seed(seed: &Option<u64>, what: &str) -> u64 {
+    match seed {
+        Some(s) => *s,
+        None => {
+            let s = random_seed();
+            eprintln!("canvas {}: using auto seed {}", what, s);
+            s
+        }
+    }
+}
+
 /// Derive a seed from the OS entropy pool when the user didn't supply one.
 /// Uses `getrandom::fill`; if the call fails (extremely rare on any supported
 /// platform) we fall back to a fixed constant so the tool still produces an
@@ -1192,6 +1802,809 @@ fn edge_point(w: f64, h: f64, edge: u32, t: f64) -> Point {
         2 => Point::new(t * w, h),   // bottom edge, left -> right
         _ => Point::new(0.0, t * h), // left edge, top -> bottom
     }
+}
+
+/// Radius, in cell widths, at which a blob cell's influence reaches exactly
+/// zero. This is what makes the finite search window correct: a seed outside
+/// the searched 5x5 block is always more than 2 cell widths away, so it would
+/// contribute nothing even if it were included.
+const BLOB_SUPPORT: f64 = 2.0;
+
+/// Voronoi cells over a jittered grid.
+///
+/// Both styles search a fixed block of grid cells around the pixel, which is
+/// what keeps this O(1) per pixel. The block has to be wide enough that no
+/// excluded seed could have changed the answer, otherwise seeds pop in and out
+/// as the block slides and the grid pitch shows up in the output:
+///
+/// * `sharp` needs the true nearest seed. A seed outside the 3x3 block is more
+///   than 1 cell away, so a 3x3 result under that distance is already provably
+///   correct; only when it isn't do we widen to 5x5.
+/// * `blob` sums every seed with non-zero weight, so its window must cover the
+///   whole kernel support -- hence 5x5 paired with `BLOB_SUPPORT`.
+#[allow(clippy::too_many_arguments)]
+fn render_voronoi(
+    buf: &mut [u16],
+    width: u32,
+    height: u32,
+    seed: u64,
+    cells: u32,
+    style: VoronoiStyle,
+    softness: f64,
+    palette: &[(Oklab, f32)],
+) {
+    let row_len = width as usize * 4;
+    // Cell pitch comes off the short edge so cells stay square on a
+    // non-square canvas instead of stretching with it.
+    let short = width.min(height).max(1) as f64;
+    let cell = (short / cells.max(1) as f64).max(1.0);
+    let inv_cell = 1.0 / cell;
+    let pal_n = palette.len().max(1);
+    // Exponential falloff constant, expressed in cell widths.
+    let falloff = 1.0 / softness.max(1e-3);
+
+    buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+        let py = y as f64 + 0.5;
+        let gy = (py * inv_cell).floor() as i64;
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            let pxf = x as f64 + 0.5;
+            let gx = (pxf * inv_cell).floor() as i64;
+
+            // Distance from this pixel to the seed of one grid cell, in
+            // cell widths so `softness` means the same thing at every
+            // cell count.
+            let seed_dist = |ox: i64, oy: i64| -> (f64, u64) {
+                let (cx, cy) = (gx + ox, gy + oy);
+                let h = hash2d(cx, cy, seed);
+                let (jx, jy) = hash_unit2(h);
+                let dx = (cx as f64 + jx) * cell - pxf;
+                let dy = (cy as f64 + jy) * cell - py;
+                ((dx * dx + dy * dy).sqrt() * inv_cell, h)
+            };
+
+            // The palette index uses the low hash bits, which are
+            // independent of the bits `hash_unit2` spends on jitter.
+            let (lab, alpha) = match style {
+                VoronoiStyle::Sharp => {
+                    let nearest = |radius: i64| -> (f64, u64) {
+                        let mut best = (f64::INFINITY, 0_u64);
+                        for oy in -radius..=radius {
+                            for ox in -radius..=radius {
+                                let cand = seed_dist(ox, oy);
+                                if cand.0 < best.0 {
+                                    best = cand;
+                                }
+                            }
+                        }
+                        best
+                    };
+                    let mut best = nearest(1);
+                    // The pixel's own cell always holds a seed within
+                    // sqrt(2) cells, so this widening is rare.
+                    if best.0 > 1.0 {
+                        best = nearest(2);
+                    }
+                    palette[(best.1 & 0xFFF) as usize % pal_n]
+                }
+                VoronoiStyle::Blob => {
+                    let mut seeds = [(0.0_f64, 0_u64); 25];
+                    let mut count = 0_usize;
+                    let mut d_min = f64::INFINITY;
+                    for oy in -2..=2_i64 {
+                        for ox in -2..=2_i64 {
+                            let (d, h) = seed_dist(ox, oy);
+                            if d < BLOB_SUPPORT {
+                                seeds[count] = (d, h);
+                                count += 1;
+                                if d < d_min {
+                                    d_min = d;
+                                }
+                            }
+                        }
+                    }
+
+                    let (mut l, mut a, mut b, mut al, mut wsum) =
+                        (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+                    for &(d, h) in seeds.iter().take(count) {
+                        // Wyvill's kernel windows the exponential falloff
+                        // down to exactly zero (with zero slope) at the
+                        // support radius, so a cell's contribution fades
+                        // out smoothly instead of being cut off at the
+                        // edge of the search block.
+                        let t = d * (1.0 / BLOB_SUPPORT);
+                        let window = 1.0 - t * t;
+                        let window = window * window * window;
+                        // Offsetting by d_min keeps exp() off its
+                        // underflow floor; it is a common factor across
+                        // every weight, so it cancels in the normalization
+                        // and cannot affect the result.
+                        let w = (-(d - d_min) * falloff).exp() * window;
+                        let c = palette[(h & 0xFFF) as usize % pal_n];
+                        l += w * c.0.l as f64;
+                        a += w * c.0.a as f64;
+                        b += w * c.0.b as f64;
+                        al += w * c.1 as f64;
+                        wsum += w;
+                    }
+
+                    if wsum > 1e-12 {
+                        let inv = 1.0 / wsum;
+                        (
+                            Oklab { l: (l * inv) as f32, a: (a * inv) as f32, b: (b * inv) as f32 },
+                            (al * inv) as f32,
+                        )
+                    } else {
+                        // Unreachable in practice -- the pixel's own cell
+                        // always holds a seed inside the support radius --
+                        // but this keeps a zero divide from painting the
+                        // pixel black, and cannot panic on an empty slice.
+                        palette
+                            .first()
+                            .copied()
+                            .unwrap_or((Oklab { l: 0.0, a: 0.0, b: 0.0 }, MAX16))
+                    }
+                }
+            };
+
+            let rgb = oklab_to_rgb16(lab);
+            px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha.round().clamp(0.0, MAX16) as u16]);
+        }
+    });
+}
+
+/// Fractal Brownian motion from the `noise` crate, mapped through a ramp.
+#[allow(clippy::too_many_arguments)]
+fn render_fbm(
+    buf: &mut [u16],
+    width: u32,
+    height: u32,
+    seed: u64,
+    octaves: usize,
+    frequency: f64,
+    lacunarity: f64,
+    persistence: f64,
+    zoom: f64,
+    seamless: bool,
+    grad: &PreparedGradient,
+    easing: Option<&CssEasing>,
+) {
+    // Order matters: `set_persistence` recomputes the internal scale factor
+    // from the octave count, so octaves has to be set first.
+    // `noise` seeds are u32, so the canvas seed is deliberately narrowed here.
+    let fbm = Fbm::<Perlin>::new(seed as u32)
+        .set_octaves(octaves.clamp(1, Fbm::<Perlin>::MAX_OCTAVES))
+        .set_frequency(frequency)
+        .set_lacunarity(lacunarity)
+        .set_persistence(persistence);
+
+    // Keep the field isotropic: the short edge spans `zoom` units and the long
+    // edge is extended in proportion rather than stretching the noise.
+    let (w, h) = (width as f64, height as f64);
+    let (ex, ey) = if w >= h { (zoom * w / h, zoom) } else { (zoom, zoom * h / w) };
+
+    // `new_fn` rather than `new`: in noise 0.9 the 2-D `build` is only
+    // implemented for a builder whose source went through `new_fn`, so
+    // `PlaneMapBuilder::<_, 2>::new(&fbm)` (as the crate README shows) has no
+    // `set_size` or `build` to call. The turbofish pins the dimension rather
+    // than leaving it to be inferred through the closure's `Fn` bound.
+    let map = PlaneMapBuilder::<_, 2>::new_fn(|p: [f64; 2]| fbm.get(p))
+        .set_size(width as usize, height as usize)
+        .set_x_bounds(-ex, ex)
+        .set_y_bounds(-ey, ey)
+        .set_is_seamless(seamless)
+        .build();
+
+    let row_len = width as usize * 4;
+    let map = &map;
+    buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            // Fbm is scaled to [-1, 1]; remap onto the ramp's [0, 1].
+            let mut t = ((map.get_value(x, y) + 1.0) * 0.5).clamp(0.0, 1.0);
+            if let Some(e) = easing {
+                t = e.ease(t);
+            }
+            px.copy_from_slice(&grad.eval(t));
+        }
+    });
+}
+
+/// Deposits one sub-pixel sample into a coverage buffer with bilinear weights.
+/// Colors are accumulated premultiplied by coverage so overlapping strands
+/// average rather than fight, independent of the order they were drawn in.
+#[inline]
+fn splat(acc: &mut [[f32; 4]], width: u32, height: u32, x: f64, y: f64, c: Oklab, a: f32) {
+    if a <= 0.0 {
+        return;
+    }
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let bx = fx.floor();
+    let by = fy.floor();
+    let tx = (fx - bx) as f32;
+    let ty = (fy - by) as f32;
+    let x0 = bx as i64;
+    let y0 = by as i64;
+    let corners = [
+        (0_i64, 0_i64, (1.0 - tx) * (1.0 - ty)),
+        (1, 0, tx * (1.0 - ty)),
+        (0, 1, (1.0 - tx) * ty),
+        (1, 1, tx * ty),
+    ];
+    for (dx, dy, wgt) in corners {
+        let px = x0 + dx;
+        let py = y0 + dy;
+        if px < 0 || py < 0 || px >= width as i64 || py >= height as i64 {
+            continue;
+        }
+        let cw = wgt * a;
+        if cw <= 0.0 {
+            continue;
+        }
+        let cell = &mut acc[py as usize * width as usize + px as usize];
+        cell[0] += cw * c.l;
+        cell[1] += cw * c.a;
+        cell[2] += cw * c.b;
+        cell[3] += cw;
+    }
+}
+
+/// Hair-like streamlines: particles seeded on a jittered grid and advected
+/// through a Perlin flow field, tapering at both ends so they read as strands
+/// rather than tubes.
+#[allow(clippy::too_many_arguments)]
+fn render_flow(
+    buf: &mut [u16],
+    width: u32,
+    height: u32,
+    seed: u64,
+    strands: u32,
+    steps: u32,
+    step_len: f64,
+    zoom: f64,
+    turns: f64,
+    line_width: f64,
+    alpha: f64,
+    palette: &[(Oklab, f32)],
+) {
+    use std::f64::consts::PI;
+
+    let (w, h) = (width as f64, height as f64);
+    let mut acc: Vec<[f32; 4]> = vec![[0.0; 4]; width as usize * height as usize];
+
+    let field =
+        Fbm::<Perlin>::new(seed as u32).set_octaves(4).set_frequency(1.0).set_persistence(0.5);
+
+    // Strand starts sit on a jittered grid: pure random placement clumps, and
+    // clumps show up badly once every strand is a visible line.
+    let target = strands.max(1) as f64;
+    let cols = ((target * w / h).sqrt().round() as i64).max(1);
+    let rows = ((target * h / w).sqrt().round() as i64).max(1);
+
+    let short = w.min(h).max(1.0);
+    let noise_scale = zoom.max(1e-6) / short;
+    let sub = line_width.max(0.5).ceil().max(1.0) as i64;
+    let sub_gap = line_width.max(0.5) / sub as f64;
+    let a_step = alpha.clamp(0.0, 1.0) as f32;
+    let steps = steps.max(1);
+
+    for gy in 0..rows {
+        for gx in 0..cols {
+            let h0 = hash2d(gx, gy, seed);
+            let (jx, jy) = hash_unit2(h0);
+            let mut x = (gx as f64 + jx) / cols as f64 * w;
+            let mut y = (gy as f64 + jy) / rows as f64 * h;
+
+            // Color by start position so neighbouring strands share a hue and
+            // the field reads as regions rather than confetti.
+            let t = (x / w) * 0.65 + (y / h) * 0.35;
+            let (base, _) = palette_sample(palette, t);
+            let jitter = ((h0 >> 20) & 0xFFFF) as f32 / 65535.0 - 0.5;
+            let col = Oklab { l: (base.l + jitter * 0.12).clamp(0.0, 1.0), a: base.a, b: base.b };
+
+            for s in 0..steps {
+                let ang = field.get([x * noise_scale, y * noise_scale]) * PI * turns;
+                let (dy_dir, dx_dir) = ang.sin_cos();
+                x += dx_dir * step_len;
+                y += dy_dir * step_len;
+                if x < -2.0 || y < -2.0 || x > w + 2.0 || y > h + 2.0 {
+                    break;
+                }
+                // Fade in and out along the strand so the ends taper.
+                let u = (s as f64 + 0.5) / steps as f64;
+                let env = (PI * u).sin().sqrt() as f32;
+                let a = a_step * env;
+                for k in 0..sub {
+                    let off = (k as f64 - (sub - 1) as f64 * 0.5) * sub_gap;
+                    // Offset perpendicular to travel to give the strand width.
+                    splat(&mut acc, width, height, x - dy_dir * off, y + dx_dir * off, col, a);
+                }
+            }
+        }
+    }
+
+    // Backdrop: the palette's darkest color, pushed darker still so even the
+    // dimmest strand stays legible against it.
+    let dark = palette_darkest(palette);
+    let bg = Oklab { l: (dark.l * 0.55).clamp(0.02, 0.5), a: dark.a * 0.5, b: dark.b * 0.5 };
+
+    let row_len = width as usize * 4;
+    let acc = &acc;
+    buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            let cell = acc[y * width as usize + x];
+            let cov = cell[3];
+            let lab = if cov > 1e-6 {
+                let inv = 1.0 / cov;
+                let a = cov.min(1.0);
+                Oklab {
+                    l: bg.l + (cell[0] * inv - bg.l) * a,
+                    a: bg.a + (cell[1] * inv - bg.a) * a,
+                    b: bg.b + (cell[2] * inv - bg.b) * a,
+                }
+            } else {
+                bg
+            };
+            let rgb = oklab_to_rgb16(lab);
+            px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], u16::MAX]);
+        }
+    });
+}
+
+/// Low-poly facets: a Delaunay triangulation of jittered points, each triangle
+/// filled from a smooth underlying color field.
+fn render_lowpoly(
+    buf: &mut [u16],
+    width: u32,
+    height: u32,
+    seed: u64,
+    points: u32,
+    smooth: bool,
+    palette: &[(Oklab, f32)],
+) {
+    let (w, h) = (width as f64, height as f64);
+    let mut rng = SplitMix64::new(seed);
+
+    // Interior points on a jittered grid. Uniform random points leave clumps
+    // and slivers; jittered grid points give evenly sized facets.
+    let target = points.max(3) as f64;
+    let aspect = (w / h).max(1e-6);
+    let cols = ((target * aspect).sqrt().round() as usize).max(2);
+    let rows = ((target / aspect).sqrt().round() as usize).max(2);
+
+    let mut pts: Vec<DelaunayPoint> = Vec::with_capacity(cols * rows + 4 * (cols + rows) + 8);
+    for gy in 0..rows {
+        for gx in 0..cols {
+            let jx = rng.range(0.12, 0.88);
+            let jy = rng.range(0.12, 0.88);
+            pts.push(DelaunayPoint {
+                x: (gx as f64 + jx) / cols as f64 * w,
+                y: (gy as f64 + jy) / rows as f64 * h,
+            });
+        }
+    }
+
+    // Boundary points, so the convex hull of the input is the canvas rectangle
+    // and every pixel ends up inside some triangle. Corners are contributed
+    // once by the horizontal edges; the vertical edges skip them to avoid
+    // handing the triangulator duplicate points.
+    let edge_x = cols.max(2);
+    let edge_y = rows.max(2);
+    for i in 0..=edge_x {
+        let t = i as f64 / edge_x as f64;
+        pts.push(DelaunayPoint { x: t * w, y: 0.0 });
+        pts.push(DelaunayPoint { x: t * w, y: h });
+    }
+    for i in 1..edge_y {
+        let t = i as f64 / edge_y as f64;
+        pts.push(DelaunayPoint { x: 0.0, y: t * h });
+        pts.push(DelaunayPoint { x: w, y: t * h });
+    }
+
+    // Underlying color field: a bilinear Oklab blend of four palette entries,
+    // so adjacent facets differ subtly instead of at random.
+    let corner = |i: usize| palette_sample(palette, i as f64 / 3.0).0;
+    let (c_tl, c_tr, c_bl, c_br) = (corner(0), corner(1), corner(2), corner(3));
+    let field = |x: f64, y: f64| -> Oklab {
+        let u = (x / w).clamp(0.0, 1.0) as f32;
+        let v = (y / h).clamp(0.0, 1.0) as f32;
+        let (ui, vi) = (1.0 - u, 1.0 - v);
+        let (w00, w10, w01, w11) = (ui * vi, u * vi, ui * v, u * v);
+        Oklab {
+            l: w00 * c_tl.l + w10 * c_tr.l + w01 * c_bl.l + w11 * c_br.l,
+            a: w00 * c_tl.a + w10 * c_tr.a + w01 * c_bl.a + w11 * c_br.a,
+            b: w00 * c_tl.b + w10 * c_tr.b + w01 * c_bl.b + w11 * c_br.b,
+        }
+    };
+
+    let tri = triangulate(&pts);
+    let width_us = width as usize;
+
+    // Collinear input degenerates to an empty triangulation; fall back to the
+    // bare color field rather than leaving the canvas blank.
+    if tri.triangles.is_empty() {
+        let row_len = width_us * 4;
+        buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+            for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                let rgb = oklab_to_rgb16(field(x as f64 + 0.5, y as f64 + 0.5));
+                px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], u16::MAX]);
+            }
+        });
+        return;
+    }
+
+    for t in 0..tri.len() {
+        let (ia, ib, ic) =
+            (tri.triangles[3 * t], tri.triangles[3 * t + 1], tri.triangles[3 * t + 2]);
+        let (pa, pb, pc) = (&pts[ia], &pts[ib], &pts[ic]);
+
+        // Twice the signed area. Dividing the barycentric weights by it also
+        // normalizes the winding, so the inside test works either way round.
+        let area2 = (pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x);
+        if area2.abs() < 1e-12 {
+            continue;
+        }
+        let inv_area = 1.0 / area2;
+
+        // Per-facet lightness offset, keyed off the triangle's own position so
+        // it stays stable for a given seed. This is what sells the "faceted
+        // 3-D surface" read; without it the mesh looks like a flat gradient.
+        let cx = (pa.x + pb.x + pc.x) / 3.0;
+        let cy = (pa.y + pb.y + pc.y) / 3.0;
+        let facet = (hash2d(cx as i64, cy as i64, seed) >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+        let shade = facet * 0.09;
+
+        let (ca, cb, cc) = if smooth {
+            (field(pa.x, pa.y), field(pb.x, pb.y), field(pc.x, pc.y))
+        } else {
+            let flat = field(cx, cy);
+            (flat, flat, flat)
+        };
+
+        let min_x = pa.x.min(pb.x).min(pc.x).floor().max(0.0) as usize;
+        let max_x = (pa.x.max(pb.x).max(pc.x).ceil() as i64).clamp(0, width as i64 - 1) as usize;
+        let min_y = pa.y.min(pb.y).min(pc.y).floor().max(0.0) as usize;
+        let max_y = (pa.y.max(pb.y).max(pc.y).ceil() as i64).clamp(0, height as i64 - 1) as usize;
+        if min_x > max_x || min_y > max_y {
+            continue;
+        }
+
+        for py in min_y..=max_y {
+            let fy = py as f64 + 0.5;
+            for px_i in min_x..=max_x {
+                let fx = px_i as f64 + 0.5;
+                // Barycentric weights: wb for B, wc for C, wa the remainder.
+                let wb = ((fx - pa.x) * (pc.y - pa.y) - (fy - pa.y) * (pc.x - pa.x)) * inv_area;
+                let wc = ((pb.x - pa.x) * (fy - pa.y) - (pb.y - pa.y) * (fx - pa.x)) * inv_area;
+                let wa = 1.0 - wb - wc;
+                // A hair of slack on the edges: neighbouring triangles then
+                // overlap by a sliver instead of leaving a seam of unwritten
+                // pixels where the two tests disagree by a rounding error.
+                if wa < -1e-9 || wb < -1e-9 || wc < -1e-9 {
+                    continue;
+                }
+
+                let lab = if smooth {
+                    let (fa, fb, fc) = (wa as f32, wb as f32, wc as f32);
+                    Oklab {
+                        l: (ca.l * fa + cb.l * fb + cc.l * fc + shade).clamp(0.0, 1.0),
+                        a: ca.a * fa + cb.a * fb + cc.a * fc,
+                        b: ca.b * fa + cb.b * fb + cc.b * fc,
+                    }
+                } else {
+                    Oklab { l: (ca.l + shade).clamp(0.0, 1.0), a: ca.a, b: ca.b }
+                };
+
+                let rgb = oklab_to_rgb16(lab);
+                let o = (py * width_us + px_i) * 4;
+                buf[o] = rgb[0];
+                buf[o + 1] = rgb[1];
+                buf[o + 2] = rgb[2];
+                buf[o + 3] = u16::MAX;
+            }
+        }
+    }
+}
+
+/// Hard ceiling on chaos-game iterations, whatever `quality` asks for. The
+/// chaos game is a serial random scatter, so this is the knob that decides how
+/// long a `flame` canvas can take; raising it costs time roughly linearly.
+const MAX_FLAME_ITERS: u64 = 400_000_000;
+
+/// Variations that stay continuous across the `atan2` branch cut along the
+/// negative y axis. A variation that jumps there folds the plane along that
+/// line, which renders as a hard straight edge through the image as soon as
+/// the transform carries real weight. `continuous` draws from this set only.
+///
+/// Using `theta` is not by itself disqualifying: most of these feed it through
+/// `sin`/`cos`, which are 2*pi-periodic, so the 2*pi jump at the cut cancels
+/// out. Only three genuinely break -- polar (5) and disc (8) use `theta / PI`
+/// raw, and heart (7) forms `sin(theta * r)`, which is periodic in `theta`
+/// only when `r` happens to be an integer.
+const CONTINUOUS_VARIATIONS: [u8; 14] = [0, 1, 2, 3, 4, 6, 9, 10, 11, 12, 13, 14, 15, 16];
+
+/// One affine map plus its variation, i.e. one function of the iterated
+/// function system.
+struct FlameTransform {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+    /// Where this transform sits on the palette, in [0, 1].
+    color: f64,
+    variation: u8,
+}
+
+/// A representative subset of the Draves variation set. `theta` follows the
+/// flame convention of `atan2(x, y)` rather than the usual `atan2(y, x)`.
+#[inline]
+fn flame_variation(v: u8, x: f64, y: f64) -> (f64, f64) {
+    use std::f64::consts::PI;
+
+    let r2 = x * x + y * y;
+    let r = r2.sqrt();
+    let theta = x.atan2(y);
+    let inv_r = 1.0 / (r + 1e-9);
+
+    match v {
+        0 => (x, y),                             // linear
+        1 => (x.sin(), y.sin()),                 // sinusoidal
+        2 => (x / (r2 + 1e-9), y / (r2 + 1e-9)), // spherical
+        3 => {
+            let (s, c) = r2.sin_cos();
+            (x * s - y * c, x * c + y * s) // swirl
+        }
+        4 => ((x - y) * (x + y) * inv_r, 2.0 * x * y * inv_r), // horseshoe
+        5 => (theta / PI, r - 1.0),                            // polar
+        6 => (r * (theta + r).sin(), r * (theta - r).cos()),   // handkerchief
+        7 => (r * (theta * r).sin(), -r * (theta * r).cos()),  // heart
+        8 => {
+            let t = theta / PI;
+            let (s, c) = (PI * r).sin_cos();
+            (t * s, t * c) // disc
+        }
+        9 => (inv_r * (theta.cos() + r.sin()), inv_r * (theta.sin() - r.cos())), // spiral
+        10 => (theta.sin() * inv_r, r * theta.cos()),                            // hyperbolic
+        11 => (theta.sin() * r.cos(), theta.cos() * r.sin()),                    // diamond
+        // 12..=16 are the cut-free additions. They exist so `continuous` has a
+        // pool worth drawing from; the numbering starts above the originals so
+        // that the default `% 12` selection, and every seed rendered with it,
+        // is left exactly as it was.
+        12 => {
+            let s = 2.0 / (r + 1.0);
+            (s * y, s * x) // fisheye
+        }
+        13 => {
+            let s = 2.0 / (r + 1.0);
+            (s * x, s * y) // eyefish
+        }
+        14 => {
+            // Clamped so a far-flung point cannot overflow to infinity; the
+            // iteration guard would catch it, but a finite value keeps the
+            // orbit usable instead of forcing a restart.
+            let m = (x - 1.0).min(80.0).exp();
+            (m * (PI * y).cos(), m * (PI * y).sin()) // exponential
+        }
+        15 => {
+            let s = 4.0 / (r2 + 4.0);
+            (s * x, s * y) // bubble
+        }
+        16 => (x.sin(), y), // cylinder
+        _ => (x, y),
+    }
+}
+
+/// Applies one transform: affine first, then its variation.
+#[inline]
+fn flame_step(t: &FlameTransform, x: f64, y: f64) -> (f64, f64) {
+    flame_variation(t.variation, t.a * x + t.b * y + t.c, t.d * x + t.e * y + t.f)
+}
+
+/// Fractal flame: the chaos game scattered into a density histogram, then
+/// log-tone-mapped. Accumulation is single-threaded on purpose -- a per-thread
+/// histogram would cost 16 bytes per pixel per thread, which is a worse trade
+/// than the time saved on a scatter this cache-hostile.
+#[allow(clippy::too_many_arguments)]
+fn render_flame(
+    buf: &mut [u16],
+    width: u32,
+    height: u32,
+    seed: u64,
+    quality: u32,
+    transforms: u32,
+    gamma: f64,
+    continuous: bool,
+    palette: &[(Oklab, f32)],
+) {
+    let mut rng = SplitMix64::new(seed);
+    let n_t = transforms.clamp(2, 12) as usize;
+
+    // Random affine maps, biased toward contraction so the attractor usually
+    // stays bounded. Divergent draws are caught during iteration anyway.
+    let mut xf: Vec<FlameTransform> = Vec::with_capacity(n_t);
+    for i in 0..n_t {
+        let scale = rng.range(0.3, 0.9);
+        let (sn, cs) = rng.range(0.0, std::f64::consts::TAU).sin_cos();
+        xf.push(FlameTransform {
+            a: scale * cs,
+            b: -scale * sn * rng.range(0.6, 1.4),
+            c: rng.range(-1.0, 1.0),
+            d: scale * sn,
+            e: scale * cs * rng.range(0.6, 1.4),
+            f: rng.range(-1.0, 1.0),
+            color: if n_t > 1 { i as f64 / (n_t - 1) as f64 } else { 0.0 },
+            // One draw either way, so switching `continuous` on does not
+            // shift the PRNG stream for anything that follows.
+            variation: if continuous {
+                CONTINUOUS_VARIATIONS
+                    [(rng.next_u64() % CONTINUOUS_VARIATIONS.len() as u64) as usize]
+            } else {
+                (rng.next_u64() % 12) as u8
+            },
+        });
+    }
+
+    // Palette in linear light, so summing samples is physically sensible.
+    let lut: Vec<[f32; 3]> = (0..256)
+        .map(|i| {
+            let (lab, _) = palette_sample(palette, i as f64 / 255.0);
+            let lin = oklab_to_linear_srgb(lab);
+            [lin.r.max(0.0), lin.g.max(0.0), lin.b.max(0.0)]
+        })
+        .collect();
+
+    // --- pass 1: sample the attractor to work out where to point the camera.
+    let mut xs: Vec<f64> = Vec::with_capacity(40_000);
+    let mut ys: Vec<f64> = Vec::with_capacity(40_000);
+    let (mut x, mut y) = (rng.range(-1.0, 1.0), rng.range(-1.0, 1.0));
+    for i in 0..40_000_u32 {
+        let t = &xf[(rng.next_u64() % n_t as u64) as usize];
+        let (nx, ny) = flame_step(t, x, y);
+        x = nx;
+        y = ny;
+        if !x.is_finite() || !y.is_finite() || x.abs() > 1e6 || y.abs() > 1e6 {
+            x = rng.range(-1.0, 1.0);
+            y = rng.range(-1.0, 1.0);
+            continue;
+        }
+        if i > 20 {
+            xs.push(x);
+            ys.push(y);
+        }
+    }
+
+    // Percentile bounds rather than min/max: a handful of far-flung outliers
+    // would otherwise shrink the whole attractor to a dot in the middle.
+    let bounds = |v: &mut Vec<f64>| -> (f64, f64) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let lo = v[v.len() / 200];
+        let hi = v[v.len() - 1 - v.len() / 200];
+        if hi - lo < 1e-9 { (lo - 1.0, hi + 1.0) } else { (lo, hi) }
+    };
+
+    let (cam_cx, cam_cy, scale_x, scale_y) = if xs.len() < 400 {
+        // Degenerate system: frame the default unit square and let the
+        // background carry the image.
+        (0.0, 0.0, width as f64 * 0.5, height as f64 * 0.5)
+    } else {
+        let (x0, x1) = bounds(&mut xs);
+        let (y0, y1) = bounds(&mut ys);
+        let mut sx = (x1 - x0) * 0.55;
+        let mut sy = (y1 - y0) * 0.55;
+        // Match the canvas aspect so the attractor is not squashed.
+        let aspect = width as f64 / height as f64;
+        if sx / sy < aspect {
+            sx = sy * aspect;
+        } else {
+            sy = sx / aspect;
+        }
+        ((x0 + x1) * 0.5, (y0 + y1) * 0.5, width as f64 / (2.0 * sx), height as f64 / (2.0 * sy))
+    };
+
+    // --- pass 2: the real chaos game.
+    //
+    // `quality` is samples per pixel, so the work grows with canvas area and
+    // has to be bounded somewhere. Silently clamping made two very different
+    // `quality:` values render byte-for-byte identically, so the clamp is
+    // reported: past this point the only thing more samples buy is less
+    // Monte-Carlo noise, since the tone map normalizes by the peak density.
+    let px_total = (width as u64).saturating_mul(height as u64).max(1);
+    let requested = (quality as u64).saturating_mul(px_total);
+    let iters = requested.min(MAX_FLAME_ITERS);
+    if iters < requested {
+        eprintln!(
+            "canvas flame: quality {} needs {} iterations at {}x{}, over the {}M ceiling; \
+             rendering at quality {} instead",
+            quality,
+            requested,
+            width,
+            height,
+            MAX_FLAME_ITERS / 1_000_000,
+            (iters / px_total).max(1)
+        );
+    }
+
+    let width_us = width as usize;
+    let mut hist: Vec<[f32; 4]> = vec![[0.0; 4]; width_us * height as usize];
+
+    let (mut x, mut y) = (rng.range(-1.0, 1.0), rng.range(-1.0, 1.0));
+    let mut col = rng.next_f64();
+    let half_w = width as f64 * 0.5;
+    let half_h = height as f64 * 0.5;
+
+    for i in 0..iters {
+        let t = &xf[(rng.next_u64() % n_t as u64) as usize];
+        let (nx, ny) = flame_step(t, x, y);
+        x = nx;
+        y = ny;
+        // Colour drifts halfway toward the chosen transform's index each step,
+        // which is what ties a region's hue to the path that reached it.
+        col = (col + t.color) * 0.5;
+        if !x.is_finite() || !y.is_finite() || x.abs() > 1e6 || y.abs() > 1e6 {
+            x = rng.range(-1.0, 1.0);
+            y = rng.range(-1.0, 1.0);
+            col = rng.next_f64();
+            continue;
+        }
+        // Discard the first few points: they are still settling onto the
+        // attractor and would smear the image with off-shape samples.
+        if i < 20 {
+            continue;
+        }
+
+        let sx = (x - cam_cx) * scale_x + half_w;
+        let sy = (y - cam_cy) * scale_y + half_h;
+        if sx < 0.0 || sy < 0.0 {
+            continue;
+        }
+        let (ix, iy) = (sx as usize, sy as usize);
+        if ix >= width_us || iy >= height as usize {
+            continue;
+        }
+
+        let rgb = lut[(col.clamp(0.0, 1.0) * 255.0) as usize];
+        let cell = &mut hist[iy * width_us + ix];
+        cell[0] += rgb[0];
+        cell[1] += rgb[1];
+        cell[2] += rgb[2];
+        cell[3] += 1.0;
+    }
+
+    // --- tone map. Brightness follows log density, which is what stops the
+    // dense core from blowing out while the faint filaments stay visible.
+    let max_count = hist.iter().fold(0.0_f32, |m, h| m.max(h[3]));
+    let denom = (1.0 + max_count).ln().max(1e-6);
+    let inv_gamma = 1.0 / (gamma.max(0.1) as f32);
+
+    let dark = palette_darkest(palette);
+    let bg_lin = oklab_to_linear_srgb(Oklab {
+        l: (dark.l * 0.30).clamp(0.01, 0.4),
+        a: dark.a * 0.4,
+        b: dark.b * 0.4,
+    });
+
+    let row_len = width_us * 4;
+    let hist = &hist;
+    buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            let cell = hist[y * width_us + x];
+            let cnt = cell[3];
+            let (r, g, b) = if cnt > 0.0 {
+                let a = ((1.0 + cnt).ln() / denom).powf(inv_gamma).clamp(0.0, 1.0);
+                let inv = 1.0 / cnt;
+                (
+                    cell[0] * inv * a + bg_lin.r * (1.0 - a),
+                    cell[1] * inv * a + bg_lin.g * (1.0 - a),
+                    cell[2] * inv * a + bg_lin.b * (1.0 - a),
+                )
+            } else {
+                (bg_lin.r, bg_lin.g, bg_lin.b)
+            };
+            let rgb = linear_rgb_to_rgb16(r, g, b);
+            px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], u16::MAX]);
+        }
+    });
 }
 
 pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickError> {
@@ -1372,14 +2785,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             // Resolve the seed: use the caller's or derive one from OS entropy.
             // When auto-seeding, report the chosen seed on stderr so the user
             // can capture an interesting output and reproduce it with `seed:N`.
-            let actual_seed = match seed {
-                Some(s) => *s,
-                None => {
-                    let s = random_seed();
-                    eprintln!("canvas coons: using auto seed {}", s);
-                    s
-                }
-            };
+            let actual_seed = resolve_seed(seed, "coons");
             let mut rng = SplitMix64::new(actual_seed);
 
             // Random geometry. Drawn from `rng` first so that seeds behave
@@ -1443,6 +2849,118 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
                     px.copy_from_slice(&c);
                 }
             });
+        }
+        CanvasSpec::Voronoi { seed, cells, style, softness, colors } => {
+            let actual_seed = resolve_seed(seed, "voronoi");
+            let mut rng = SplitMix64::new(actual_seed);
+            let palette = resolve_palette(colors, 6, &mut rng);
+            render_voronoi(
+                &mut buf,
+                width,
+                height,
+                actual_seed,
+                *cells,
+                *style,
+                *softness,
+                &palette,
+            );
+        }
+        CanvasSpec::Fbm {
+            seed,
+            octaves,
+            frequency,
+            lacunarity,
+            persistence,
+            zoom,
+            seamless,
+            stops,
+            easing,
+        } => {
+            let actual_seed = resolve_seed(seed, "fbm");
+            let mut rng = SplitMix64::new(actual_seed);
+            let grad = match stops {
+                Some(list) => PreparedGradient::new(list),
+                None => {
+                    // No ramp given: turn the generated palette into evenly
+                    // spaced stops, staying in Oklab the whole way.
+                    let palette = random_palette(4, &mut rng);
+                    let last = (palette.len() - 1).max(1) as f64;
+                    PreparedGradient::from_oklab(
+                        palette
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (lab, a))| {
+                                (i as f64 / last, *lab, a.round().clamp(0.0, MAX16) as u16)
+                            })
+                            .collect(),
+                    )
+                }
+            };
+            render_fbm(
+                &mut buf,
+                width,
+                height,
+                actual_seed,
+                *octaves,
+                *frequency,
+                *lacunarity,
+                *persistence,
+                *zoom,
+                *seamless,
+                &grad,
+                easing.as_ref(),
+            );
+        }
+        CanvasSpec::Flow {
+            seed,
+            strands,
+            steps,
+            step_len,
+            zoom,
+            turns,
+            width: line_width,
+            alpha,
+            colors,
+        } => {
+            let actual_seed = resolve_seed(seed, "flow");
+            let mut rng = SplitMix64::new(actual_seed);
+            let palette = resolve_palette(colors, 5, &mut rng);
+            render_flow(
+                &mut buf,
+                width,
+                height,
+                actual_seed,
+                *strands,
+                *steps,
+                *step_len,
+                *zoom,
+                *turns,
+                *line_width,
+                *alpha,
+                &palette,
+            );
+        }
+        CanvasSpec::LowPoly { seed, points, smooth, colors } => {
+            let actual_seed = resolve_seed(seed, "lowpoly");
+            let mut rng = SplitMix64::new(actual_seed);
+            let palette = resolve_palette(colors, 4, &mut rng);
+            render_lowpoly(&mut buf, width, height, actual_seed, *points, *smooth, &palette);
+        }
+        CanvasSpec::Flame { seed, quality, transforms, gamma, continuous, colors } => {
+            let actual_seed = resolve_seed(seed, "flame");
+            let mut rng = SplitMix64::new(actual_seed);
+            let palette = resolve_palette(colors, 5, &mut rng);
+            render_flame(
+                &mut buf,
+                width,
+                height,
+                actual_seed,
+                *quality,
+                *transforms,
+                *gamma,
+                *continuous,
+                &palette,
+            );
         }
     }
 
@@ -1892,6 +3410,245 @@ mod tests {
                     t,
                     tmin,
                     tmax,
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_arg_voronoi_defaults_and_styles() {
+        let c = CanvasConfig::parse_arg("size:64x64,voronoi").unwrap();
+        match c.spec {
+            CanvasSpec::Voronoi { seed, cells, style, colors, .. } => {
+                assert_eq!(seed, None);
+                assert_eq!(cells, 12);
+                assert_eq!(style, VoronoiStyle::Sharp);
+                assert!(colors.is_none());
+            }
+            _ => panic!("expected voronoi"),
+        }
+
+        // `sharp` and `blob` select the edge treatment; order is free.
+        let blob = CanvasConfig::parse_arg("voronoi,blob,cells:30,seed:7").unwrap();
+        let blob2 = CanvasConfig::parse_arg("voronoi,seed:7,cells:30,blob").unwrap();
+        assert_eq!(blob.spec, blob2.spec);
+        match blob.spec {
+            CanvasSpec::Voronoi { style, cells, seed, .. } => {
+                assert_eq!(style, VoronoiStyle::Blob);
+                assert_eq!(cells, 30);
+                assert_eq!(seed, Some(7));
+            }
+            _ => panic!("expected voronoi"),
+        }
+    }
+
+    #[test]
+    fn parse_arg_voronoi_bad_options() {
+        // Out of range, non-numeric, unknown key, repeated key.
+        assert!(CanvasConfig::parse_arg("voronoi,cells:0").is_err());
+        assert!(CanvasConfig::parse_arg("voronoi,cells:abc").is_err());
+        assert!(CanvasConfig::parse_arg("voronoi,cels:8").is_err());
+        assert!(CanvasConfig::parse_arg("voronoi,cells:8,cells:9").is_err());
+        assert!(CanvasConfig::parse_arg("voronoi,softness:0.0").is_err());
+        // A single color is not enough to build a palette from.
+        assert!(CanvasConfig::parse_arg("voronoi,#ff0000").is_err());
+    }
+
+    #[test]
+    fn parse_arg_fbm_options_and_stops() {
+        let c = CanvasConfig::parse_arg(
+            "size:32x32,fbm,seed:3,octaves:4,persistence:0.6,zoom:8,seamless,#000000,#ffffff",
+        )
+        .unwrap();
+        match c.spec {
+            CanvasSpec::Fbm { seed, octaves, persistence, zoom, seamless, stops, .. } => {
+                assert_eq!(seed, Some(3));
+                assert_eq!(octaves, 4);
+                assert!((persistence - 0.6).abs() < 1e-12);
+                assert!((zoom - 8.0).abs() < 1e-12);
+                assert!(seamless);
+                assert_eq!(stops.unwrap().len(), 2);
+            }
+            _ => panic!("expected fbm"),
+        }
+    }
+
+    #[test]
+    fn parse_arg_fbm_positional_stops_are_not_options() {
+        // `0.5:#00ff00` contains a colon but is a gradient stop, not `key:value`.
+        let c = CanvasConfig::parse_arg("fbm,0:#000000,0.5:#00ff00,1:#ffffff").unwrap();
+        match c.spec {
+            CanvasSpec::Fbm { stops, .. } => {
+                let stops = stops.expect("stops parsed");
+                assert_eq!(stops.len(), 3);
+                assert!((stops[1].pos - 0.5).abs() < 1e-12);
+            }
+            _ => panic!("expected fbm"),
+        }
+    }
+
+    #[test]
+    fn parse_arg_fbm_bad_options() {
+        assert!(CanvasConfig::parse_arg("fbm,octaves:0").is_err());
+        assert!(CanvasConfig::parse_arg("fbm,octaves:99").is_err());
+        assert!(CanvasConfig::parse_arg("fbm,persistence:2.0").is_err());
+        assert!(CanvasConfig::parse_arg("fbm,seamles").is_err()); // typo'd flag
+    }
+
+    #[test]
+    fn parse_arg_flame_continuous_flag() {
+        let c = CanvasConfig::parse_arg("flame,continuous,seed:5").unwrap();
+        match c.spec {
+            CanvasSpec::Flame { continuous, .. } => assert!(continuous),
+            _ => panic!("expected flame"),
+        }
+        let d = CanvasConfig::parse_arg("flame,seed:5").unwrap();
+        match d.spec {
+            CanvasSpec::Flame { continuous, .. } => assert!(!continuous),
+            _ => panic!("expected flame"),
+        }
+    }
+
+    #[test]
+    fn continuous_variations_exclude_the_discontinuous_ones() {
+        // Exactly polar, heart and disc jump across the branch cut; the rest
+        // only ever use theta inside sin/cos, where the jump cancels.
+        for v in CONTINUOUS_VARIATIONS {
+            assert!(
+                !matches!(v, 5 | 7 | 8),
+                "variation {} jumps across the branch cut and cannot be cut-free",
+                v
+            );
+        }
+        // ...and every other variation is present, so the pool stays varied.
+        for v in 0..=16_u8 {
+            assert_eq!(
+                CONTINUOUS_VARIATIONS.contains(&v),
+                !matches!(v, 5 | 7 | 8),
+                "variation {} is on the wrong side of the cut-free set",
+                v
+            );
+        }
+        // No duplicates, so the modulo draw is uniform over distinct choices.
+        let mut sorted = CONTINUOUS_VARIATIONS;
+        sorted.sort_unstable();
+        let mut deduped = sorted.to_vec();
+        deduped.dedup();
+        assert_eq!(deduped.len(), CONTINUOUS_VARIATIONS.len());
+    }
+
+    #[test]
+    fn parse_arg_flow_and_lowpoly_and_flame() {
+        let flow = CanvasConfig::parse_arg("flow,seed:1,strands:500,steps:120,width:2").unwrap();
+        match flow.spec {
+            CanvasSpec::Flow { strands, steps, width, .. } => {
+                assert_eq!(strands, 500);
+                assert_eq!(steps, 120);
+                assert!((width - 2.0).abs() < 1e-12);
+            }
+            _ => panic!("expected flow"),
+        }
+
+        let lp = CanvasConfig::parse_arg("lowpoly,points:40,smooth,seed:9").unwrap();
+        match lp.spec {
+            CanvasSpec::LowPoly { points, smooth, seed, .. } => {
+                assert_eq!(points, 40);
+                assert!(smooth);
+                assert_eq!(seed, Some(9));
+            }
+            _ => panic!("expected lowpoly"),
+        }
+
+        let fl = CanvasConfig::parse_arg("flame,quality:5,transforms:4,gamma:1.8").unwrap();
+        match fl.spec {
+            CanvasSpec::Flame { quality, transforms, gamma, .. } => {
+                assert_eq!(quality, 5);
+                assert_eq!(transforms, 4);
+                assert!((gamma - 1.8).abs() < 1e-12);
+            }
+            _ => panic!("expected flame"),
+        }
+
+        // Range checks on the generators that take counts.
+        assert!(CanvasConfig::parse_arg("flow,alpha:1.5").is_err());
+        assert!(CanvasConfig::parse_arg("lowpoly,points:2").is_err());
+        assert!(CanvasConfig::parse_arg("flame,transforms:1").is_err());
+        assert!(CanvasConfig::parse_arg("flame,transforms:99").is_err());
+    }
+
+    #[test]
+    fn spec_tokens_splits_options_flags_and_colors() {
+        let t = SpecTokens::split(&["seed:42", "blob", "#ff0000", "0.5:#00ff00"]);
+        assert_eq!(t.opts, vec![("seed", "42")]);
+        assert_eq!(t.flags, vec!["blob"]);
+        assert_eq!(t.colors, vec!["#ff0000", "0.5:#00ff00"]);
+    }
+
+    #[test]
+    fn spec_tokens_take_leaves_duplicates_for_finish() {
+        let mut t = SpecTokens::split(&["cells:8", "cells:9"]);
+        assert_eq!(t.take("cells"), Some("8"));
+        // The repeat is still there, so `finish` is what rejects it.
+        assert!(t.finish("err").is_err());
+    }
+
+    #[test]
+    fn random_palette_is_deterministic_and_in_gamut() {
+        let mut r1 = SplitMix64::new(1234);
+        let mut r2 = SplitMix64::new(1234);
+        let p1 = random_palette(6, &mut r1);
+        let p2 = random_palette(6, &mut r2);
+        assert_eq!(p1.len(), 6);
+        assert_eq!(p1, p2);
+        for (lab, a) in p1 {
+            assert!((0.0..=1.0).contains(&lab.l), "lightness {} out of range", lab.l);
+            assert!(lab.a.abs() < 0.5 && lab.b.abs() < 0.5);
+            assert_eq!(a, MAX16);
+        }
+    }
+
+    #[test]
+    fn palette_sample_hits_endpoints_and_midpoint() {
+        let pal = vec![
+            (Oklab { l: 0.0, a: 0.0, b: 0.0 }, MAX16),
+            (Oklab { l: 1.0, a: 0.0, b: 0.0 }, MAX16),
+        ];
+        assert!((palette_sample(&pal, 0.0).0.l - 0.0).abs() < 1e-6);
+        assert!((palette_sample(&pal, 1.0).0.l - 1.0).abs() < 1e-6);
+        assert!((palette_sample(&pal, 0.5).0.l - 0.5).abs() < 1e-6);
+        // Out-of-range input clamps rather than panicking on the index.
+        assert!((palette_sample(&pal, -3.0).0.l - 0.0).abs() < 1e-6);
+        assert!((palette_sample(&pal, 7.0).0.l - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hash2d_is_stable_and_well_spread() {
+        // Same inputs -> same hash, neighbours -> different hashes.
+        assert_eq!(hash2d(3, -7, 42), hash2d(3, -7, 42));
+        assert_ne!(hash2d(3, -7, 42), hash2d(3, -7, 43));
+        assert_ne!(hash2d(3, -7, 42), hash2d(4, -7, 42));
+        assert_ne!(hash2d(3, -7, 42), hash2d(3, -6, 42));
+        // Jitter stays inside the cell, which is what keeps the 3x3 search valid.
+        for i in 0..500_i64 {
+            let (jx, jy) = hash_unit2(hash2d(i, i * 7 - 3, 99));
+            assert!((0.0..1.0).contains(&jx));
+            assert!((0.0..1.0).contains(&jy));
+        }
+    }
+
+    #[test]
+    fn flame_variations_stay_finite() {
+        // Every variation is hit with awkward inputs, including the origin
+        // where several of them divide by r.
+        for v in 0..=16_u8 {
+            for &(x, y) in &[(0.0, 0.0), (1e-9, -1e-9), (0.7, -0.3), (-2.5, 4.25), (1e3, -1e3)] {
+                let (ox, oy) = flame_variation(v, x, y);
+                assert!(
+                    ox.is_finite() && oy.is_finite(),
+                    "variation {} produced a non-finite result at ({}, {})",
+                    v,
                     x,
                     y
                 );

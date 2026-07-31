@@ -31,6 +31,8 @@ kurbo = "0.13"
 getrandom = "0.4"
 gainforge = "0.5"
 moxcms = "0.9"
+noise = "0.9"
+delaunator = "1"
 
 [features]
 default = ["hardened_malloc", "default-formats"]
