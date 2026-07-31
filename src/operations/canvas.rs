@@ -1,16 +1,68 @@
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, ImageBuffer, Rgba};
 use kurbo::{CubicBez, ParamCurve, Point};
-use oklab::{oklab_to_srgb, srgb_to_oklab, Oklab, Rgb};
+use oklab::{Oklab, Rgb, oklab_to_srgb_f32, srgb_f32_to_oklab};
 use rayon::prelude::*;
+
+/// 16-bit RGBA image buffer. `image` keeps its own `Rgba16Image` alias
+/// crate-private, so we spell the type out once here.
+type Rgba16Image = ImageBuffer<Rgba<u16>, Vec<u16>>;
+
+/// Full-scale value of a 16-bit channel, as a float. Used for every
+/// normalize/denormalize step so the magic number lives in exactly one place.
+const MAX16: f32 = u16::MAX as f32;
+
+/// Expands an 8-bit channel to 16-bit. Multiplying by 257 (rather than
+/// shifting left by 8) maps 0x00 -> 0x0000 and 0xFF -> 0xFFFF exactly,
+/// so pure white stays pure white.
+#[inline]
+fn expand8(v: u8) -> u16 {
+    v as u16 * 257
+}
+
+/// Expands a 4-bit channel (a single hex digit) to 16-bit: 0xF -> 0xFFFF.
+#[inline]
+fn expand4(v: u8) -> u16 {
+    v as u16 * 0x1111
+}
+
+/// Quantizes one gamma-encoded sRGB channel in [0.0, 1.0] to 16 bits.
+#[inline]
+fn quantize16(v: f32) -> u16 {
+    // `oklab_to_srgb_f32` already clamps its own output, but out-of-gamut
+    // values can still reach us from interpolation, so clamp again. The
+    // float->int `as` cast saturates and maps NaN to 0 rather than wrapping.
+    (v.clamp(0.0, 1.0) * MAX16 + 0.5) as u16
+}
+
+/// Converts an Oklab color to gamma-encoded 16-bit sRGB.
+/// Goes through the crate's f32 conversion rather than `oklab_to_srgb`,
+/// which would quantize to 8 bits and throw away the precision we want.
+#[inline]
+fn oklab_to_rgb16(c: Oklab) -> [u16; 3] {
+    let rgb = oklab_to_srgb_f32(c);
+    [quantize16(rgb.r), quantize16(rgb.g), quantize16(rgb.b)]
+}
+
+/// Converts a straight-alpha 16-bit sRGB color to `(Oklab, alpha)`.
+/// The alpha channel is passed through untouched -- only RGB is color-managed.
+#[inline]
+fn rgba16_to_oklab(c: [u16; 4]) -> (Oklab, u16) {
+    let lab = srgb_f32_to_oklab(Rgb {
+        r: c[0] as f32 / MAX16,
+        g: c[1] as f32 / MAX16,
+        b: c[2] as f32 / MAX16,
+    });
+    (lab, c[3])
+}
 
 /// One stop in a gradient.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradientStop {
     /// Position in [0.0, 1.0]
     pub pos: f64,
-    /// Straight (non-premultiplied) RGBA
-    pub color: [u8; 4],
+    /// Straight (non-premultiplied) 16-bit RGBA
+    pub color: [u16; 4],
 }
 
 /// Defines the physical boundaries of a Coons Patch.
@@ -37,10 +89,7 @@ pub struct CssEasing {
 impl CssEasing {
     /// Creates a new easing curve. Matches the CSS `cubic-bezier(x1, y1, x2, y2)`.
     pub fn new(x1: f64, y1: f64, x2: f64, y2: f64) -> Self {
-        Self {
-            p1: (x1, y1),
-            p2: (x2, y2),
-        }
+        Self { p1: (x1, y1), p2: (x2, y2) }
     }
 
     /// Evaluates the eased progress for a given linear input `x` in [0.0, 1.0].
@@ -59,8 +108,10 @@ impl CssEasing {
         let mut t_max = 1.0;
         let mut t = 0.5;
 
-        // 12 iterations provide ~0.00024 precision, which is imperceptible in 8-bit color
-        for _ in 0..12 {
+        // 20 iterations provide ~1e-6 precision in `t`. 12 (~0.00024) was fine
+        // for 8-bit output but is coarse enough to show up as stair-stepping in
+        // a 16-bit ramp, where one code point is only 1.5e-5 of the range.
+        for _ in 0..20 {
             let current_x = curve.eval(t).x;
             if current_x < x {
                 t_min = t;
@@ -76,6 +127,8 @@ impl CssEasing {
 }
 
 /// Interpolates 4 corner colors using Bilinear interpolation in Oklab space.
+/// The `f32` beside each `Oklab` is straight alpha on the 16-bit scale
+/// (0.0 = transparent, 65535.0 = opaque).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshColors {
     pub tl: (Oklab, f32),
@@ -86,7 +139,7 @@ pub struct MeshColors {
 
 impl MeshColors {
     #[inline]
-    pub fn eval_color(&self, u: f64, v: f64) -> [u8; 4] {
+    pub fn eval_color(&self, u: f64, v: f64) -> [u16; 4] {
         // Cast coordinates to f32 to match Oklab's internal precision
         let u = u as f32;
         let v = v as f32;
@@ -109,15 +162,10 @@ impl MeshColors {
         // Blend straight alpha channel
         let mixed_alpha = w00 * self.tl.1 + w10 * self.tr.1 + w01 * self.bl.1 + w11 * self.br.1;
 
-        let rgb = oklab_to_srgb(mixed_oklab);
+        let rgb = oklab_to_rgb16(mixed_oklab);
 
         // Return the RGB along with the calculated alpha
-        [
-            rgb.r,
-            rgb.g,
-            rgb.b,
-            mixed_alpha.round().clamp(0.0, 255.0) as u8,
-        ]
+        [rgb[0], rgb[1], rgb[2], mixed_alpha.round().clamp(0.0, MAX16) as u16]
     }
 }
 
@@ -203,15 +251,13 @@ impl CoonsPatch {
         }
 
         // Final fallback check
-        if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
-            Some((u, v))
-        } else {
-            None
-        }
+        if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) { Some((u, v)) } else { None }
     }
 }
 
 /// Interpolates 4 corner colors using Bilinear interpolation in Oklab space, preserving Alpha.
+/// The `f32` beside each `Oklab` is straight alpha on the 16-bit scale
+/// (0.0 = transparent, 65535.0 = opaque).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatchColors {
     pub top_left: (Oklab, f32),
@@ -222,7 +268,7 @@ pub struct PatchColors {
 
 impl PatchColors {
     #[inline]
-    pub fn eval_color(&self, u: f64, v: f64) -> [u8; 4] {
+    pub fn eval_color(&self, u: f64, v: f64) -> [u16; 4] {
         // Cast coordinates to f32 to match Oklab's internal precision
         let u = u as f32;
         let v = v as f32;
@@ -258,15 +304,10 @@ impl PatchColors {
             + w01 * self.bottom_left.1
             + w11 * self.bottom_right.1;
 
-        let rgb = oklab_to_srgb(mixed_oklab);
+        let rgb = oklab_to_rgb16(mixed_oklab);
 
         // Return the RGB along with the calculated alpha
-        [
-            rgb.r,
-            rgb.g,
-            rgb.b,
-            mixed_alpha.round().clamp(0.0, 255.0) as u8,
-        ]
+        [rgb[0], rgb[1], rgb[2], mixed_alpha.round().clamp(0.0, MAX16) as u16]
     }
 }
 
@@ -280,23 +321,14 @@ pub enum Coord {
 /// What to fill the canvas with.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanvasSpec {
-    /// Solid RGBA fill
-    Solid([u8; 4]),
+    /// Solid 16-bit RGBA fill
+    Solid([u16; 4]),
     /// Linear gradient at an arbitrary angle (in degrees).
     /// 0 deg = left-to-right, 90 deg = top-to-bottom (angle increases clockwise
     /// in screen coordinates).
-    Linear {
-        angle_deg: f64,
-        stops: Vec<GradientStop>,
-        easing: Option<CssEasing>,
-    },
+    Linear { angle_deg: f64, stops: Vec<GradientStop>, easing: Option<CssEasing> },
     /// Radial gradient. `center_x` and `center_y` define the center. 0 at center, 1 at the farthest corner.
-    Radial {
-        center_x: Coord,
-        center_y: Coord,
-        stops: Vec<GradientStop>,
-        easing: Option<CssEasing>,
-    },
+    Radial { center_x: Coord, center_y: Coord, stops: Vec<GradientStop>, easing: Option<CssEasing> },
     /// A 4-corner bilinear mesh gradient.
     Mesh { colors: MeshColors },
     /// A Coons patch canvas with an auto-generated, interesting curved shape.
@@ -348,7 +380,9 @@ impl CanvasConfig {
     /// useful when canvas is the first operation in the pipeline and no input
     /// image was loaded from disk.
     ///
-    /// COLOR: hex, one of `#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`.
+    /// COLOR: hex, one of `#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA` (8-bit forms,
+    ///        expanded to the full 16-bit range), or `#RRRRGGGGBBBB` /
+    ///        `#RRRRGGGGBBBBAAAA` for native 16-bit channels.
     ///
     /// STOP: either `POS:COLOR` (e.g. `0.5:#ff0000`), or just `COLOR` in which
     ///       case positions are evenly distributed in [0, 1]. Positional and
@@ -386,10 +420,11 @@ impl CanvasConfig {
             if let Some(ease_str) = token.strip_prefix("ease:") {
                 let pts: Result<Vec<f64>, _> = ease_str.split(':').map(|n| n.parse()).collect();
                 if let Ok(p) = pts
-                    && p.len() == 4 {
-                        easing = Some(CssEasing::new(p[0], p[1], p[2], p[3]));
-                        continue;
-                    }
+                    && p.len() == 4
+                {
+                    easing = Some(CssEasing::new(p[0], p[1], p[2], p[3]));
+                    continue;
+                }
                 return Err(ArgParseErr::with_msg(
                     "canvas: invalid easing format (expected ease:x1:y1:x2:y2)",
                 ));
@@ -424,11 +459,7 @@ impl CanvasConfig {
                     return Err(ArgParseErr::with_msg("canvas linear: angle must be finite"));
                 }
                 let stops = parse_stops(&remaining[2..])?;
-                CanvasSpec::Linear {
-                    angle_deg,
-                    stops,
-                    easing,
-                }
+                CanvasSpec::Linear { angle_deg, stops, easing }
             }
             "radial" => {
                 let mut center_x = Coord::Ratio(0.5);
@@ -457,12 +488,7 @@ impl CanvasConfig {
                     ));
                 }
                 let stops = parse_stops(&remaining[stops_start..])?;
-                CanvasSpec::Radial {
-                    center_x,
-                    center_y,
-                    stops,
-                    easing,
-                }
+                CanvasSpec::Radial { center_x, center_y, stops, easing }
             }
             "mesh" => {
                 if remaining.len() != 5 {
@@ -475,15 +501,9 @@ impl CanvasConfig {
                 let c_bl = parse_color(remaining[3])?;
                 let c_br = parse_color(remaining[4])?;
 
-                let to_oklab = |c: [u8; 4]| {
-                    (
-                        srgb_to_oklab(Rgb {
-                            r: c[0],
-                            g: c[1],
-                            b: c[2],
-                        }),
-                        c[3] as f32,
-                    )
+                let to_oklab = |c: [u16; 4]| {
+                    let (lab, a) = rgba16_to_oklab(c);
+                    (lab, a as f32)
                 };
 
                 CanvasSpec::Mesh {
@@ -581,15 +601,9 @@ impl CanvasConfig {
                         let c_bl = parse_color(color_tokens[2])?;
                         let c_br = parse_color(color_tokens[3])?;
 
-                        let to_oklab = |c: [u8; 4]| {
-                            (
-                                srgb_to_oklab(Rgb {
-                                    r: c[0],
-                                    g: c[1],
-                                    b: c[2],
-                                }),
-                                c[3] as f32,
-                            )
+                        let to_oklab = |c: [u16; 4]| {
+                            let (lab, a) = rgba16_to_oklab(c);
+                            (lab, a as f32)
                         };
 
                         Some(PatchColors {
@@ -607,17 +621,12 @@ impl CanvasConfig {
                     }
                 };
 
-                CanvasSpec::Coons {
-                    seed,
-                    colors,
-                    easing,
-                    transparency,
-                }
+                CanvasSpec::Coons { seed, colors, easing, transparency }
             }
             _ => {
                 return Err(ArgParseErr::with_msg(
                     "canvas: type must be 'solid', 'linear', 'radial', 'mesh', or 'coons'",
-                ))
+                ));
             }
         };
 
@@ -628,27 +637,20 @@ impl CanvasConfig {
 fn parse_size(s: &str) -> Result<(u32, u32), ArgParseErr> {
     // accept both 'x' and 'X' as separator
     let mut it = s.splitn(2, ['x', 'X']);
-    let w_str = it
-        .next()
-        .ok_or_else(|| ArgParseErr::with_msg("canvas size: missing width"))?;
+    let w_str = it.next().ok_or_else(|| ArgParseErr::with_msg("canvas size: missing width"))?;
     let h_str = it.next().ok_or_else(|| {
         ArgParseErr::with_msg("canvas size: missing height (expected WIDTHxHEIGHT)")
     })?;
-    let w: u32 = w_str
-        .parse()
-        .map_err(|_| ArgParseErr::with_msg("canvas size: invalid width"))?;
-    let h: u32 = h_str
-        .parse()
-        .map_err(|_| ArgParseErr::with_msg("canvas size: invalid height"))?;
+    let w: u32 = w_str.parse().map_err(|_| ArgParseErr::with_msg("canvas size: invalid width"))?;
+    let h: u32 = h_str.parse().map_err(|_| ArgParseErr::with_msg("canvas size: invalid height"))?;
     if w == 0 || h == 0 {
-        return Err(ArgParseErr::with_msg(
-            "canvas size: width and height must be greater than 0",
-        ));
+        return Err(ArgParseErr::with_msg("canvas size: width and height must be greater than 0"));
     }
     // Guard against astronomically large allocations that would overflow usize.
+    // 4 channels at 2 bytes each, since the canvas buffer is 16 bits per channel.
     let bytes = (w as u64)
         .checked_mul(h as u64)
-        .and_then(|p| p.checked_mul(4));
+        .and_then(|p| p.checked_mul(4 * std::mem::size_of::<u16>() as u64));
     if bytes.is_none_or(|b| b > (isize::MAX as u64)) {
         return Err(ArgParseErr::with_msg(
             "canvas size: dimensions are too large for this platform",
@@ -670,6 +672,14 @@ fn hex_byte(hi: u8, lo: u8) -> Result<u8, ArgParseErr> {
     Ok((hex_digit(hi)? << 4) | hex_digit(lo)?)
 }
 
+/// Four hex digits -> one native 16-bit channel value.
+fn hex_u16(d: &[u8]) -> Result<u16, ArgParseErr> {
+    Ok(((hex_digit(d[0])? as u16) << 12)
+        | ((hex_digit(d[1])? as u16) << 8)
+        | ((hex_digit(d[2])? as u16) << 4)
+        | (hex_digit(d[3])? as u16))
+}
+
 fn parse_coord(s: &str) -> Option<Coord> {
     if let Some(px_str) = s.strip_suffix("px") {
         let px: f64 = px_str.parse().ok()?;
@@ -677,16 +687,23 @@ fn parse_coord(s: &str) -> Option<Coord> {
             return Some(Coord::Pixels(px));
         }
     } else if let Ok(ratio) = s.parse::<f64>()
-        && (0.0..=1.0).contains(&ratio) {
-            return Some(Coord::Ratio(ratio));
-        }
+        && (0.0..=1.0).contains(&ratio)
+    {
+        return Some(Coord::Ratio(ratio));
+    }
     None
 }
 
-fn parse_color(s: &str) -> Result<[u8; 4], ArgParseErr> {
+/// Parses a hex color into straight 16-bit RGBA. The short (4-bit) and
+/// byte-sized (8-bit) forms are expanded to the full 16-bit range, so
+/// `#fff`, `#ffffff` and `#ffffffffffff` all mean the same pure white.
+fn parse_color(s: &str) -> Result<[u16; 4], ArgParseErr> {
     let s = s.trim();
     let hex = s.strip_prefix('#').ok_or_else(|| {
-        ArgParseErr::with_msg("canvas color: must be hex like #RGB, #RGBA, #RRGGBB, or #RRGGBBAA")
+        ArgParseErr::with_msg(
+            "canvas color: must be hex like #RGB, #RGBA, #RRGGBB, #RRGGBBAA, \
+             #RRRRGGGGBBBB, or #RRRRGGGGBBBBAAAA",
+        )
     })?;
     let b = hex.as_bytes();
     match b.len() {
@@ -695,7 +712,7 @@ fn parse_color(s: &str) -> Result<[u8; 4], ArgParseErr> {
             let r = hex_digit(b[0])?;
             let g = hex_digit(b[1])?;
             let bl = hex_digit(b[2])?;
-            Ok([r * 0x11, g * 0x11, bl * 0x11, 0xFF])
+            Ok([expand4(r), expand4(g), expand4(bl), u16::MAX])
         }
         4 => {
             // #RGBA
@@ -703,37 +720,44 @@ fn parse_color(s: &str) -> Result<[u8; 4], ArgParseErr> {
             let g = hex_digit(b[1])?;
             let bl = hex_digit(b[2])?;
             let a = hex_digit(b[3])?;
-            Ok([r * 0x11, g * 0x11, bl * 0x11, a * 0x11])
+            Ok([expand4(r), expand4(g), expand4(bl), expand4(a)])
         }
         6 => {
             // #RRGGBB
             Ok([
-                hex_byte(b[0], b[1])?,
-                hex_byte(b[2], b[3])?,
-                hex_byte(b[4], b[5])?,
-                0xFF,
+                expand8(hex_byte(b[0], b[1])?),
+                expand8(hex_byte(b[2], b[3])?),
+                expand8(hex_byte(b[4], b[5])?),
+                u16::MAX,
             ])
         }
         8 => {
             // #RRGGBBAA
             Ok([
-                hex_byte(b[0], b[1])?,
-                hex_byte(b[2], b[3])?,
-                hex_byte(b[4], b[5])?,
-                hex_byte(b[6], b[7])?,
+                expand8(hex_byte(b[0], b[1])?),
+                expand8(hex_byte(b[2], b[3])?),
+                expand8(hex_byte(b[4], b[5])?),
+                expand8(hex_byte(b[6], b[7])?),
             ])
         }
+        12 => {
+            // #RRRRGGGGBBBB -- native 16-bit channels
+            Ok([hex_u16(&b[0..4])?, hex_u16(&b[4..8])?, hex_u16(&b[8..12])?, u16::MAX])
+        }
+        16 => {
+            // #RRRRGGGGBBBBAAAA -- native 16-bit channels with alpha
+            Ok([hex_u16(&b[0..4])?, hex_u16(&b[4..8])?, hex_u16(&b[8..12])?, hex_u16(&b[12..16])?])
+        }
         _ => Err(ArgParseErr::with_msg(
-            "canvas color: expected #RGB, #RGBA, #RRGGBB, or #RRGGBBAA",
+            "canvas color: expected #RGB, #RGBA, #RRGGBB, #RRGGBBAA, \
+             #RRRRGGGGBBBB, or #RRRRGGGGBBBBAAAA",
         )),
     }
 }
 
 fn parse_stops(tokens: &[&str]) -> Result<Vec<GradientStop>, ArgParseErr> {
     if tokens.len() < 2 {
-        return Err(ArgParseErr::with_msg(
-            "canvas gradient: at least 2 stops required",
-        ));
+        return Err(ArgParseErr::with_msg("canvas gradient: at least 2 stops required"));
     }
 
     let any_positional = tokens.iter().any(|t| t.contains(':'));
@@ -786,11 +810,7 @@ fn parse_stops(tokens: &[&str]) -> Result<Vec<GradientStop>, ArgParseErr> {
     };
 
     // Stable sort by position so equal positions preserve input order.
-    stops.sort_by(|a, b| {
-        a.pos
-            .partial_cmp(&b.pos)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    stops.sort_by(|a, b| a.pos.partial_cmp(&b.pos).unwrap_or(std::cmp::Ordering::Equal));
     Ok(stops)
 }
 
@@ -798,8 +818,8 @@ fn parse_stops(tokens: &[&str]) -> Result<Vec<GradientStop>, ArgParseErr> {
 /// Interpolating in Oklab gives perceptually uniform, visually pleasing
 /// transitions (no muddy midpoints between complementary hues).
 struct PreparedGradient {
-    /// (position, oklab color, straight alpha)
-    stops: Vec<(f64, Oklab, u8)>,
+    /// (position, oklab color, straight 16-bit alpha)
+    stops: Vec<(f64, Oklab, u16)>,
 }
 
 impl PreparedGradient {
@@ -807,32 +827,28 @@ impl PreparedGradient {
         let prepared = stops
             .iter()
             .map(|s| {
-                let rgb = Rgb {
-                    r: s.color[0],
-                    g: s.color[1],
-                    b: s.color[2],
-                };
-                (s.pos, srgb_to_oklab(rgb), s.color[3])
+                let (lab, alpha) = rgba16_to_oklab(s.color);
+                (s.pos, lab, alpha)
             })
             .collect();
         Self { stops: prepared }
     }
 
     #[inline]
-    fn eval(&self, t: f64) -> [u8; 4] {
+    fn eval(&self, t: f64) -> [u16; 4] {
         if self.stops.is_empty() {
-            return [0, 0, 0, 0xFF];
+            return [0, 0, 0, u16::MAX];
         }
         // Clamp-to-edge behaviour (t outside [first_pos, last_pos] -> edge color).
         let first = &self.stops[0];
         if self.stops.len() == 1 || t <= first.0 {
-            let rgb = oklab_to_srgb(first.1);
-            return [rgb.r, rgb.g, rgb.b, first.2];
+            let rgb = oklab_to_rgb16(first.1);
+            return [rgb[0], rgb[1], rgb[2], first.2];
         }
         let last = self.stops.last().unwrap();
         if t >= last.0 {
-            let rgb = oklab_to_srgb(last.1);
-            return [rgb.r, rgb.g, rgb.b, last.2];
+            let rgb = oklab_to_rgb16(last.1);
+            return [rgb[0], rgb[1], rgb[2], last.2];
         }
 
         // Locate the bracketing pair: last stop with pos <= t, and the next one.
@@ -849,12 +865,12 @@ impl PreparedGradient {
             a: lab_lo.a + (lab_hi.a - lab_lo.a) * tf,
             b: lab_lo.b + (lab_hi.b - lab_lo.b) * tf,
         };
-        let rgb = oklab_to_srgb(mixed);
+        let rgb = oklab_to_rgb16(mixed);
         // Alpha is interpolated linearly in straight-alpha space.
         let alpha = (a_lo as f64 + (a_hi as f64 - a_lo as f64) * local_t)
             .round()
-            .clamp(0.0, 255.0) as u8;
-        [rgb.r, rgb.g, rgb.b, alpha]
+            .clamp(0.0, u16::MAX as f64) as u16;
+        [rgb[0], rgb[1], rgb[2], alpha]
     }
 }
 
@@ -1018,21 +1034,14 @@ fn random_coons_colors(rng: &mut SplitMix64) -> PatchColors {
     // through its direct `&mut` reference without any closure captures.
     // `Oklab` is Copy (oklab crate derives it), so the `[x; 4]` shorthand
     // is fine for the placeholder array.
-    let mut raw_colors: [(Oklab, f32); 4] = [(
-        Oklab {
-            l: 0.0,
-            a: 0.0,
-            b: 0.0,
-        },
-        255.0,
-    ); 4];
+    let mut raw_colors: [(Oklab, f32); 4] = [(Oklab { l: 0.0, a: 0.0, b: 0.0 }, MAX16); 4];
     for i in 0..4 {
         let hue = base_hue + hue_offsets[i];
         let l = (base_l + (rng.range(-1.0, 1.0) as f32) * l_jitter).clamp(0.30, 0.95);
         let c = base_chroma * (rng.range(0.75, 1.25) as f32);
         let a = c * hue.cos() as f32;
         let b = c * hue.sin() as f32;
-        raw_colors[i] = (Oklab { l, a, b }, 255.0);
+        raw_colors[i] = (Oklab { l, a, b }, MAX16);
     }
 
     PatchColors {
@@ -1120,14 +1129,7 @@ impl TransparencyField {
             rng.range(0.85, 1.0),
         ];
 
-        Self {
-            spine_a,
-            spine_b,
-            inv_max_dist,
-            t_min,
-            t_max,
-            shape,
-        }
+        Self { spine_a, spine_b, inv_max_dist, t_min, t_max, shape }
     }
 
     /// Build one random 2D cubic Bezier spanning the canvas and return its
@@ -1174,14 +1176,8 @@ impl TransparencyField {
         let d = min_d2.sqrt();
         let d_norm = (d * self.inv_max_dist).clamp(0.0, 1.0);
 
-        let shaped = bezier1d(
-            self.shape[0],
-            self.shape[1],
-            self.shape[2],
-            self.shape[3],
-            d_norm,
-        )
-        .clamp(0.0, 1.0);
+        let shaped = bezier1d(self.shape[0], self.shape[1], self.shape[2], self.shape[3], d_norm)
+            .clamp(0.0, 1.0);
 
         self.t_min + shaped * (self.t_max - self.t_min)
     }
@@ -1232,29 +1228,29 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
         }
     };
 
+    // Length in *samples*, not bytes: the buffer is 16 bits per channel.
+    // The extra `checked_mul` makes sure the byte size fits too, so we report a
+    // clean error instead of letting `Vec` abort on capacity overflow.
     let buf_len = (width as usize)
         .checked_mul(height as usize)
         .and_then(|p| p.checked_mul(4))
+        .filter(|len| len.checked_mul(std::mem::size_of::<u16>()).is_some())
         .ok_or_else(|| crate::wm_err!("canvas: image dimensions overflow usize"))?;
 
-    let mut buf: Vec<u8> = vec![0; buf_len];
-    let row_bytes = width as usize * 4;
+    let mut buf: Vec<u16> = vec![0; buf_len];
+    let row_len = width as usize * 4;
 
     match &config.spec {
         CanvasSpec::Solid(c) => {
             // Parallel fill. chunks_exact_mut of size 4 is faster than .copy_from_slice on
             // the whole row because the optimiser turns it into a memset-friendly loop.
-            buf.par_chunks_mut(row_bytes).for_each(|row| {
+            buf.par_chunks_mut(row_len).for_each(|row| {
                 for px in row.chunks_exact_mut(4) {
                     px.copy_from_slice(c);
                 }
             });
         }
-        CanvasSpec::Linear {
-            angle_deg,
-            stops,
-            easing,
-        } => {
+        CanvasSpec::Linear { angle_deg, stops, easing } => {
             let prepared = PreparedGradient::new(stops);
 
             // Gradient direction (cos, sin) in image coordinates (y grows DOWN):
@@ -1276,36 +1272,29 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             let max_proj = cx * cos_t.abs() + cy * sin_t.abs();
             let total_span = 2.0 * max_proj;
 
-            buf.par_chunks_mut(row_bytes)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    let dy = y as f64 - cy;
-                    let dy_sin = dy * sin_t;
-                    for (x, px) in row.chunks_exact_mut(4).enumerate() {
-                        let dx = x as f64 - cx;
-                        let proj = dx * cos_t + dy_sin;
-                        let mut t = if total_span > 0.0 {
-                            ((proj + max_proj) / total_span).clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
+            buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+                let dy = y as f64 - cy;
+                let dy_sin = dy * sin_t;
+                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                    let dx = x as f64 - cx;
+                    let proj = dx * cos_t + dy_sin;
+                    let mut t = if total_span > 0.0 {
+                        ((proj + max_proj) / total_span).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
 
-                        // Apply CSS easing if provided
-                        if let Some(ease) = easing {
-                            t = ease.ease(t);
-                        }
-
-                        let c = prepared.eval(t);
-                        px.copy_from_slice(&c);
+                    // Apply CSS easing if provided
+                    if let Some(ease) = easing {
+                        t = ease.ease(t);
                     }
-                });
+
+                    let c = prepared.eval(t);
+                    px.copy_from_slice(&c);
+                }
+            });
         }
-        CanvasSpec::Radial {
-            center_x,
-            center_y,
-            stops,
-            easing,
-        } => {
+        CanvasSpec::Radial { center_x, center_y, stops, easing } => {
             let prepared = PreparedGradient::new(stops);
 
             let cx = match center_x {
@@ -1345,47 +1334,38 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
 
             let inv_max_r = if max_r > 0.0 { 1.0 / max_r } else { 0.0 };
 
-            buf.par_chunks_mut(row_bytes)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    let dy = y as f64 - cy;
-                    let dy2 = dy * dy;
-                    for (x, px) in row.chunks_exact_mut(4).enumerate() {
-                        let dx = x as f64 - cx;
-                        let r = (dx * dx + dy2).sqrt();
-                        let mut t = (r * inv_max_r).clamp(0.0, 1.0);
+            buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+                let dy = y as f64 - cy;
+                let dy2 = dy * dy;
+                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                    let dx = x as f64 - cx;
+                    let r = (dx * dx + dy2).sqrt();
+                    let mut t = (r * inv_max_r).clamp(0.0, 1.0);
 
-                        // Apply CSS easing if provided
-                        if let Some(ease) = easing {
-                            t = ease.ease(t);
-                        }
-
-                        let c = prepared.eval(t);
-                        px.copy_from_slice(&c);
+                    // Apply CSS easing if provided
+                    if let Some(ease) = easing {
+                        t = ease.ease(t);
                     }
-                });
+
+                    let c = prepared.eval(t);
+                    px.copy_from_slice(&c);
+                }
+            });
         }
         CanvasSpec::Mesh { colors } => {
             let width_f = (width as f64 - 1.0).max(1.0);
             let height_f = (height as f64 - 1.0).max(1.0);
 
-            buf.par_chunks_mut(row_bytes)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    let v = y as f64 / height_f;
-                    for (x, px) in row.chunks_exact_mut(4).enumerate() {
-                        let u = x as f64 / width_f;
-                        let c = colors.eval_color(u, v);
-                        px.copy_from_slice(&c);
-                    }
-                });
+            buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+                let v = y as f64 / height_f;
+                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                    let u = x as f64 / width_f;
+                    let c = colors.eval_color(u, v);
+                    px.copy_from_slice(&c);
+                }
+            });
         }
-        CanvasSpec::Coons {
-            seed,
-            colors,
-            easing,
-            transparency,
-        } => {
+        CanvasSpec::Coons { seed, colors, easing, transparency } => {
             let w = width as f64;
             let h = height as f64;
 
@@ -1430,57 +1410,56 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             let inv_w = 1.0 / (w - 1.0).max(1.0);
             let inv_h = 1.0 / (h - 1.0).max(1.0);
 
-            buf.par_chunks_mut(row_bytes)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    let v_fallback = y as f64 * inv_h;
-                    let y_f = y as f64;
-                    for (x, px) in row.chunks_exact_mut(4).enumerate() {
-                        let pt = Point::new(x as f64, y_f);
+            buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+                let v_fallback = y as f64 * inv_h;
+                let y_f = y as f64;
+                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                    let pt = Point::new(x as f64, y_f);
 
-                        // Solve for (u, v) via Newton-Raphson; fall back to
-                        // bilinear if the solver bails, guaranteeing full
-                        // coverage — critical when this canvas is a background.
-                        let (mut u, mut v) = patch
-                            .inverse_eval(pt)
-                            .unwrap_or((x as f64 * inv_w, v_fallback));
+                    // Solve for (u, v) via Newton-Raphson; fall back to
+                    // bilinear if the solver bails, guaranteeing full
+                    // coverage — critical when this canvas is a background.
+                    let (mut u, mut v) =
+                        patch.inverse_eval(pt).unwrap_or((x as f64 * inv_w, v_fallback));
 
-                        // Apply CSS easing to u and v independently when set,
-                        // yielding non-linear color transitions inside the patch.
-                        if let Some(ease) = easing {
-                            u = ease.ease(u);
-                            v = ease.ease(v);
-                        }
-
-                        let mut c = patch_colors.eval_color(u, v);
-
-                        // Modulate alpha by the transparency field if enabled.
-                        // Multiplicative: existing alpha from color interp is
-                        // preserved when the field returns 0.
-                        if let Some(field) = &transparency_field {
-                            let t = field.transparency_at(x as f64, y_f);
-                            let alpha_factor = (1.0 - t) as f32;
-                            c[3] = (c[3] as f32 * alpha_factor).round().clamp(0.0, 255.0) as u8;
-                        }
-
-                        px.copy_from_slice(&c);
+                    // Apply CSS easing to u and v independently when set,
+                    // yielding non-linear color transitions inside the patch.
+                    if let Some(ease) = easing {
+                        u = ease.ease(u);
+                        v = ease.ease(v);
                     }
-                });
+
+                    let mut c = patch_colors.eval_color(u, v);
+
+                    // Modulate alpha by the transparency field if enabled.
+                    // Multiplicative: existing alpha from color interp is
+                    // preserved when the field returns 0.
+                    if let Some(field) = &transparency_field {
+                        let t = field.transparency_at(x as f64, y_f);
+                        let alpha_factor = (1.0 - t) as f32;
+                        c[3] = (c[3] as f32 * alpha_factor).round().clamp(0.0, MAX16) as u16;
+                    }
+
+                    px.copy_from_slice(&c);
+                }
+            });
         }
     }
 
-    let out = RgbaImage::from_raw(width, height, buf).ok_or_else(|| {
+    let out = Rgba16Image::from_raw(width, height, buf).ok_or_else(|| {
         crate::wm_err!("canvas: failed to construct image buffer (dimensions too large?)")
     })?;
 
     if is_overlay {
-        // We are mutating an existing image. Convert to RGBA and alpha-blend `out` OVER it.
-        let mut base = image.pixels.to_rgba8();
+        // We are mutating an existing image. Convert to 16-bit RGBA and
+        // alpha-blend `out` OVER it. Promoting the base rather than demoting
+        // the canvas keeps the gradient's extra precision through compositing.
+        let mut base = image.pixels.to_rgba16();
         image::imageops::overlay(&mut base, &out, 0, 0);
-        image.pixels = DynamicImage::ImageRgba8(base);
+        image.pixels = DynamicImage::ImageRgba16(base);
     } else {
         // We are generating a new image.
-        image.pixels = DynamicImage::ImageRgba8(out);
+        image.pixels = DynamicImage::ImageRgba16(out);
     }
 
     Ok(())
@@ -1506,10 +1485,20 @@ mod tests {
 
     #[test]
     fn parse_color_hex_forms() {
-        assert_eq!(parse_color("#f00").unwrap(), [0xFF, 0, 0, 0xFF]);
-        assert_eq!(parse_color("#f008").unwrap(), [0xFF, 0, 0, 0x88]);
-        assert_eq!(parse_color("#ff0000").unwrap(), [0xFF, 0, 0, 0xFF]);
-        assert_eq!(parse_color("#ff000080").unwrap(), [0xFF, 0, 0, 0x80]);
+        // 8-bit input is expanded to the full 16-bit range (v * 257).
+        assert_eq!(parse_color("#f00").unwrap(), [0xFFFF, 0, 0, 0xFFFF]);
+        assert_eq!(parse_color("#f008").unwrap(), [0xFFFF, 0, 0, 0x8888]);
+        assert_eq!(parse_color("#ff0000").unwrap(), [0xFFFF, 0, 0, 0xFFFF]);
+        assert_eq!(parse_color("#ff000080").unwrap(), [0xFFFF, 0, 0, 0x8080]);
+    }
+
+    #[test]
+    fn parse_color_16bit_forms() {
+        assert_eq!(parse_color("#123456789abc").unwrap(), [0x1234, 0x5678, 0x9ABC, 0xFFFF]);
+        assert_eq!(parse_color("#0000ffff00007fff").unwrap(), [0x0000, 0xFFFF, 0x0000, 0x7FFF]);
+        // Full scale is full scale in every notation.
+        assert_eq!(parse_color("#fff").unwrap(), parse_color("#ffffffffffff").unwrap());
+        assert_eq!(parse_color("#ffffff").unwrap(), parse_color("#ffffffffffff").unwrap());
     }
 
     #[test]
@@ -1517,6 +1506,8 @@ mod tests {
         assert!(parse_color("ff0000").is_err()); // missing '#'
         assert!(parse_color("#zzz").is_err());
         assert!(parse_color("#12345").is_err()); // length 5 invalid
+        assert!(parse_color("#1234567890").is_err()); // length 10 invalid
+        assert!(parse_color("#123456789abcdef").is_err()); // length 15 invalid
     }
 
     #[test]
@@ -1545,7 +1536,7 @@ mod tests {
     fn parse_arg_solid_with_size() {
         let c = CanvasConfig::parse_arg("size:100x50,solid,#336699").unwrap();
         assert_eq!(c.size, Some((100, 50)));
-        assert_eq!(c.spec, CanvasSpec::Solid([0x33, 0x66, 0x99, 0xFF]));
+        assert_eq!(c.spec, CanvasSpec::Solid([0x3333, 0x6666, 0x9999, 0xFFFF]));
     }
 
     #[test]
@@ -1553,7 +1544,7 @@ mod tests {
         // `size:` is optional -- canvas inherits the current image's dimensions
         let c = CanvasConfig::parse_arg("solid,#336699").unwrap();
         assert_eq!(c.size, None);
-        assert_eq!(c.spec, CanvasSpec::Solid([0x33, 0x66, 0x99, 0xFF]));
+        assert_eq!(c.spec, CanvasSpec::Solid([0x3333, 0x6666, 0x9999, 0xFFFF]));
     }
 
     #[test]
@@ -1561,9 +1552,7 @@ mod tests {
         let c = CanvasConfig::parse_arg("size:64x64,linear,16.514,#000000,#ffffff").unwrap();
         assert_eq!(c.size, Some((64, 64)));
         match c.spec {
-            CanvasSpec::Linear {
-                angle_deg, stops, ..
-            } => {
+            CanvasSpec::Linear { angle_deg, stops, .. } => {
                 assert!((angle_deg - 16.514).abs() < 1e-9);
                 assert_eq!(stops.len(), 2);
             }
@@ -1584,12 +1573,7 @@ mod tests {
         let c = CanvasConfig::parse_arg("size:64x64,radial,0:#ffffff,1:#000000").unwrap();
         assert_eq!(c.size, Some((64, 64)));
         match c.spec {
-            CanvasSpec::Radial {
-                center_x,
-                center_y,
-                stops,
-                ..
-            } => {
+            CanvasSpec::Radial { center_x, center_y, stops, .. } => {
                 assert_eq!(center_x, Coord::Ratio(0.5));
                 assert_eq!(center_y, Coord::Ratio(0.5));
                 assert_eq!(stops.len(), 2);
@@ -1603,12 +1587,7 @@ mod tests {
         let c = CanvasConfig::parse_arg("radial,#ffffff,#000000").unwrap();
         assert_eq!(c.size, None);
         match c.spec {
-            CanvasSpec::Radial {
-                center_x,
-                center_y,
-                stops,
-                ..
-            } => {
+            CanvasSpec::Radial { center_x, center_y, stops, .. } => {
                 assert_eq!(center_x, Coord::Ratio(0.5));
                 assert_eq!(center_y, Coord::Ratio(0.5));
                 assert_eq!(stops.len(), 2);
@@ -1622,12 +1601,7 @@ mod tests {
         let c = CanvasConfig::parse_arg("radial,pos:0.75,20px,#ffffff,#000000").unwrap();
         assert_eq!(c.size, None);
         match c.spec {
-            CanvasSpec::Radial {
-                center_x,
-                center_y,
-                stops,
-                ..
-            } => {
+            CanvasSpec::Radial { center_x, center_y, stops, .. } => {
                 assert_eq!(center_x, Coord::Ratio(0.75));
                 assert_eq!(center_y, Coord::Pixels(20.0));
                 assert_eq!(stops.len(), 2);
@@ -1661,23 +1635,31 @@ mod tests {
     #[test]
     fn eval_gradient_endpoints() {
         let pg = PreparedGradient::new(&[
-            GradientStop {
-                pos: 0.0,
-                color: [255, 0, 0, 255],
-            },
-            GradientStop {
-                pos: 1.0,
-                color: [0, 0, 255, 255],
-            },
+            GradientStop { pos: 0.0, color: [65535, 0, 0, 65535] },
+            GradientStop { pos: 1.0, color: [0, 0, 65535, 65535] },
         ]);
         let lo = pg.eval(0.0);
         let hi = pg.eval(1.0);
         // endpoints should round-trip through Oklab very close to original sRGB
-        assert!(lo[0] > 240 && lo[1] < 15 && lo[2] < 15);
-        assert!(hi[0] < 15 && hi[1] < 15 && hi[2] > 240);
+        // (same 240/15-of-255 tolerance as before, scaled to 16 bits)
+        assert!(lo[0] > 61_000 && lo[1] < 4_000 && lo[2] < 4_000);
+        assert!(hi[0] < 4_000 && hi[1] < 4_000 && hi[2] > 61_000);
         // alpha preserved exactly
-        assert_eq!(lo[3], 255);
-        assert_eq!(hi[3], 255);
+        assert_eq!(lo[3], 65535);
+        assert_eq!(hi[3], 65535);
+    }
+
+    #[test]
+    fn gradient_resolves_below_8bit_steps() {
+        // The point of the 16-bit pipeline: intermediate samples must be able
+        // to land off the 257-value lattice that an expanded 8-bit ramp is
+        // stuck on. If this fails we are still quantizing to 8 bits somewhere.
+        let pg = PreparedGradient::new(&[
+            GradientStop { pos: 0.0, color: [0, 0, 0, 65535] },
+            GradientStop { pos: 1.0, color: [65535, 65535, 65535, 65535] },
+        ]);
+        let off_lattice = (0..=1000).any(|i| pg.eval(i as f64 / 1000.0)[0] % 257 != 0);
+        assert!(off_lattice, "gradient output never left the 8-bit lattice");
     }
 
     #[test]
@@ -1686,12 +1668,7 @@ mod tests {
         let c = CanvasConfig::parse_arg("size:64x64,coons").unwrap();
         assert_eq!(c.size, Some((64, 64)));
         match c.spec {
-            CanvasSpec::Coons {
-                seed,
-                colors,
-                easing,
-                transparency,
-            } => {
+            CanvasSpec::Coons { seed, colors, easing, transparency } => {
                 assert_eq!(seed, None);
                 assert!(colors.is_none());
                 assert!(easing.is_none());
@@ -1731,12 +1708,7 @@ mod tests {
         )
         .unwrap();
         match c.spec {
-            CanvasSpec::Coons {
-                seed,
-                colors,
-                transparency,
-                ..
-            } => {
+            CanvasSpec::Coons { seed, colors, transparency, .. } => {
                 assert_eq!(seed, Some(7));
                 assert_eq!(transparency, Some((0.0, 1.0)));
                 assert!(colors.is_some());
