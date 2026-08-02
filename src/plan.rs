@@ -4,9 +4,8 @@ use std::{
 };
 
 use crate::arg_parsers::{
-    parse_numeric_arg, BlurGeometry, ChannelFormat, ColorModel, Colorspace, CropGeometry,
-    FileFormat, GrayscaleMethod, IdentifyFormat, InputFileArg, Location, ResizeGeometry,
-    UnsharpenGeometry,
+    BlurGeometry, ChannelFormat, ColorModel, Colorspace, CropGeometry, FileFormat, GrayscaleMethod,
+    IdentifyFormat, InputFileArg, Location, ResizeGeometry, UnsharpenGeometry, parse_numeric_arg,
 };
 use crate::args::{Arg, ArgParseCtx, ArgSign, SignedArg};
 use crate::decode::decode;
@@ -18,9 +17,10 @@ use crate::{
     error::MagickError,
     operations::Axis,
     operations::{
-        Bm3dConfig, CanvasConfig, ConnectedComponentsConfig, DespeckleConfig, FxConfig,
-        MonochromeConfig, MorphologyConfig, NormalizeBackgroundConfig, Operation, PhansalkarConfig,
-        PruneConfig, QuantizeConfig, RewriteOperation, SauvolaConfig, TextConfig, WolfJolionConfig, TonemapConfig,
+        Bm3dConfig, Bm3dDebConfig, CanvasConfig, ConnectedComponentsConfig, DespeckleConfig,
+        FxConfig, MonochromeConfig, MorphologyConfig, NormalizeBackgroundConfig, Operation,
+        PhansalkarConfig, PruneConfig, QuantizeConfig, RewriteOperation, SauvolaConfig, TextConfig,
+        TonemapConfig, WolfJolionConfig,
     },
     wm_try,
 };
@@ -97,13 +97,9 @@ impl ExecutionPlan {
             return Err(wm_err!("argument requires a value: {arg_string}"));
         };
 
-        self.apply_arg_inner(signed_arg, value, ctx)
-            .map_err(|arg_err| {
-                wm_err!(
-                    "{}",
-                    arg_err.display_with_arg(arg_string, value.unwrap_or_default())
-                )
-            })?;
+        self.apply_arg_inner(signed_arg, value, ctx).map_err(|arg_err| {
+            wm_err!("{}", arg_err.display_with_arg(arg_string, value.unwrap_or_default()))
+        })?;
 
         Ok(())
     }
@@ -154,10 +150,7 @@ impl ExecutionPlan {
                         fallback_for_channel_count: false,
                     })?;
                 } else {
-                    let model = self
-                        .modifiers
-                        .colorspace
-                        .map_or(ColorModel::Rgb, |sp| sp.color);
+                    let model = self.modifiers.colorspace.map_or(ColorModel::Rgb, |sp| sp.color);
 
                     self.add_rewrite(RewriteOperation::Combine {
                         color: self.color_type_for_model(model),
@@ -181,12 +174,12 @@ impl ExecutionPlan {
             Arg::Blur => {
                 self.add_operation(Operation::Blur(BlurGeometry::try_from(value.unwrap())?))
             }
-            Arg::GaussianBlur => self.add_operation(Operation::GaussianBlur(
-                BlurGeometry::try_from(value.unwrap())?,
-            )),
-            Arg::Grayscale => self.add_operation(Operation::Grayscale(GrayscaleMethod::try_from(
-                value.unwrap(),
-            )?)),
+            Arg::GaussianBlur => {
+                self.add_operation(Operation::GaussianBlur(BlurGeometry::try_from(value.unwrap())?))
+            }
+            Arg::Grayscale => {
+                self.add_operation(Operation::Grayscale(GrayscaleMethod::try_from(value.unwrap())?))
+            }
             Arg::Monochrome => {
                 let val_str = value
                     .unwrap()
@@ -256,6 +249,14 @@ impl ExecutionPlan {
                     .ok_or_else(|| ArgParseErr::with_msg("bm3d: value is not valid UTF-8"))?;
                 let config = Bm3dConfig::parse_arg(val_str)?;
                 self.add_operation(Operation::Bm3d(config));
+            }
+            Arg::Bm3dDeb => {
+                let val_str = value
+                    .unwrap()
+                    .to_str()
+                    .ok_or_else(|| ArgParseErr::with_msg("bm3d_deb: value is not valid UTF-8"))?;
+                let config = Bm3dDebConfig::parse_arg(val_str)?;
+                self.add_operation(Operation::Bm3dDeb(config));
             }
             Arg::Quantize => {
                 let val_str = value
@@ -342,9 +343,8 @@ impl ExecutionPlan {
             Arg::Filter => self.modifiers.filter = Some(Filter::try_from(value.unwrap())?),
             Arg::Flip => self.add_operation(Operation::Flip(Axis::Vertical)),
             Arg::Flop => self.add_operation(Operation::Flip(Axis::Horizontal)),
-            Arg::Unsharp => self.add_operation(Operation::Unsharpen(UnsharpenGeometry::try_from(
-                value.unwrap(),
-            )?)),
+            Arg::Unsharp => self
+                .add_operation(Operation::Unsharpen(UnsharpenGeometry::try_from(value.unwrap())?)),
             Arg::Write => {
                 self.add_output(value.unwrap(), ctx)?;
             }
@@ -384,9 +384,7 @@ impl ExecutionPlan {
 
     fn add_rewrite(&mut self, op: RewriteOperation) -> Result<(), ArgParseErr> {
         if self.execution.is_empty() {
-            Err(ArgParseErr::with_msg(format_args!(
-                "no input file for operation {op:?}"
-            )))
+            Err(ArgParseErr::with_msg(format_args!("no input file for operation {op:?}")))
         } else {
             self.execution.push(ExecutionStep::Rewrite(op));
             Ok(())
@@ -399,17 +397,13 @@ impl ExecutionPlan {
         }
 
         let (loc, format) = ctx.parse_output_file(loc);
-        self.execution
-            .push(ExecutionStep::Write(loc, format, self.modifiers.clone()));
+        self.execution.push(ExecutionStep::Write(loc, format, self.modifiers.clone()));
         Ok(())
     }
 
     pub fn add_input_file(&mut self, file: InputFileArg) {
-        let mut file_plan = FilePlan {
-            location: file.location,
-            format: file.format,
-            ops: self.global_ops.clone(),
-        };
+        let mut file_plan =
+            FilePlan { location: file.location, format: file.format, ops: self.global_ops.clone() };
 
         // Operations are affected by Modifiers such as -format or -quality.
         // Their behavior is somewhat nontrivial.
@@ -534,16 +528,16 @@ impl ExecutionPlan {
     /// FIXME: handle animated/sequence output
     fn output_locations(output: &Location, images: &[Image]) -> Vec<Location> {
         if images.len() > 1
-            && let Location::Path(output_file) = output {
-                let mut locations = Vec::new();
-                for i in 1..=images.len() {
-                    let suffix = OsString::from(format!("-{i}")); // indexing for output images starts at 1
-                    let name =
-                        insert_suffix_before_extension_in_path(output_file.as_os_str(), &suffix);
-                    locations.push(Location::Path(PathBuf::from(name)))
-                }
-                return locations;
+            && let Location::Path(output_file) = output
+        {
+            let mut locations = Vec::new();
+            for i in 1..=images.len() {
+                let suffix = OsString::from(format!("-{i}")); // indexing for output images starts at 1
+                let name = insert_suffix_before_extension_in_path(output_file.as_os_str(), &suffix);
+                locations.push(Location::Path(PathBuf::from(name)))
             }
+            return locations;
+        }
 
         vec![output.clone(); images.len()]
     }
@@ -583,11 +577,7 @@ pub struct Strip {
 impl Strip {
     pub fn set_all(&mut self, new_val: bool) {
         // enumerate the fields exhaustively so that the compiler complains if we miss any
-        *self = Self {
-            exif: new_val,
-            xmp: new_val,
-            icc: new_val,
-        };
+        *self = Self { exif: new_val, xmp: new_val, icc: new_val };
     }
 }
 

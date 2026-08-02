@@ -52,6 +52,7 @@ impl SignedArg {
 pub enum Arg {
     AutoOrient,
     Bm3d,
+    Bm3dDeb,
     Colorspace,
     Combine,
     Crop,
@@ -100,6 +101,7 @@ impl Arg {
         match self {
             Arg::AutoOrient => false,
             Arg::Bm3d => true,
+            Arg::Bm3dDeb => true,
             Arg::Colorspace => true,
             Arg::Combine => matches!(sign, ArgSign::Plus),
             Arg::Crop => true,
@@ -147,6 +149,9 @@ impl Arg {
             Arg::AutoOrient => "automagically orient (rotate) image",
             Arg::Bm3d => {
                 "apply BM3D denoising in Oklab color space (use 'default' or sigma_l,sigma_a,sigma_b,patch_size,step_size,search_window,max_matches)"
+            }
+            Arg::Bm3dDeb => {
+                "apply BM3D deblurring in Oklab lightness (use 'default' or sigma,patch_size,step_size,search_window,max_matches,psf[,reg_ri[,reg_rwi[,deringing]]], for example 0,8,3,48,32,gauss:1.2)"
             }
             Arg::Colorspace => "specify the colorspace of created images",
             Arg::Combine => "create an image channel by channel from separate greyscale inputs",

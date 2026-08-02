@@ -30,6 +30,8 @@ mod normalize_background;
 pub use normalize_background::NormalizeBackgroundConfig;
 mod bm3d;
 pub use bm3d::Bm3dConfig;
+mod bm3d_deb;
+pub use bm3d_deb::Bm3dDebConfig;
 mod contrast;
 mod quantize;
 pub use quantize::QuantizeConfig;
@@ -39,7 +41,7 @@ mod countcolors;
 mod fx;
 pub use fx::FxConfig;
 pub mod canvas;
-pub use canvas::{canvas, CanvasConfig};
+pub use canvas::{CanvasConfig, canvas};
 mod tonemap;
 pub use tonemap::TonemapConfig;
 
@@ -80,6 +82,7 @@ pub enum Operation {
     Skeleton,
     Prune(PruneConfig),
     Bm3d(Bm3dConfig),
+    Bm3dDeb(Bm3dDebConfig),
     Otsu,
     Kapur,
     EqualizeHistogram,
@@ -123,6 +126,7 @@ impl Operation {
             Operation::Skeleton => skeleton::skeleton(image),
             Operation::Prune(config) => prune::prune(image, config),
             Operation::Bm3d(config) => bm3d::bm3d(image, config),
+            Operation::Bm3dDeb(config) => bm3d_deb::bm3d_deb(image, config),
             Operation::Otsu => contrast::otsu(image),
             Operation::Kapur => contrast::kapur(image),
             Operation::EqualizeHistogram => contrast::equalize_histogram(image),
@@ -166,6 +170,7 @@ impl Operation {
             Skeleton => (),
             Prune(_) => (),
             Bm3d(_) => (),
+            Bm3dDeb(_) => (),
             Otsu => (),
             Kapur => (),
             EqualizeHistogram => (),
@@ -191,10 +196,7 @@ pub enum RewriteOperation {
 impl RewriteOperation {
     pub(crate) fn execute(&self, sequence: &mut Vec<Image>) -> Result<(), MagickError> {
         match self {
-            &RewriteOperation::Combine {
-                color,
-                fallback_for_channel_count,
-            } => {
+            &RewriteOperation::Combine { color, fallback_for_channel_count } => {
                 let image =
                     combine::combine(sequence.split_off(0), color, fallback_for_channel_count)?;
                 sequence.push(image);
