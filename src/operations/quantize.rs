@@ -30,25 +30,23 @@ fn parse_finite_f32(s: &str, err: &'static str) -> Result<f32, ArgParseErr> {
 
 impl QuantizeConfig {
     /// Parse from a comma-separated string of three values, or "default".
-    /// Format: "colors,dither_level,bias" or "colors,dither_level,bias:light_boost"
-    /// or "colors,dither_level,bias:light_boost:lc_priority"
+    /// Format: "colors,dither_level,bias[:light_boost[:lc_priority]]"
     ///
     ///   colors:  palette size (2-)
     ///   dither:  error diffusion strength (0.0 = off, 1.0 = full)
     ///   bias:    algorithm selector:
     ///          <= -2.0        MacQueen online k-means in Oklab (stochastic, fast)
     ///     -2.0 < ... < 0.0    Oklab median-cut (fast, good for flat art)
-    ///               0.0       classic RGB k-means (mapping & dither run in RGB too)
-    ///              > 0.0       Oklab k-means++ (perceptual, value = saturation boost)
+    ///              0.0        classic RGB k-means (mapping & dither run in RGB too)
+    ///            > 0.0        Oklab k-means++ (perceptual, value = saturation boost)
     ///
     ///  Oklab k-means++ accepts optional suffixes after bias:
-    ///    bias:light_boost     highlight preservation (default 1.0, higher keeps brights)
-    ///    bias:light_boost:lc  equalization blend (0.0 = lightness, 1.0 = chroma, default 0.0)
+    ///    light_boost      highlight preservation (default 1.0, higher keeps brights)
+    ///    light_boost:lc   equalization blend (0.0 = lightness, 1.0 = chroma, default 0.0)
     ///
-    ///  Examples:  16,1.0,0.0      16 colors, full dither, RGB k-means
-    ///             8,0.5,-1.0       8 colors, half dither, Oklab median-cut
-    ///             32,0.2,0.5:3.0   32 colors, Oklab k-means++, sat boost 0.5, light_boost 3.0
-    ///           4,0.1,1.0:1.5:0.5  chroma+lightness equalization balanced
+    ///  Examples:  16,1.0,0.0          16 colors, full dither, RGB k-means
+    ///             8,0.5,-1.0           8 colors, half dither, Oklab median-cut
+    ///             32,0.1,1.0:1.5:0.5  32 colors, Oklab K-means with chroma+lightness equalization balanced
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("default") {

@@ -208,7 +208,7 @@ impl Arg {
             Arg::Kapur => "kapur threshold",
             Arg::EqualizeHistogram => "equalize histogram",
             Arg::Quantize => {
-                "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '32,0.2,0.2:2.6', or 'default' — bias -2.0 uses MacQueen kmeans, -1.0 uses Oklab median-cut, 0.0 uses RGB K-means, >=1.0 uses Oklab K-means++ with pure Perceptual Euclidean distance in Oklab with chroma multiplier (it also supports optional light_boost:lc_priority parameters)"
+                "reduce colors (format: colors,dither_level,bias | e.g., '16,1.0,0.0', '32,0.2,0.2:1.5:0.5', or 'default' — bias -2.0 uses MacQueen kmeans, -1.0 uses Oklab median-cut, 0.0 uses RGB K-means, >=0.0 uses Oklab K-means++ with pure Perceptual Euclidean distance in Oklab with chroma multiplier (it also supports optional light_boost:lc_priority parameters)"
             }
             Arg::CountColors => "count the number of unique colors in the image",
             Arg::Text => {
