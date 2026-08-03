@@ -1,4 +1,7 @@
+use siphasher::sip::SipHasher13;
 use std::borrow::Cow;
+use std::hash::BuildHasher;
+use std::hash::Hasher;
 
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image, wm_err};
 use image::{DynamicImage, RgbImage};
@@ -19,12 +22,132 @@ impl Default for QuantizeConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CentroidsSoA {
+    l: Vec<f32>,
+    a: Vec<f32>,
+    b: Vec<f32>,
+    chroma: Vec<f32>,
+}
+
+impl CentroidsSoA {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            l: Vec::with_capacity(cap),
+            a: Vec::with_capacity(cap),
+            b: Vec::with_capacity(cap),
+            chroma: Vec::with_capacity(cap),
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, pt: OkPt) {
+        self.l.push(pt.l);
+        self.a.push(pt.a);
+        self.b.push(pt.b);
+        self.chroma.push(pt.chroma);
+    }
+
+    #[inline(always)]
+    pub fn update(&mut self, idx: usize, pt: OkPt) {
+        self.l[idx] = pt.l;
+        self.a[idx] = pt.a;
+        self.b[idx] = pt.b;
+        self.chroma[idx] = pt.chroma;
+    }
+
+    #[inline(always)]
+    pub fn get_pt(&self, idx: usize) -> OkPt {
+        OkPt { l: self.l[idx], a: self.a[idx], b: self.b[idx], chroma: self.chroma[idx] }
+    }
+
+    pub fn to_oklab_vec(&self) -> Vec<Oklab> {
+        (0..self.l.len()).map(|i| Oklab { l: self.l[i], a: self.a[i], b: self.b[i] }).collect()
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.l.len()
+    }
+}
+
+#[inline(always)]
+fn oklch_weighted_dist_soa_single(p: OkPt, soa: &CentroidsSoA, idx: usize) -> f32 {
+    let dl = p.l - soa.l[idx];
+    let dc = p.chroma - soa.chroma[idx];
+    let da = p.a - soa.a[idx];
+    let db = p.b - soa.b[idx];
+    let dh_sq = (da * da + db * db - dc * dc).max(0.0);
+    (dl * dl) + (dc * dc * 4.0) + (dh_sq * 4.0)
+}
+
 /// Parse an f32 that must be finite — NaN or ±inf in any of these parameters
 /// would silently poison palette weights/distances downstream.
 fn parse_finite_f32(s: &str, err: &'static str) -> Result<f32, ArgParseErr> {
     match s.trim().parse::<f32>() {
         Ok(v) if v.is_finite() => Ok(v),
         _ => Err(ArgParseErr::with_msg(err)),
+    }
+}
+
+// Draw domains
+const TAG_FIRST: u8 = 0; // first-centroid threshold
+const TAG_TARGET: u8 = 1; // weighted-pick target for centroid ki
+const TAG_FALLBACK: u8 = 2; // degenerate-case random index for centroid ki
+
+/// Two-tier SipHash13 RNG.
+///
+/// Init: metadata (24 B) is hashed ONCE under a fixed master key; the 64-bit
+/// result, zero-padded to 16 bytes, becomes the key for all draws.
+/// Draw: SipHash13(derived_key, tag || index) — only 9 bytes per call.
+///
+/// Stateless (no counter): every draw is a pure function of (tag, index),
+/// so `&self` suffices and call order doesn't matter.
+struct SipRng {
+    key: [u8; 16],
+}
+
+impl SipRng {
+    fn new(k: usize, n_unique: usize, n_pixels: usize) -> Self {
+        const MASTER_KEY: &[u8; 16] = b"palette-mstr-key";
+
+        // Structural Metadata Mix, little-endian → identical bytes everywhere.
+        let mut metadata = [0u8; 32];
+        let nonce: u64 = std::collections::hash_map::RandomState::new().build_hasher().finish();
+        metadata[0..8].copy_from_slice(&(k as u64).to_le_bytes());
+        metadata[8..16].copy_from_slice(&(n_unique as u64).to_le_bytes());
+        metadata[16..24].copy_from_slice(&(n_pixels as u64).to_le_bytes());
+        metadata[24..32].copy_from_slice(&nonce.to_le_bytes());
+        // One-time metadata mix → 64-bit value.
+        let mut h = SipHasher13::new_with_key(MASTER_KEY);
+        h.write(&metadata);
+        let mix = h.finish();
+
+        // Pad to the 16-byte key SipHasher requires.
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&mix.to_le_bytes());
+        Self { key }
+    }
+
+    #[inline]
+    fn draw(&self, tag: u8, i: u64) -> u64 {
+        let mut h = SipHasher13::new_with_key(&self.key);
+        h.write_u8(tag);
+        h.write_u64(i);
+        h.finish()
+    }
+
+    /// Uniform in [0, 1) — top 24 bits, exact 2^-24 scaling onto the f32 mantissa.
+    #[inline]
+    fn unit_f32(&self, tag: u8, i: u64) -> f32 {
+        const SCALE: f32 = 1.0 / (1u64 << 24) as f32;
+        (self.draw(tag, i) >> 40) as f32 * SCALE
+    }
+
+    /// Index in [0, n) — modulo BEFORE the usize cast (32-bit-safe).
+    #[inline]
+    fn below(&self, tag: u8, i: u64, n: usize) -> usize {
+        (self.draw(tag, i) % n as u64) as usize
     }
 }
 
@@ -311,16 +434,25 @@ where
     D: Fn(T, T) -> f32 + Sync,
     M: Fn([f32; 3]) -> T + Sync,
 {
-    let (unique, pixel_to_unique) = unique_colors(pixels);
+    // Destructures unique_colors output (ignoring counts with `_`)
+    let (unique, pixel_to_unique, _) = unique_colors(pixels);
+
     let palette_pts: Vec<T> = palette.iter().map(|&c| make_pt(convert(c))).collect();
+
     let best_per_unique: Vec<u32> = unique
         .par_iter()
         .map(|&c| nearest_idx(make_pt(convert(c)), &palette_pts, &dist) as u32)
         .collect();
 
+    // Pre-map each unique color index directly to its final RGB palette entry,
+    // eliminating double-array indirection (`palette[best_per_unique[...]]`)
+    // inside the multi-million iteration output loop.
+    let unique_to_rgb: Vec<[u8; 3]> =
+        best_per_unique.iter().map(|&idx| palette[idx as usize]).collect();
+
     let mut out = vec![0u8; pixels.len() * 3];
     out.par_chunks_exact_mut(3).enumerate().for_each(|(i, px)| {
-        px.copy_from_slice(&palette[best_per_unique[pixel_to_unique[i] as usize] as usize]);
+        px.copy_from_slice(&unique_to_rgb[pixel_to_unique[i] as usize]);
     });
     out
 }
@@ -432,7 +564,7 @@ fn error_diffusion_map<T, D, M>(
 /// FP determinism: duplicates share identical converted values, and downstream
 /// passes that must match a per-pixel FP sequence walk the ORIGINAL pixel
 /// order through `pixel_to_unique` term-for-term.
-fn unique_colors(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>) {
+fn unique_colors(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>, Vec<u32>) {
     let mut indexed_keys: Vec<(u32, u32)> = pixels
         .par_iter()
         .enumerate()
@@ -443,19 +575,24 @@ fn unique_colors(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>) {
         .collect();
     indexed_keys.par_sort_unstable_by_key(|&(k, _)| k);
 
-    let mut unique_rgb: Vec<[u8; 3]> = Vec::with_capacity(pixels.len() / 4 + 1);
-    let mut pixel_to_unique: Vec<u32> = vec![0u32; pixels.len()];
+    let mut unique_rgb = Vec::with_capacity(pixels.len() / 4 + 1);
+    let mut pixel_to_unique = vec![0u32; pixels.len()];
+    let mut unique_counts = Vec::with_capacity(pixels.len() / 4 + 1);
+
     let mut i = 0;
     while i < indexed_keys.len() {
         let key = indexed_keys[i].0;
         let u_idx = unique_rgb.len() as u32;
         unique_rgb.push([(key >> 16) as u8, (key >> 8) as u8, key as u8]);
+
+        let start = i;
         while i < indexed_keys.len() && indexed_keys[i].0 == key {
             pixel_to_unique[indexed_keys[i].1 as usize] = u_idx;
             i += 1;
         }
+        unique_counts.push((i - start) as u32);
     }
-    (unique_rgb, pixel_to_unique)
+    (unique_rgb, pixel_to_unique, unique_counts)
 }
 
 /// MacQueen K-Means clustering natively in Oklab perceptual space (bias <= -2.0).
@@ -778,85 +915,57 @@ fn generate_palette_oklab(
         return vec![[0, 0, 0]; k];
     }
 
-    let n_pixels = rgb_pixels.len();
-
     // ── Color histogram deduplication ───────────────────────────────────────
-    // Typical photos have N pixels but only a small fraction of distinct RGB
-    // triples. Collapsing duplicates cuts the sRGB→Oklab conversion, the
-    // k-means++ distance updates, and the 20-iteration nearest-centroid search
-    // from O(N·k) to O(U·k), where U is the number of unique colors — often
-    // 10–100× smaller than N.
-    let (unique_rgb, pixel_to_unique) = unique_colors(rgb_pixels);
+    let (unique_rgb, pixel_to_unique, unique_counts) = unique_colors(rgb_pixels);
     let n_unique = unique_rgb.len();
+    let k = k.min(n_unique).max(1);
 
-    // All heavy math (Oklab conversion, chroma, distances) runs over unique
-    // colors only. `oklab_pixels` is indexed by unique color id; use
-    // `pixel_to_unique[i]` to map from an original pixel index.
     let oklab_pixels: Vec<Oklab> = unique_rgb.par_iter().map(|&p| srgb_to_oklab(p)).collect();
-
-    // Point reps with precomputed chroma for every distance-heavy loop below —
-    // one sqrt per unique color instead of one per (unique color × iteration × k).
     let oklab_pts: Vec<OkPt> = oklab_pixels.par_iter().map(|&o| OkPt::from_oklab(o)).collect();
 
     // 1. Per-pixel weights: uniform base with optional linear chroma boost.
-    //    sat_bias = 1.0 acts as the neutral floor (all pixels get a weight of 1.0),
-    //    relying purely on `oklch_weighted_dist` to preserve vibrant colors.
-    //    Values > 1.0 (e.g., 4.0) apply a gentle linear multiplier to
-    //    artificially inflate the importance of highly saturated pixels.
     let chroma_multiplier = (sat_bias - 1.0).max(0.0);
-
     let chromas: Vec<f32> = oklab_pts.iter().map(|p| p.chroma).collect();
-
     let mut weights: Vec<f32> = chromas.iter().map(|&c| 1.0 + (c * chroma_multiplier)).collect();
 
     // 2. Histogram equalization across lightness and chroma.
-    //    Two independent 16-bin histograms are computed, and their equalization
-    //    factors are blended via lc_priority: 0.0 = lightness only, 1.0 = chroma
-    //    only, 0.5 = both equally. This is what preserves dark-area detail —
-    //    underrepresented lightness bins get boosted so k-means allocates
-    //    palette slots to them proportionally.
-    //
-    //    Bin accumulation walks the ORIGINAL pixel order through pixel_to_unique
-    //    so that the summed weights match the pre-dedup FP sequence term-for-term.
     const LC_BINS: usize = 16;
-
-    // Equalization strength scales with light_boost
     let eq_power = (0.5_f32).max(1.0 - 0.5 / light_boost.max(0.1));
+
+    let oklab_pixels_slice = &oklab_pixels[..n_unique];
+    let chromas_slice = &chromas[..n_unique];
+    let weights_slice = &mut weights[..n_unique];
+    let unique_counts_slice = &unique_counts[..n_unique];
 
     // --- Lightness histogram ---
     let mut l_bin_weights = [0.0f32; LC_BINS];
-    for i in 0..n_pixels {
-        let u = pixel_to_unique[i] as usize;
-        let bin = ((oklab_pixels[u].l * LC_BINS as f32) as usize).min(LC_BINS - 1);
-        l_bin_weights[bin] += weights[u];
+    for u in 0..n_unique {
+        let bin = ((oklab_pixels_slice[u].l * LC_BINS as f32) as usize).min(LC_BINS - 1);
+        let w = weights_slice[u] * (unique_counts_slice[u] as f32);
+        l_bin_weights[bin] = l_bin_weights[bin].algebraic_add(w);
     }
     let active_l = l_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
     let avg_l = if active_l > 0.0 { l_bin_weights.iter().sum::<f32>() / active_l } else { 1.0 };
 
     // --- Chroma histogram ---
-    // Find max chroma to scale bins across the image's actual range
-    let max_chroma = chromas.iter().copied().max_by(|a, b| a.total_cmp(b)).unwrap_or(0.0);
+    let max_chroma = chromas_slice.iter().copied().max_by(|a, b| a.total_cmp(b)).unwrap_or(0.0);
     let chroma_scale = if max_chroma > 1e-6 { LC_BINS as f32 / max_chroma } else { 1.0 };
 
     let mut c_bin_weights = [0.0f32; LC_BINS];
-    for i in 0..n_pixels {
-        let u = pixel_to_unique[i] as usize;
-        let bin = ((chromas[u] * chroma_scale) as usize).min(LC_BINS - 1);
-        c_bin_weights[bin] += weights[u];
+    for u in 0..n_unique {
+        let bin = ((chromas_slice[u] * chroma_scale) as usize).min(LC_BINS - 1);
+        let w = weights_slice[u] * (unique_counts_slice[u] as f32);
+        c_bin_weights[bin] = c_bin_weights[bin].algebraic_add(w);
     }
     let active_c = c_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
     let avg_c = if active_c > 0.0 { c_bin_weights.iter().sum::<f32>() / active_c } else { 1.0 };
 
     // --- Apply blended equalization ---
-    //   Equalization factors depend only on the pixel's Oklab value, so they
-    //   are identical across duplicates. Applying them to the per-unique
-    //   weights array therefore produces the same per-pixel weight the
-    //   pre-dedup code would have produced for every original pixel.
     let l_weight = 1.0 - lc_priority;
     let c_weight = lc_priority;
-    for (i, w) in weights.iter_mut().enumerate() {
-        let l_bin = ((oklab_pixels[i].l * LC_BINS as f32) as usize).min(LC_BINS - 1);
-        let c_bin = ((chromas[i] * chroma_scale) as usize).min(LC_BINS - 1);
+    for u in 0..n_unique {
+        let l_bin = ((oklab_pixels_slice[u].l * LC_BINS as f32) as usize).min(LC_BINS - 1);
+        let c_bin = ((chromas_slice[u] * chroma_scale) as usize).min(LC_BINS - 1);
 
         let l_eq = if l_bin_weights[l_bin] > 0.0 {
             (avg_l / l_bin_weights[l_bin]).powf(eq_power)
@@ -869,171 +978,132 @@ fn generate_palette_oklab(
             1.0
         };
 
-        // Geometric blend: eq = l_eq^(1-priority) * c_eq^priority
-        *w *= l_eq.powf(l_weight) * c_eq.powf(c_weight);
+        weights_slice[u] *= l_eq.powf(l_weight) * c_eq.powf(c_weight);
     }
 
-    // 3. K-Means++ initialization
-    //    Initial fallback value matches the pre-dedup first-pixel Oklab
-    //    (the Oklab of rgb_pixels[0]), NOT unique index 0 which is now
-    //    the lowest-keyed color after sorting. `centroid_pts` mirrors
-    //    `centroids` with precomputed chroma and is updated at every write.
+    // Precompute the effective weights array once to avoid millions of redundant multiplications
+    let effective_weights: Vec<f32> =
+        weights_slice.iter().zip(unique_counts_slice.iter()).map(|(&w, &c)| w * c as f32).collect();
+
+    // 3. K-Means++ initialization using CentroidsSoA
     let first_pixel_oklab = oklab_pixels[pixel_to_unique[0] as usize];
-    let mut centroids = vec![first_pixel_oklab; k];
-    let mut centroid_pts = vec![OkPt::from_oklab(first_pixel_oklab); k];
-    let mut min_dists = vec![f32::MAX; n_unique]; // Cached nearest centroid distance (per unique color)
+    let mut centroids_soa = CentroidsSoA::with_capacity(k);
+    centroids_soa.push(OkPt::from_oklab(first_pixel_oklab));
 
-    let mut rng_state: u64 = 0x5EED_C0DE_1234_5678;
-    let mut xorshift = || -> u64 {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        rng_state
-    };
+    let mut min_dists = vec![f32::MAX; n_unique];
 
-    // Initial weight sum walks the original pixel order so the
-    // left-associated FP partial-sum sequence matches the pre-dedup
-    // `weights.iter().sum()` term-for-term.
-    let total_w: f32 = (0..n_pixels).map(|i| weights[pixel_to_unique[i] as usize]).sum();
-    let mut threshold = (xorshift() as f32 / u64::MAX as f32) * total_w;
-    for i in 0..n_pixels {
-        let u = pixel_to_unique[i] as usize;
-        threshold -= weights[u];
+    let rng = SipRng::new(k, n_unique, rgb_pixels.len());
+    let total_w: f32 =
+        effective_weights.iter().copied().fold(0.0f32, |acc, x| acc.algebraic_add(x));
+
+    let mut threshold = rng.unit_f32(TAG_FIRST, 0) * total_w;
+    for u in 0..n_unique {
+        let w = effective_weights[u];
+        threshold = threshold.algebraic_add(-w);
         if threshold <= 0.0 {
-            centroids[0] = oklab_pixels[u];
-            centroid_pts[0] = oklab_pts[u];
+            centroids_soa.update(0, oklab_pts[u]);
             break;
         }
     }
 
-    // Initial pass: populate min_dists for the first centroid (over unique only).
     min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
-        *d = oklch_weighted_dist_pt(oklab_pts[i], centroid_pts[0]);
+        *d = oklch_weighted_dist_soa_single(oklab_pts[i], &centroids_soa, 0);
     });
 
     for ki in 1..k {
-        // Deterministic parallel sum: fixed-size chunks are summed in
-        // parallel, then the chunk totals are combined sequentially in index
-        // order. This avoids FP non-associativity jitter while staying
-        // parallel for large pixel counts. Chunks walk ORIGINAL pixels (via
-        // pixel_to_unique) so the summation order is identical to the
-        // pre-dedup version.
-        const CHUNK_W: usize = 4096;
-        let n_chunks_w = n_pixels.div_ceil(CHUNK_W);
-
-        // 1. Parallel per-chunk accumulation with algebraic_add in the inner loop
-        let chunk_totals: Vec<f32> = (0..n_chunks_w)
+        let total: f32 = (0..n_unique)
             .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * CHUNK_W;
-                let end = (start + CHUNK_W).min(n_pixels);
-                let mut s = 0.0f32;
-                for i in start..end {
-                    let u = pixel_to_unique[i] as usize;
-                    // Allows LLVM to vectorize the chunk accumulation across SIMD registers
-                    s = s.algebraic_add(min_dists[u] * weights[u]);
-                }
-                s
-            })
-            .collect();
-
-        // 2. Algebraic reduction across chunk totals (replaces strict sequential .sum())
-        let total = chunk_totals.iter().fold(0.0f32, |acc, &x| acc.algebraic_add(x));
+            .map(|u| min_dists[u] * effective_weights[u])
+            .reduce(|| 0.0f32, |a, b| a.algebraic_add(b));
 
         if total <= 0.0 {
-            // Fallback picks a random ORIGINAL pixel (pre-dedup modulus range),
-            // then dereferences to its unique Oklab — identical semantics.
-            let idx = (xorshift() as usize) % n_pixels;
-            let u = pixel_to_unique[idx] as usize;
-            centroids[ki] = oklab_pixels[u];
-            centroid_pts[ki] = oklab_pts[u];
+            let idx = rng.below(TAG_FALLBACK, ki as u64, n_unique);
+            centroids_soa.push(oklab_pts[idx]);
         } else {
-            let mut target = (xorshift() as f32 / u64::MAX as f32) * total;
-            for i in 0..n_pixels {
-                let u = pixel_to_unique[i] as usize;
-                target -= min_dists[u] * weights[u];
+            let mut target = rng.unit_f32(TAG_TARGET, ki as u64) * total;
+            let mut chosen_u = n_unique - 1;
+            for u in 0..n_unique {
+                let w = min_dists[u] * effective_weights[u];
+                target = target.algebraic_add(-w);
                 if target <= 0.0 {
-                    centroids[ki] = oklab_pixels[u];
-                    centroid_pts[ki] = oklab_pts[u];
+                    chosen_u = u;
                     break;
                 }
             }
+            centroids_soa.push(oklab_pts[chosen_u]);
         }
 
-        let new_c_pt = centroid_pts[ki];
-
-        // Update cached distances
+        let new_c_idx = ki;
         min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
-            let dist = oklch_weighted_dist_pt(oklab_pts[i], new_c_pt);
+            let dist = oklch_weighted_dist_soa_single(oklab_pts[i], &centroids_soa, new_c_idx);
             if dist < *d {
                 *d = dist;
             }
         });
     }
 
-    // 4. K-Means iterations
-    for _ in 0..20 {
-        // Extract slice so the compiler doesn't insert bounds checks in the inner loop
-        let cd_slice = &centroid_pts[..];
+    // 4. K-Means iterations with persistent allocations
+    let mut best_per_unique = vec![0u32; n_unique];
 
-        // Step A: nearest-centroid search runs per UNIQUE color (O(U·k)
-        // instead of O(N·k)). This is the dominant cost of k-means and the
-        // single biggest win from dedup. The scalar < comparison preserves
-        // first-index tie-breaking.
-        let best_per_unique: Vec<u32> = (0..n_unique)
-            .into_par_iter()
-            .map(|u| {
+    // Chunking limits parallel split overhead & gives explicit cache locality
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = n_unique.div_ceil(num_threads * 4).max(1);
+
+    for _ in 0..20 {
+        // Step A: Parallel nearest-centroid assignment using SoA
+        best_per_unique.par_iter_mut().zip(min_dists.par_iter_mut()).enumerate().for_each(
+            |(u, (best_idx, min_d))| {
                 let p = oklab_pts[u];
                 let mut min_dist = f32::MAX;
-                let mut best_idx = 0u32;
-                for (ci, cd) in cd_slice.iter().enumerate() {
-                    let dist_sq = oklch_weighted_dist_pt(p, *cd);
-                    if dist_sq < min_dist {
-                        min_dist = dist_sq;
-                        best_idx = ci as u32;
+                let mut best = 0;
+                // Unrolled SoA loop for contiguous vector loads
+                for i in 0..centroids_soa.len() {
+                    let dl = p.l - centroids_soa.l[i];
+                    let dc = p.chroma - centroids_soa.chroma[i];
+                    let da = p.a - centroids_soa.a[i];
+                    let db = p.b - centroids_soa.b[i];
+                    let dh_sq = (da * da + db * db - dc * dc).max(0.0);
+                    let d = (dl * dl) + (dc * dc * 4.0) + (dh_sq * 4.0);
+                    if d < min_dist {
+                        min_dist = d;
+                        best = i;
                     }
                 }
-                best_idx
-            })
-            .collect();
+                *best_idx = best as u32;
+                // Maintain `min_dists` accurately for zero-cost empty cluster reseeding
+                *min_d = min_dist;
+            },
+        );
 
-        // Step B: deterministic parallel accumulation over ORIGINAL pixels.
-        // Fixed-size chunks are processed in parallel and collected in index
-        // order, so the final sequential reduction always combines partial
-        // sums identically across runs.
-        const CHUNK: usize = 4096;
-        let n_chunks = n_pixels.div_ceil(CHUNK);
-        let partials: Vec<(Vec<(f32, f32, f32)>, Vec<f32>)> = (0..n_chunks)
-            .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * CHUNK;
-                let end = (start + CHUNK).min(n_pixels);
+        // Step B: Parallel O(U) accumulation avoiding Rayon fold allocations
+        let partials: Vec<(Vec<(f32, f32, f32)>, Vec<f32>)> = oklab_pixels_slice
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
                 let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
                 let mut counts = vec![0.0f32; k];
-                for i in start..end {
-                    let u = pixel_to_unique[i] as usize;
-                    let p = &oklab_pixels[u];
-                    let w = weights[u];
-                    let best_idx = best_per_unique[u] as usize;
+                for (u_in_chunk, p) in chunk.iter().enumerate() {
+                    let u = chunk_idx * chunk_size + u_in_chunk;
+                    let effective_w = effective_weights[u];
+                    let best = best_per_unique[u] as usize;
 
-                    sums[best_idx].0 += p.l * w;
-                    sums[best_idx].1 += p.a * w;
-                    sums[best_idx].2 += p.b * w;
-                    counts[best_idx] += w;
+                    sums[best].0 = sums[best].0.algebraic_add(p.l * effective_w);
+                    sums[best].1 = sums[best].1.algebraic_add(p.a * effective_w);
+                    sums[best].2 = sums[best].2.algebraic_add(p.b * effective_w);
+                    counts[best] = counts[best].algebraic_add(effective_w);
                 }
                 (sums, counts)
             })
             .collect();
 
-        // Sequential reduction in fixed order → deterministic
         let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
         let mut counts = vec![0.0f32; k];
         for (ps, pc) in &partials {
             for i in 0..k {
-                sums[i].0 += ps[i].0;
-                sums[i].1 += ps[i].1;
-                sums[i].2 += ps[i].2;
-                counts[i] += pc[i];
+                sums[i].0 = sums[i].0.algebraic_add(ps[i].0);
+                sums[i].1 = sums[i].1.algebraic_add(ps[i].1);
+                sums[i].2 = sums[i].2.algebraic_add(ps[i].2);
+                counts[i] = counts[i].algebraic_add(pc[i]);
             }
         }
 
@@ -1046,60 +1116,37 @@ fn generate_palette_oklab(
                     b: sums[i].2 / counts[i],
                 };
                 let new_ok_pt = OkPt::from_oklab(new_ok);
-                let shift = oklch_weighted_dist_pt(centroid_pts[i], new_ok_pt);
+                let cur_pt = centroids_soa.get_pt(i);
+                let shift = oklch_weighted_dist_pt(cur_pt, new_ok_pt);
                 max_shift = max_shift.max(shift);
-                centroids[i] = new_ok;
-                centroid_pts[i] = new_ok_pt;
+                centroids_soa.update(i, new_ok_pt);
             }
         }
 
-        // Empty-cluster reseed. Any centroid with counts == 0 got no pixels
-        // assigned this iteration, so the update loop above left it at its
-        // stale position. In the mapping pass that stale centroid can still
-        // be oklch-nearest to some pixels and show up as a stray hue. Reseed
-        // each empty centroid to the unique color currently furthest from any
-        // filled centroid — the same heuristic k-means++ uses for init.
+        // Empty-cluster reseed intelligently using persistent `min_dists`
+        // O(U) loop instead of O(U * K) network gathered per reseed.
         let mut reseeded = false;
         for empty_idx in 0..k {
             if counts[empty_idx] > 0.0 {
                 continue;
             }
-            // Parallel per-unique "distance to nearest filled centroid", then
-            // sequential argmax for deterministic tie-breaking. Empty
-            // centroids are handled one at a time so each subsequent reseed
-            // sees the previous one as "filled" and avoids landing every
-            // empty slot on the same outlier.
-            let min_d_per_u: Vec<f32> = (0..n_unique)
-                .into_par_iter()
-                .map(|u| {
-                    let p = oklab_pts[u];
-                    let mut min_d = f32::MAX;
-                    for (ci, cd) in centroid_pts.iter().enumerate() {
-                        if counts[ci] <= 0.0 {
-                            continue;
-                        }
-                        let d = oklch_weighted_dist_pt(p, *cd);
-                        if d < min_d {
-                            min_d = d;
-                        }
-                    }
-                    min_d
-                })
-                .collect();
 
-            let (best_u, _) =
-                min_d_per_u.iter().enumerate().fold((0usize, f32::MIN), |(bu, bd), (u, &d)| {
-                    if d > bd { (u, d) } else { (bu, bd) }
-                });
+            let best_u = min_dists
+                .par_iter()
+                .enumerate()
+                .map(|(i, &d)| (i, d))
+                .max_by(|&(_, a), &(_, b)| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
 
-            centroids[empty_idx] = oklab_pixels[best_u];
-            centroid_pts[empty_idx] = oklab_pts[best_u];
-            counts[empty_idx] = 1.0; // mark filled for later reseeds this pass
+            centroids_soa.update(empty_idx, oklab_pts[best_u]);
+            // Avoid picking the identical distance pixel next loop
+            min_dists[best_u] = 0.0;
+            counts[empty_idx] = 1.0;
             reseeded = true;
         }
+
         if reseeded {
-            // Force another iteration so reseeded centroids actually get
-            // pixels assigned to them before the convergence test can fire.
             max_shift = max_shift.max(1.0);
         }
 
@@ -1109,7 +1156,7 @@ fn generate_palette_oklab(
     }
 
     // 5. Final mapping back to sRGB [u8; 3]
-    centroids.into_iter().map(oklab_to_srgb_u8).collect()
+    centroids_soa.to_oklab_vec().into_iter().map(oklab_to_srgb_u8).collect()
 }
 
 // -----------------------------------------------------------------------------
