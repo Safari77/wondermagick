@@ -584,7 +584,7 @@ fn generate_palette_rgb(pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]> {
                 || (vec![0.0f32; 3 * k], vec![0usize; k]),
                 |mut a, b| {
                     for i in 0..3 * k {
-                        a.0[i] += b.0[i];
+                        a.0[i] = a.0[i].algebraic_add(b.0[i]);
                     }
                     for i in 0..k {
                         a.1[i] += b.1[i];
@@ -667,9 +667,9 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
 
         let mut sum = [0.0f32; 3];
         for p in slice {
-            sum[0] += p.l;
-            sum[1] += p.a;
-            sum[2] += p.b;
+            sum[0] = sum[0].algebraic_add(p.l);
+            sum[1] = sum[1].algebraic_add(p.a);
+            sum[2] = sum[2].algebraic_add(p.b);
         }
         let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
 
@@ -746,7 +746,11 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
             let n = slice.len() as f64;
             let (sum_l, sum_a, sum_b) =
                 slice.iter().fold((0.0f64, 0.0f64, 0.0f64), |(sl, sa, sb), p| {
-                    (sl + p.l as f64, sa + p.a as f64, sb + p.b as f64)
+                    (
+                        sl.algebraic_add(p.l as f64),
+                        sa.algebraic_add(p.a as f64),
+                        sb.algebraic_add(p.b as f64),
+                    )
                 });
             oklab_to_srgb_u8(Oklab {
                 l: (sum_l / n) as f32,
@@ -918,7 +922,9 @@ fn generate_palette_oklab(
         // pre-dedup version.
         const CHUNK_W: usize = 4096;
         let n_chunks_w = n_pixels.div_ceil(CHUNK_W);
-        let total: f32 = (0..n_chunks_w)
+
+        // 1. Parallel per-chunk accumulation with algebraic_add in the inner loop
+        let chunk_totals: Vec<f32> = (0..n_chunks_w)
             .into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * CHUNK_W;
@@ -926,13 +932,15 @@ fn generate_palette_oklab(
                 let mut s = 0.0f32;
                 for i in start..end {
                     let u = pixel_to_unique[i] as usize;
-                    s += min_dists[u] * weights[u];
+                    // Allows LLVM to vectorize the chunk accumulation across SIMD registers
+                    s = s.algebraic_add(min_dists[u] * weights[u]);
                 }
                 s
             })
-            .collect::<Vec<f32>>()
-            .iter()
-            .sum();
+            .collect();
+
+        // 2. Algebraic reduction across chunk totals (replaces strict sequential .sum())
+        let total = chunk_totals.iter().fold(0.0f32, |acc, &x| acc.algebraic_add(x));
 
         if total <= 0.0 {
             // Fallback picks a random ORIGINAL pixel (pre-dedup modulus range),
@@ -956,7 +964,7 @@ fn generate_palette_oklab(
 
         let new_c_pt = centroid_pts[ki];
 
-        // Update cached distances, ONLY checking against the newly added centroid
+        // Update cached distances
         min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
             let dist = oklch_weighted_dist_pt(oklab_pts[i], new_c_pt);
             if dist < *d {
