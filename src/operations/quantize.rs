@@ -14,11 +14,19 @@ pub struct QuantizeConfig {
     pub bias: f32,         // algorithm selector, see parse_arg docs
     pub light_boost: f32, // >1.0 preserves bright detail, 1.0 is neutral (only used with Oklab k-means++)
     pub lc_priority: f32, // 0.0 = equalize lightness only, 1.0 = equalize chroma only, 0.5 = both equally
+    pub brightness_preserve: f32, // 0.0 = disabled, 1.0 = fully match source mean L
 }
 
 impl Default for QuantizeConfig {
     fn default() -> Self {
-        Self { colors: 16, dither_level: 0.0, bias: 0.0, light_boost: 1.0, lc_priority: 0.0 }
+        Self {
+            colors: 16,
+            dither_level: 0.0,
+            bias: 0.0,
+            light_boost: 1.0,
+            lc_priority: 0.0,
+            brightness_preserve: 0.0,
+        }
     }
 }
 
@@ -166,6 +174,7 @@ impl QuantizeConfig {
     ///  Oklab k-means++ accepts optional suffixes after bias:
     ///    light_boost      highlight preservation (default 1.0, higher keeps brights)
     ///    light_boost:lc   equalization blend (0.0 = lightness, 1.0 = chroma, default 0.0)
+    ///    light_boost:lc:bright brightness preservation (0.0 = off, 1.0 = match source mean L, default 0.0)
     ///
     ///  Examples:  16,1.0,0.0          16 colors, full dither, RGB k-means
     ///             8,0.5,-1.0           8 colors, half dither, Oklab median-cut
@@ -178,17 +187,21 @@ impl QuantizeConfig {
 
         // Iterator-based splitting: no allocations, everything borrows from `s`.
         let mut parts = s.split(',');
-        let (colors_str, dither_str, bias_str) =
-            match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                (Some(c), Some(d), Some(b), None) => (c, d, b),
-                _ => {
-                    return Err(ArgParseErr::with_msg(
-                        "quantize requires 'default' or exactly 3 comma-separated values: \
-                         colors,dither_level,bias (bias may include :light_boost:lc_priority, \
-                         e.g. 1.0:5.5:0.5)",
-                    ));
-                }
-            };
+        let (colors_str, dither_str, bias_str) = match (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) {
+            (Some(c), Some(d), Some(b), None) => (c, d, b),
+            _ => {
+                return Err(ArgParseErr::with_msg(
+                    "quantize requires 'default' or exactly 3 comma-separated values: \
+                         colors,dither_level,bias (bias may include :light_boost:lc_priority:brightness_preserve, \
+                         e.g. 1.0:5.5:0.5:0.8)",
+                ));
+            }
+        };
 
         let colors = colors_str.trim().parse::<u32>().map_err(|_| {
             ArgParseErr::with_msg("invalid colors value (must be positive integer)")
@@ -222,13 +235,22 @@ impl QuantizeConfig {
             }
             None => 0.0,
         };
+        let brightness_preserve = match bias_parts.next() {
+            Some(v) => parse_finite_f32(
+                v,
+                "invalid brightness_preserve value (must be a finite float 0.0-1.0)",
+            )?
+            .clamp(0.0, 1.0),
+            None => 1.0,
+        };
+
         if bias_parts.next().is_some() {
             return Err(ArgParseErr::with_msg(
-                "bias accepts at most two ':' suffixes: bias:light_boost:lc_priority",
+                "bias accepts at most three ':' suffixes: bias:light_boost:lc_priority:brightness_preserve",
             ));
         }
 
-        Ok(Self { colors, dither_level, bias, light_boost, lc_priority })
+        Ok(Self { colors, dither_level, bias, light_boost, lc_priority, brightness_preserve })
     }
 }
 
@@ -283,7 +305,14 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
         } else if config.bias < 0.0 {
             generate_palette_median_cut(pixels, k)
         } else if config.bias > 0.0 {
-            generate_palette_oklab(pixels, k, config.bias, config.light_boost, config.lc_priority)
+            generate_palette_oklab(
+                pixels,
+                k,
+                config.bias,
+                config.light_boost,
+                config.lc_priority,
+                config.brightness_preserve,
+            )
         } else {
             generate_palette_rgb(pixels, k)
         };
@@ -896,6 +925,60 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
         .collect()
 }
 
+/// Post-palette luminance normalization that preserves relative lightness
+/// spacing. Instead of shifting all entries by a uniform delta (which clamps
+/// highlights and collapses bright detail), this applies a multiplicative
+/// scale in L space anchored at L=0. This maintains the ratio between any
+/// two palette entries' lightness values, so highlight separation is preserved
+/// even when the overall brightness needs significant correction.
+///
+/// The correction is blended between the scaled palette and the original
+/// using `strength`, where 0.0 = no correction and 1.0 = full match to
+/// source mean L.
+fn preserve_brightness(palette_oklab: &mut [Oklab], rgb_pixels: &[[u8; 3]], strength: f32) {
+    if strength <= 0.0 || palette_oklab.is_empty() || rgb_pixels.is_empty() {
+        return;
+    }
+
+    // Source mean L (sampled for large images)
+    let sample_len = rgb_pixels.len().min(256 * 256);
+    let step = (rgb_pixels.len() / sample_len).max(1);
+    let mut source_l_sum = 0.0f64;
+    let mut source_count = 0u64;
+    for p in rgb_pixels.iter().step_by(step) {
+        source_l_sum += srgb_to_oklab(*p).l as f64;
+        source_count += 1;
+    }
+    if source_count == 0 {
+        return;
+    }
+    let source_mean_l = (source_l_sum / source_count as f64) as f32;
+
+    // Palette mean L
+    let palette_mean_l: f32 =
+        palette_oklab.iter().map(|c| c.l as f64).sum::<f64>() as f32 / palette_oklab.len() as f32;
+
+    if palette_mean_l < 1e-6 {
+        // Degenerate: all palette entries are black. Fall back to uniform shift
+        // since multiplicative scaling from zero is undefined.
+        let delta_l = source_mean_l * strength;
+        for c in palette_oklab.iter_mut() {
+            c.l = (c.l + delta_l).clamp(0.0, 1.0);
+        }
+        return;
+    }
+
+    // Multiplicative scale factor that maps palette_mean_l → source_mean_l.
+    // Clamped to avoid extreme scaling when the palette mean is very small
+    // or very large relative to the source.
+    let target_mean = palette_mean_l + (source_mean_l - palette_mean_l) * strength;
+    let scale = (target_mean / palette_mean_l).clamp(0.5, 2.0);
+
+    for c in palette_oklab.iter_mut() {
+        c.l = (c.l * scale).clamp(0.0, 1.0);
+    }
+}
+
 /// K-means++ clustering in Oklab with the weighted OkLCh distance (used when bias > 0.0).
 ///
 /// Histogram equalization across lightness and chroma ensures dark areas and
@@ -908,6 +991,7 @@ fn generate_palette_oklab(
     sat_bias: f32,
     light_boost: f32,
     lc_priority: f32,
+    brightness_preserve: f32,
 ) -> Vec<[u8; 3]> {
     let k = k.max(1);
 
@@ -1155,8 +1239,12 @@ fn generate_palette_oklab(
         }
     }
 
-    // 5. Final mapping back to sRGB [u8; 3]
-    centroids_soa.to_oklab_vec().into_iter().map(oklab_to_srgb_u8).collect()
+    // 5. Brightness preservation — correct systematic L drift before sRGB conversion
+    let mut final_oklab = centroids_soa.to_oklab_vec();
+    preserve_brightness(&mut final_oklab, rgb_pixels, brightness_preserve);
+
+    // 6. Final mapping back to sRGB [u8; 3]
+    final_oklab.into_iter().map(oklab_to_srgb_u8).collect()
 }
 
 // -----------------------------------------------------------------------------
