@@ -86,7 +86,10 @@ fn oklch_weighted_dist_soa_single(p: OkPt, soa: &CentroidsSoA, idx: usize) -> f3
     let da = p.a - soa.a[idx];
     let db = p.b - soa.b[idx];
     let dh_sq = (da * da + db * db - dc * dc).max(0.0);
-    (dl * dl) + (dc * dc * 4.0) + (dh_sq * 4.0)
+    // Perceptually balanced weights: 1.0 Lightness, 2.0 Chroma, 3.5 Hue.
+    // Balances contrast preservation in light/dark areas while ensuring distinct
+    // hue tints (e.g. subtle blues in dark/gray scenes) are not collapsed into gray.
+    (dl * dl * 1.0) + (dc * dc * 2.0) + (dh_sq * 3.5)
 }
 
 /// Parse an f32 that must be finite — NaN or ±inf in any of these parameters
@@ -99,9 +102,9 @@ fn parse_finite_f32(s: &str, err: &'static str) -> Result<f32, ArgParseErr> {
 }
 
 // Draw domains
-const TAG_FIRST: u8 = 0; // first-centroid threshold
-const TAG_TARGET: u8 = 1; // weighted-pick target for centroid ki
-const TAG_FALLBACK: u8 = 2; // degenerate-case random index for centroid ki
+const TAG_FIRST: u8 = 0; // first-centroid weighted threshold
+const TAG_FALLBACK: u8 = 1; // degenerate-case random index for centroid ki
+const TAG_TARGET_BASE: u8 = 10; // weighted-pick target base for candidate trials
 
 /// Two-tier SipHash13 RNG.
 ///
@@ -161,15 +164,15 @@ impl SipRng {
 
 impl QuantizeConfig {
     /// Parse from a comma-separated string of three values, or "default".
-    /// Format: "colors,dither_level,bias[:light_boost[:lc_priority]]"
+    /// Format: "colors,dither_level,bias[:light_boost[:lc_priority[:brightness_preserve]]]"
     ///
-    ///   colors:  palette size (2-)
-    ///   dither:  error diffusion strength (0.0 = off, 1.0 = full)
-    ///   bias:    algorithm selector:
-    ///          <= -2.0        MacQueen online k-means in Oklab (stochastic, fast)
-    ///     -2.0 < ... < 0.0    Oklab median-cut (fast, good for flat art)
-    ///              0.0        classic RGB k-means (mapping & dither run in RGB too)
-    ///            > 0.0        Oklab k-means++ (perceptual, value = saturation boost)
+    ///    colors:  palette size (2-)
+    ///    dither:  error diffusion strength (0.0 = off, 1.0 = full)
+    ///    bias:    algorithm selector:
+    ///               <= -2.0        MacQueen online k-means in Oklab (stochastic, fast)
+    ///          -2.0 < ... < 0.0    Oklab median-cut (fast, good for flat art)
+    ///                    0.0        classic RGB k-means (mapping & dither run in RGB too)
+    ///                  > 0.0        Oklab k-means++ (perceptual, value = saturation boost)
     ///
     ///  Oklab k-means++ accepts optional suffixes after bias:
     ///    light_boost      highlight preservation (default 1.0, higher keeps brights)
@@ -177,7 +180,7 @@ impl QuantizeConfig {
     ///    light_boost:lc:bright brightness preservation (0.0 = off, 1.0 = match source mean L, default 0.0)
     ///
     ///  Examples:  16,1.0,0.0          16 colors, full dither, RGB k-means
-    ///             8,0.5,-1.0           8 colors, half dither, Oklab median-cut
+    ///             8,0.5,-1.0            8 colors, half dither, Oklab median-cut
     ///             32,0.1,1.0:1.5:0.5  32 colors, Oklab K-means with chroma+lightness equalization balanced
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
@@ -211,8 +214,8 @@ impl QuantizeConfig {
             parse_finite_f32(dither_str, "invalid dither_level value (must be a finite float)")?
                 .clamp(0.0, 1.0);
 
-        // bias field supports optional :light_boost and :lc_priority suffixes
-        // (e.g. "1.0:5.5" or "1.0:5.5:0.5")
+        // bias field supports optional :light_boost, :lc_priority and :brightness_preserve suffixes
+        // (e.g. "1.0:5.5" or "1.0:5.5:0.5" or "1.0:5.5:0.5:0.8")
         let mut bias_parts = bias_str.trim().split(':');
         let bias = parse_finite_f32(
             bias_parts.next().unwrap_or(""),
@@ -241,7 +244,7 @@ impl QuantizeConfig {
                 "invalid brightness_preserve value (must be a finite float 0.0-1.0)",
             )?
             .clamp(0.0, 1.0),
-            None => 1.0,
+            None => 0.0,
         };
 
         if bias_parts.next().is_some() {
@@ -463,8 +466,8 @@ where
     D: Fn(T, T) -> f32 + Sync,
     M: Fn([f32; 3]) -> T + Sync,
 {
-    // Destructures unique_colors output (ignoring counts with `_`)
-    let (unique, pixel_to_unique, _) = unique_colors(pixels);
+    // Remap pixel indices to unique color indices (counts not needed)
+    let (unique, pixel_to_unique) = unique_colors_with_map(pixels);
 
     let palette_pts: Vec<T> = palette.iter().map(|&c| make_pt(convert(c))).collect();
 
@@ -563,7 +566,7 @@ fn error_diffusion_map<T, D, M>(
                 [(p[0] + e[0]) - chosen[0], (p[1] + e[1]) - chosen[1], (p[2] + e[2]) - chosen[2]];
 
             // Sierra Lite distribution (same as monochrome.rs):
-            //   current → [fwd: 2/4, diag-below: 1/4, below: 1/4]
+            //    current → [fwd: 2/4, diag-below: 1/4, below: 1/4]
             // mirrored on R→L rows so error always follows the scan direction.
             // Edge pixels write into the padding column (never read), so no
             // explicit x-bounds check is needed.
@@ -588,12 +591,12 @@ fn error_diffusion_map<T, D, M>(
 }
 
 /// Deduplicate pixels into unique colors plus a per-pixel index map.
-/// Returns `(unique_colors, pixel_to_unique)`.
+/// Returns `(unique_rgb, pixel_to_unique)`.
 ///
 /// FP determinism: duplicates share identical converted values, and downstream
 /// passes that must match a per-pixel FP sequence walk the ORIGINAL pixel
 /// order through `pixel_to_unique` term-for-term.
-fn unique_colors(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>, Vec<u32>) {
+fn unique_colors_with_map(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>) {
     let mut indexed_keys: Vec<(u32, u32)> = pixels
         .par_iter()
         .enumerate()
@@ -606,7 +609,6 @@ fn unique_colors(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>, Vec<u32>) {
 
     let mut unique_rgb = Vec::with_capacity(pixels.len() / 4 + 1);
     let mut pixel_to_unique = vec![0u32; pixels.len()];
-    let mut unique_counts = Vec::with_capacity(pixels.len() / 4 + 1);
 
     let mut i = 0;
     while i < indexed_keys.len() {
@@ -614,14 +616,40 @@ fn unique_colors(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>, Vec<u32>) {
         let u_idx = unique_rgb.len() as u32;
         unique_rgb.push([(key >> 16) as u8, (key >> 8) as u8, key as u8]);
 
-        let start = i;
         while i < indexed_keys.len() && indexed_keys[i].0 == key {
             pixel_to_unique[indexed_keys[i].1 as usize] = u_idx;
             i += 1;
         }
+    }
+    (unique_rgb, pixel_to_unique)
+}
+
+/// Deduplicate pixels into unique colors and their frequency counts for histogram clustering.
+/// Returns `(unique_rgb, unique_counts)`.
+///
+/// Stores only 32-bit color keys without pixel indices, halving memory and sort bandwidth.
+fn unique_colors_with_counts(pixels: &[[u8; 3]]) -> (Vec<[u8; 3]>, Vec<u32>) {
+    let mut keys: Vec<u32> = pixels
+        .par_iter()
+        .map(|p| (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2]))
+        .collect();
+    keys.par_sort_unstable();
+
+    let mut unique_rgb = Vec::with_capacity(pixels.len() / 4 + 1);
+    let mut unique_counts = Vec::with_capacity(pixels.len() / 4 + 1);
+
+    let mut i = 0;
+    while i < keys.len() {
+        let key = keys[i];
+        unique_rgb.push([(key >> 16) as u8, (key >> 8) as u8, key as u8]);
+
+        let start = i;
+        while i < keys.len() && keys[i] == key {
+            i += 1;
+        }
         unique_counts.push((i - start) as u32);
     }
-    (unique_rgb, pixel_to_unique, unique_counts)
+    (unique_rgb, unique_counts)
 }
 
 /// MacQueen K-Means clustering natively in Oklab perceptual space (bias <= -2.0).
@@ -927,12 +955,11 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
 
 /// Post-palette luminance normalization that preserves relative lightness
 /// spacing. Instead of shifting all entries by a uniform delta (which clamps
-/// highlights and collapses bright detail), this applies a multiplicative
-/// scale in L space anchored at L=0. This maintains the ratio between any
-/// two palette entries' lightness values, so highlight separation is preserved
-/// even when the overall brightness needs significant correction.
+/// highlights and collapses bright detail), this applies a power (gamma) curve
+/// in L space anchored at L=0 and L=1. This maintains highlight separation
+/// unconditionally without clipping any bright detail.
 ///
-/// The correction is blended between the scaled palette and the original
+/// The correction is blended between the normalized palette and the original
 /// using `strength`, where 0.0 = no correction and 1.0 = full match to
 /// source mean L.
 fn preserve_brightness(palette_oklab: &mut [Oklab], rgb_pixels: &[[u8; 3]], strength: f32) {
@@ -958,33 +985,27 @@ fn preserve_brightness(palette_oklab: &mut [Oklab], rgb_pixels: &[[u8; 3]], stre
     let palette_mean_l: f32 =
         palette_oklab.iter().map(|c| c.l as f64).sum::<f64>() as f32 / palette_oklab.len() as f32;
 
-    if palette_mean_l < 1e-6 {
-        // Degenerate: all palette entries are black. Fall back to uniform shift
-        // since multiplicative scaling from zero is undefined.
-        let delta_l = source_mean_l * strength;
-        for c in palette_oklab.iter_mut() {
-            c.l = (c.l + delta_l).clamp(0.0, 1.0);
-        }
+    if palette_mean_l <= 1e-4 || source_mean_l <= 1e-4 {
         return;
     }
 
-    // Multiplicative scale factor that maps palette_mean_l → source_mean_l.
-    // Clamped to avoid extreme scaling when the palette mean is very small
-    // or very large relative to the source.
+    // Power curve mapping: L -> L^gamma. Preserves relative spacing while avoiding
+    // highlight clamping. Clamped to avoid extreme distortion.
     let target_mean = palette_mean_l + (source_mean_l - palette_mean_l) * strength;
-    let scale = (target_mean / palette_mean_l).clamp(0.5, 2.0);
+    let gamma = (target_mean.ln() / palette_mean_l.ln()).clamp(0.5, 2.0);
 
     for c in palette_oklab.iter_mut() {
-        c.l = (c.l * scale).clamp(0.0, 1.0);
+        c.l = c.l.powf(gamma).clamp(0.0, 1.0);
     }
 }
 
 /// K-means++ clustering in Oklab with the weighted OkLCh distance (used when bias > 0.0).
 ///
-/// Histogram equalization across lightness and chroma ensures dark areas and
-/// minority colors get fair palette representation. sat_bias boosts saturated
-/// pixels' weight, light_boost controls equalization strength, and lc_priority
-/// blends between lightness-only (0.0) and chroma-only (1.0) equalization.
+/// 3D histogram equalization across (L, a, b) space ensures dark areas, minority colors
+/// (e.g. subtle blues in dark/gray scenes), and delicate highlights receive dedicated
+/// representation in the final palette. sat_bias boosts saturated pixels' weight,
+/// light_boost controls highlight preservation, and lc_priority balances lightness
+/// and chromatic discrimination.
 fn generate_palette_oklab(
     rgb_pixels: &[[u8; 3]],
     k: usize,
@@ -1000,100 +1021,134 @@ fn generate_palette_oklab(
     }
 
     // ── Color histogram deduplication ───────────────────────────────────────
-    let (unique_rgb, pixel_to_unique, unique_counts) = unique_colors(rgb_pixels);
+    let (unique_rgb, unique_counts) = unique_colors_with_counts(rgb_pixels);
     let n_unique = unique_rgb.len();
     let k = k.min(n_unique).max(1);
 
     let oklab_pixels: Vec<Oklab> = unique_rgb.par_iter().map(|&p| srgb_to_oklab(p)).collect();
     let oklab_pts: Vec<OkPt> = oklab_pixels.par_iter().map(|&o| OkPt::from_oklab(o)).collect();
 
-    // 1. Per-pixel weights: uniform base with optional linear chroma boost.
+    // 1. Per-pixel weights: uniform base with optional linear chroma boost and highlight boost.
     let chroma_multiplier = (sat_bias - 1.0).max(0.0);
     let chromas: Vec<f32> = oklab_pts.iter().map(|p| p.chroma).collect();
-    let mut weights: Vec<f32> = chromas.iter().map(|&c| 1.0 + (c * chroma_multiplier)).collect();
+    let mut weights: Vec<f32> = oklab_pixels
+        .iter()
+        .zip(chromas.iter())
+        .map(|(p, &c)| {
+            let mut w = 1.0 + (c * chroma_multiplier);
+            if light_boost > 1.0 && p.l > 0.65 {
+                let l_norm = (p.l - 0.65) / 0.35;
+                w *= 1.0 + (light_boost - 1.0) * (l_norm * l_norm);
+            }
+            w
+        })
+        .collect();
 
-    // 2. Histogram equalization across lightness and chroma.
-    const LC_BINS: usize = 16;
-    let eq_power = (0.5_f32).max(1.0 - 0.5 / light_boost.max(0.1));
+    // 2. 3D (L, a, b) spatial histogram equalization.
+    // Partitioning chromatic space into an 8x8x8 grid (512 bins) ensures that distinct
+    // hue pockets (such as subtle blues in dark/gray scenes) are not smothered by massive
+    // neutral gray clusters.
+    let eq_power = (0.35_f32).max(0.85 - 0.4 / light_boost.max(0.1));
 
     let oklab_pixels_slice = &oklab_pixels[..n_unique];
-    let chromas_slice = &chromas[..n_unique];
     let weights_slice = &mut weights[..n_unique];
     let unique_counts_slice = &unique_counts[..n_unique];
 
-    // --- Lightness histogram ---
-    let mut l_bin_weights = [0.0f32; LC_BINS];
+    // --- Lightness histogram (16 bins) ---
+    const L_BINS: usize = 16;
+    let mut l_bin_weights = [0.0f32; L_BINS];
     for u in 0..n_unique {
-        let bin = ((oklab_pixels_slice[u].l * LC_BINS as f32) as usize).min(LC_BINS - 1);
+        let bin = ((oklab_pixels_slice[u].l * L_BINS as f32) as usize).min(L_BINS - 1);
         let w = weights_slice[u] * (unique_counts_slice[u] as f32);
         l_bin_weights[bin] = l_bin_weights[bin].algebraic_add(w);
     }
     let active_l = l_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
     let avg_l = if active_l > 0.0 { l_bin_weights.iter().sum::<f32>() / active_l } else { 1.0 };
 
-    // --- Chroma histogram ---
-    let max_chroma = chromas_slice.iter().copied().max_by(|a, b| a.total_cmp(b)).unwrap_or(0.0);
-    let chroma_scale = if max_chroma > 1e-6 { LC_BINS as f32 / max_chroma } else { 1.0 };
-
-    let mut c_bin_weights = [0.0f32; LC_BINS];
+    // --- 3D (L, a, b) Grid histogram (8x8x8 = 512 bins) ---
+    let mut grid_weights = [0.0f32; 512];
     for u in 0..n_unique {
-        let bin = ((chromas_slice[u] * chroma_scale) as usize).min(LC_BINS - 1);
+        let p = oklab_pixels_slice[u];
+        let l_bin = ((p.l * 8.0) as usize).min(7);
+        let a_bin = (((p.a + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
+        let b_bin = (((p.b + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
+        let bin = (l_bin << 6) | (a_bin << 3) | b_bin;
         let w = weights_slice[u] * (unique_counts_slice[u] as f32);
-        c_bin_weights[bin] = c_bin_weights[bin].algebraic_add(w);
+        grid_weights[bin] = grid_weights[bin].algebraic_add(w);
     }
-    let active_c = c_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
-    let avg_c = if active_c > 0.0 { c_bin_weights.iter().sum::<f32>() / active_c } else { 1.0 };
+    let active_grid = grid_weights.iter().filter(|&&w| w > 0.0).count() as f32;
+    let avg_grid =
+        if active_grid > 0.0 { grid_weights.iter().sum::<f32>() / active_grid } else { 1.0 };
 
     // --- Apply blended equalization ---
-    let l_weight = 1.0 - lc_priority;
-    let c_weight = lc_priority;
+    // Keep 3D chromatic equalization active by default so subtle hues are preserved,
+    // using lc_priority to smoothly shift priority from lightness-balance to pure hue-balance.
+    let l_eff = 1.0 - (lc_priority * 0.5);
+    let c_eff = 0.5 + (lc_priority * 0.5);
+
     for u in 0..n_unique {
-        let l_bin = ((oklab_pixels_slice[u].l * LC_BINS as f32) as usize).min(LC_BINS - 1);
-        let c_bin = ((chromas_slice[u] * chroma_scale) as usize).min(LC_BINS - 1);
+        let p = oklab_pixels_slice[u];
+        let l_bin = ((p.l * L_BINS as f32) as usize).min(L_BINS - 1);
+        let gl_bin = ((p.l * 8.0) as usize).min(7);
+        let a_bin = (((p.a + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
+        let b_bin = (((p.b + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
+        let g_bin = (gl_bin << 6) | (a_bin << 3) | b_bin;
 
         let l_eq = if l_bin_weights[l_bin] > 0.0 {
             (avg_l / l_bin_weights[l_bin]).powf(eq_power)
         } else {
             1.0
         };
-        let c_eq = if c_bin_weights[c_bin] > 0.0 {
-            (avg_c / c_bin_weights[c_bin]).powf(eq_power)
+        let c_eq = if grid_weights[g_bin] > 0.0 {
+            (avg_grid / grid_weights[g_bin]).powf(eq_power)
         } else {
             1.0
         };
 
-        weights_slice[u] *= l_eq.powf(l_weight) * c_eq.powf(c_weight);
+        weights_slice[u] *= l_eq.powf(l_eff) * c_eq.powf(c_eff);
     }
 
     // Precompute the effective weights array once to avoid millions of redundant multiplications
     let effective_weights: Vec<f32> =
         weights_slice.iter().zip(unique_counts_slice.iter()).map(|(&w, &c)| w * c as f32).collect();
 
-    // 3. K-Means++ initialization using CentroidsSoA
-    let first_pixel_oklab = oklab_pixels[pixel_to_unique[0] as usize];
+    // 3. K-Means++ initialization using CentroidsSoA with multi-candidate local trial evaluation
     let mut centroids_soa = CentroidsSoA::with_capacity(k);
-    centroids_soa.push(OkPt::from_oklab(first_pixel_oklab));
+
+    // Pick first centroid: prioritize dynamic range highlights if light_boost > 1.2,
+    // otherwise sample from the weighted distribution.
+    let rng = SipRng::new(k, n_unique, rgb_pixels.len());
+    let first_idx = if light_boost > 1.2 {
+        oklab_pts
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.l.total_cmp(&b.1.l))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    } else {
+        let total_w: f32 =
+            effective_weights.iter().copied().fold(0.0f32, |acc, x| acc.algebraic_add(x));
+        let mut threshold = rng.unit_f32(TAG_FIRST, 0) * total_w;
+        let mut chosen_u = 0;
+        for u in 0..n_unique {
+            let w = effective_weights[u];
+            threshold = threshold.algebraic_add(-w);
+            if threshold <= 0.0 {
+                chosen_u = u;
+                break;
+            }
+        }
+        chosen_u
+    };
+    centroids_soa.push(oklab_pts[first_idx]);
 
     let mut min_dists = vec![f32::MAX; n_unique];
-
-    let rng = SipRng::new(k, n_unique, rgb_pixels.len());
-    let total_w: f32 =
-        effective_weights.iter().copied().fold(0.0f32, |acc, x| acc.algebraic_add(x));
-
-    let mut threshold = rng.unit_f32(TAG_FIRST, 0) * total_w;
-    for u in 0..n_unique {
-        let w = effective_weights[u];
-        threshold = threshold.algebraic_add(-w);
-        if threshold <= 0.0 {
-            centroids_soa.update(0, oklab_pts[u]);
-            break;
-        }
-    }
 
     min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
         *d = oklch_weighted_dist_soa_single(oklab_pts[i], &centroids_soa, 0);
     });
 
+    const CANDIDATES_PER_STEP: usize = 3;
     for ki in 1..k {
         let total: f32 = (0..n_unique)
             .into_par_iter()
@@ -1104,17 +1159,28 @@ fn generate_palette_oklab(
             let idx = rng.below(TAG_FALLBACK, ki as u64, n_unique);
             centroids_soa.push(oklab_pts[idx]);
         } else {
-            let mut target = rng.unit_f32(TAG_TARGET, ki as u64) * total;
-            let mut chosen_u = n_unique - 1;
-            for u in 0..n_unique {
-                let w = min_dists[u] * effective_weights[u];
-                target = target.algebraic_add(-w);
-                if target <= 0.0 {
-                    chosen_u = u;
-                    break;
+            // Multi-trial candidate selection (k-means++ local trial heuristic)
+            let mut best_candidate_idx = n_unique - 1;
+            let mut max_cand_dist = -1.0f32;
+
+            for trial in 0..CANDIDATES_PER_STEP {
+                let sub_tag = TAG_TARGET_BASE + (trial as u8);
+                let mut target = rng.unit_f32(sub_tag, ki as u64) * total;
+                let mut cand_u = n_unique - 1;
+                for u in 0..n_unique {
+                    let w = min_dists[u] * effective_weights[u];
+                    target = target.algebraic_add(-w);
+                    if target <= 0.0 {
+                        cand_u = u;
+                        break;
+                    }
+                }
+                if min_dists[cand_u] > max_cand_dist {
+                    max_cand_dist = min_dists[cand_u];
+                    best_candidate_idx = cand_u;
                 }
             }
-            centroids_soa.push(oklab_pts[chosen_u]);
+            centroids_soa.push(oklab_pts[best_candidate_idx]);
         }
 
         let new_c_idx = ki;
@@ -1147,7 +1213,7 @@ fn generate_palette_oklab(
                     let da = p.a - centroids_soa.a[i];
                     let db = p.b - centroids_soa.b[i];
                     let dh_sq = (da * da + db * db - dc * dc).max(0.0);
-                    let d = (dl * dl) + (dc * dc * 4.0) + (dh_sq * 4.0);
+                    let d = (dl * dl * 1.0) + (dc * dc * 2.0) + (dh_sq * 3.5);
                     if d < min_dist {
                         min_dist = d;
                         best = i;
@@ -1243,7 +1309,7 @@ fn generate_palette_oklab(
     let mut final_oklab = centroids_soa.to_oklab_vec();
     preserve_brightness(&mut final_oklab, rgb_pixels, brightness_preserve);
 
-    // 6. Final mapping back to sRGB [u8; 3]
+    // 6. Final mapping back to sRGB [u8; 3] with gamut preservation
     final_oklab.into_iter().map(oklab_to_srgb_u8).collect()
 }
 
@@ -1298,10 +1364,10 @@ fn oklch_weighted_dist_pt(p: OkPt, c: OkPt) -> f32 {
     let db = p.b - c.b;
     let dh_sq = (da * da + db * db - dc * dc).max(0.0);
 
-    // Perceptual Weights: 1.0 Lightness, 4.0 Chroma, 4.0 Hue — forces the
-    // algorithm to preserve vibrant gradients instead of settling for
-    // mathematically safe but pale averages.
-    (dl * dl) + (dc * dc * 4.0) + (dh_sq * 4.0)
+    // Perceptual Weights: 1.0 Lightness, 2.0 Chroma, 3.5 Hue — forces the
+    // algorithm to preserve vibrant gradients and distinct minority hues (like dark blues)
+    // instead of settling for mathematically safe but pale averages.
+    (dl * dl * 1.0) + (dc * dc * 2.0) + (dh_sq * 3.5)
 }
 
 /// Squared Euclidean distance in u8-scale RGB — the metric for classic mode.
@@ -1324,11 +1390,52 @@ fn srgb_to_oklab_arr(p: [u8; 3]) -> [f32; 3] {
     [o.l, o.a, o.b]
 }
 
-/// Single shared Oklab → sRGB u8 conversion.
-/// Note: negative out-of-gamut linear values take the linear segment of the
-/// gamma curve and are clamped to 0 — no NaN path through `powf`.
-fn oklab_to_srgb_u8(ok: Oklab) -> [u8; 3] {
-    let linear = oklab_to_linear_srgb(ok);
+/// Single shared Oklab → sRGB u8 conversion with gamut mapping.
+/// If (L, a, b) lies outside the sRGB cube, reduces chroma towards neutral
+/// at constant Lightness L to avoid blowing out or tinting bright details.
+fn oklab_to_srgb_u8(mut ok: Oklab) -> [u8; 3] {
+    let mut linear = oklab_to_linear_srgb(ok);
+    if linear[0] >= 0.0
+        && linear[0] <= 1.0
+        && linear[1] >= 0.0
+        && linear[1] <= 1.0
+        && linear[2] >= 0.0
+        && linear[2] <= 1.0
+    {
+        return [
+            (linear_to_srgb(linear[0]) * 255.0).round() as u8,
+            (linear_to_srgb(linear[1]) * 255.0).round() as u8,
+            (linear_to_srgb(linear[2]) * 255.0).round() as u8,
+        ];
+    }
+
+    // Out-of-gamut bisection: scale chroma (a, b) towards 0 preserving exact L
+    let mut low = 0.0f32;
+    let mut high = 1.0f32;
+    let orig_a = ok.a;
+    let orig_b = ok.b;
+
+    for _ in 0..5 {
+        let mid = (low + high) * 0.5;
+        ok.a = orig_a * mid;
+        ok.b = orig_b * mid;
+        linear = oklab_to_linear_srgb(ok);
+        if linear[0] >= 0.0
+            && linear[0] <= 1.0
+            && linear[1] >= 0.0
+            && linear[1] <= 1.0
+            && linear[2] >= 0.0
+            && linear[2] <= 1.0
+        {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    ok.a = orig_a * low;
+    ok.b = orig_b * low;
+    linear = oklab_to_linear_srgb(ok);
+
     std::array::from_fn(|i| (linear_to_srgb(linear[i]).clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
