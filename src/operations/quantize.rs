@@ -169,10 +169,10 @@ impl QuantizeConfig {
     ///    colors:  palette size (2-)
     ///    dither:  error diffusion strength (0.0 = off, 1.0 = full)
     ///    bias:    algorithm selector:
-    ///               <= -2.0        MacQueen online k-means in Oklab (stochastic, fast)
+    ///                <= -2.0        MacQueen online k-means in Oklab (stochastic, fast)
     ///          -2.0 < ... < 0.0    Oklab median-cut (fast, good for flat art)
-    ///                    0.0        classic RGB k-means (mapping & dither run in RGB too)
-    ///                  > 0.0        Oklab k-means++ (perceptual, value = saturation boost)
+    ///                     0.0        classic RGB k-means (mapping & dither run in RGB too)
+    ///                   > 0.0        Oklab k-means++ (perceptual, value = saturation boost)
     ///
     ///  Oklab k-means++ accepts optional suffixes after bias:
     ///    light_boost      highlight preservation (default 1.0, higher keeps brights)
@@ -341,6 +341,7 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
                     ERR_CLAMP_RGB,
                     [1.0; 3],
                     config.dither_level * 25.5,
+                    config.dither_level,
                     width,
                     height,
                 )
@@ -354,6 +355,7 @@ pub fn quantize(image: &mut Image, config: &QuantizeConfig) -> Result<(), Magick
                     ERR_CLAMP_OKLAB,
                     [1.0, 0.0, 0.0],
                     config.dither_level * 0.1,
+                    config.dither_level,
                     width,
                     height,
                 )
@@ -416,6 +418,7 @@ fn dither_and_map<T, C, D, M>(
     clamp: [f32; 3],
     jitter_mask: [f32; 3],
     noise_spread: f32,
+    dither_level: f32,
     width: usize,
     height: usize,
 ) -> Vec<u8>
@@ -441,6 +444,7 @@ where
         clamp,
         jitter_mask,
         noise_spread,
+        dither_level,
         width,
         height,
         &mut out,
@@ -509,6 +513,7 @@ fn error_diffusion_map<T, D, M>(
     clamp: [f32; 3],
     jitter_mask: [f32; 3],
     noise_spread: f32,
+    dither_level: f32,
     width: usize,
     height: usize,
     out: &mut [u8],
@@ -562,8 +567,11 @@ fn error_diffusion_map<T, D, M>(
             // eventually lands near a distant palette entry for a single pixel
             // before correction propagates.
             let chosen = palette_ws[best];
-            let err =
-                [(p[0] + e[0]) - chosen[0], (p[1] + e[1]) - chosen[1], (p[2] + e[2]) - chosen[2]];
+            let err = [
+                ((p[0] + e[0]) - chosen[0]) * dither_level,
+                ((p[1] + e[1]) - chosen[1]) * dither_level,
+                ((p[2] + e[2]) - chosen[2]) * dither_level,
+            ];
 
             // Sierra Lite distribution (same as monochrome.rs):
             //    current → [fwd: 2/4, diag-below: 1/4, below: 1/4]
