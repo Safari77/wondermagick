@@ -1846,7 +1846,7 @@ fn render_voronoi(
     buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
         let py = y as f64 + 0.5;
         let gy = (py * inv_cell).floor() as i64;
-        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let pxf = x as f64 + 0.5;
             let gx = (pxf * inv_cell).floor() as i64;
 
@@ -1997,7 +1997,7 @@ fn render_fbm(
     let row_len = width as usize * 4;
     let map = &map;
     buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
-        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             // Fbm is scaled to [-1, 1]; remap onto the ramp's [0, 1].
             let mut t = ((map.get_value(x, y) + 1.0) * 0.5).clamp(0.0, 1.0);
             if let Some(e) = easing {
@@ -2130,7 +2130,7 @@ fn render_flow(
     let row_len = width as usize * 4;
     let acc = &acc;
     buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
-        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let cell = acc[y * width as usize + x];
             let cov = cell[3];
             let lab = if cov > 1e-6 {
@@ -2224,7 +2224,7 @@ fn render_lowpoly(
     if tri.triangles.is_empty() {
         let row_len = width_us * 4;
         buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
-            for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let rgb = oklab_to_rgb16(field(x as f64 + 0.5, y as f64 + 0.5));
                 px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], u16::MAX]);
             }
@@ -2587,7 +2587,7 @@ fn render_flame(
     let row_len = width_us * 4;
     let hist = &hist;
     buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
-        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let cell = hist[y * width_us + x];
             let cnt = cell[3];
             let (r, g, b) = if cnt > 0.0 {
@@ -2658,7 +2658,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             // Parallel fill. chunks_exact_mut of size 4 is faster than .copy_from_slice on
             // the whole row because the optimiser turns it into a memset-friendly loop.
             buf.par_chunks_mut(row_len).for_each(|row| {
-                for px in row.chunks_exact_mut(4) {
+                for px in row.as_chunks_mut::<4>().0 {
                     px.copy_from_slice(c);
                 }
             });
@@ -2688,7 +2688,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
                 let dy = y as f64 - cy;
                 let dy_sin = dy * sin_t;
-                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let dx = x as f64 - cx;
                     let proj = dx * cos_t + dy_sin;
                     let mut t = if total_span > 0.0 {
@@ -2750,7 +2750,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
                 let dy = y as f64 - cy;
                 let dy2 = dy * dy;
-                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let dx = x as f64 - cx;
                     let r = (dx * dx + dy2).sqrt();
                     let mut t = (r * inv_max_r).clamp(0.0, 1.0);
@@ -2771,7 +2771,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
 
             buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
                 let v = y as f64 / height_f;
-                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let u = x as f64 / width_f;
                     let c = colors.eval_color(u, v);
                     px.copy_from_slice(&c);
@@ -2819,7 +2819,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
                 let v_fallback = y as f64 * inv_h;
                 let y_f = y as f64;
-                for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let pt = Point::new(x as f64, y_f);
 
                     // Solve for (u, v) via Newton-Raphson; fall back to
