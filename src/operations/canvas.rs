@@ -230,8 +230,8 @@ impl CoonsPatch {
             let err_x = current.x - p.x;
             let err_y = current.y - p.y;
 
-            // If we are within half a pixel of the target, we've converged!
-            if err_x.abs() < 0.5 && err_y.abs() < 0.5 {
+            // Converged within sub-pixel numerical precision
+            if err_x.abs() < 1e-4 && err_y.abs() < 1e-4 {
                 // Return clamped to prevent float slop right on the boundary
                 return Some((u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)));
             }
@@ -264,7 +264,16 @@ impl CoonsPatch {
         }
 
         // Final fallback check
-        if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) { Some((u, v)) } else { None }
+        let final_pos = self.eval_position(u, v);
+        if (final_pos.x - p.x).abs() < 0.5
+            && (final_pos.y - p.y).abs() < 0.5
+            && (0.0..=1.0).contains(&u)
+            && (0.0..=1.0).contains(&v)
+        {
+            Some((u, v))
+        } else {
+            None
+        }
     }
 }
 
@@ -530,9 +539,15 @@ impl CanvasConfig {
         let mut filtered_remaining = Vec::new();
         for &token in remaining {
             if let Some(ease_str) = token.strip_prefix("ease:") {
+                if easing.is_some() {
+                    return Err(ArgParseErr::with_msg("canvas: easing specified more than once"));
+                }
                 let pts: Result<Vec<f64>, _> = ease_str.split(':').map(|n| n.parse()).collect();
                 if let Ok(p) = pts
                     && p.len() == 4
+                    && p.iter().all(|v| v.is_finite())
+                    && (0.0..=1.0).contains(&p[0])
+                    && (0.0..=1.0).contains(&p[2])
                 {
                     easing = Some(CssEasing::new(p[0], p[1], p[2], p[3]));
                     continue;
@@ -548,7 +563,7 @@ impl CanvasConfig {
 
         let spec = match kind.as_str() {
             "solid" => {
-                if remaining.len() != 2 {
+                if easing.is_some() || remaining.len() != 2 {
                     return Err(ArgParseErr::with_msg(
                         "canvas solid: expected '[size:WxH,]solid,COLOR'",
                     ));
@@ -579,13 +594,19 @@ impl CanvasConfig {
                 let mut stops_start = 1;
 
                 // Check for pos:x,y (which spans two comma-separated tokens: "pos:x" and "y")
-                if remaining.len() >= 3 && remaining[1].starts_with("pos:") {
-                    let x_str = remaining[1].strip_prefix("pos:").unwrap();
-                    let y_str = remaining[2];
-                    if let (Some(cx), Some(cy)) = (parse_coord(x_str), parse_coord(y_str)) {
-                        center_x = cx;
-                        center_y = cy;
-                        stops_start = 3;
+                if remaining.len() >= 2 && remaining[1].starts_with("pos:") {
+                    if remaining.len() >= 3 {
+                        let x_str = remaining[1].strip_prefix("pos:").unwrap();
+                        let y_str = remaining[2];
+                        if let (Some(cx), Some(cy)) = (parse_coord(x_str), parse_coord(y_str)) {
+                            center_x = cx;
+                            center_y = cy;
+                            stops_start = 3;
+                        } else {
+                            return Err(ArgParseErr::with_msg(
+                                "canvas radial: invalid pos specifier (expected pos:x,y)",
+                            ));
+                        }
                     } else {
                         return Err(ArgParseErr::with_msg(
                             "canvas radial: invalid pos specifier (expected pos:x,y)",
@@ -593,7 +614,7 @@ impl CanvasConfig {
                     }
                 }
 
-                if remaining.len() - stops_start < 2 {
+                if remaining.len().saturating_sub(stops_start) < 2 {
                     return Err(ArgParseErr::with_msg(
                         "canvas radial: expected '[size:WxH,]radial,[pos:x,y,][ease:x:y:x:y,]STOP1,STOP2[,...]' \
                          (at least 2 stops)",
@@ -603,7 +624,7 @@ impl CanvasConfig {
                 CanvasSpec::Radial { center_x, center_y, stops, easing }
             }
             "mesh" => {
-                if remaining.len() != 5 {
+                if easing.is_some() || remaining.len() != 5 {
                     return Err(ArgParseErr::with_msg(
                         "canvas mesh: expected '[size:WxH,]mesh,TL_COLOR,TR_COLOR,BL_COLOR,BR_COLOR'",
                     ));
@@ -629,8 +650,8 @@ impl CanvasConfig {
             }
             "coons" => {
                 // Coons syntax is flexible:
-                //   coons                             -- fully random (shape + palette)
-                //   coons,seed:N                      -- seeded random
+                //   coons                                 -- fully random (shape + palette)
+                //   coons,seed:N                          -- seeded random
                 //   coons,TL,TR,BL,BR                 -- random shape, explicit colors
                 //   coons,seed:N,TL,TR,BL,BR          -- fully deterministic
                 //   coons,transparency:MIN-MAX        -- smooth bezier-based alpha field
@@ -736,6 +757,12 @@ impl CanvasConfig {
                 CanvasSpec::Coons { seed, colors, easing, transparency }
             }
             "voronoi" => {
+                if easing.is_some() {
+                    return Err(ArgParseErr::with_msg(
+                        "canvas voronoi: unknown or repeated option (expected \
+                         'sharp', 'blob', 'cells:N', 'softness:F', 'seed:N')",
+                    ));
+                }
                 let mut tok = SpecTokens::split(&remaining[1..]);
                 let style = if tok.flag("blob") {
                     VoronoiStyle::Blob
@@ -831,6 +858,13 @@ impl CanvasConfig {
                 }
             }
             "flow" => {
+                if easing.is_some() {
+                    return Err(ArgParseErr::with_msg(
+                        "canvas flow: unknown or repeated option (expected 'seed:N', \
+                         'strands:N', 'steps:N', 'step:F', 'zoom:F', 'turns:F', \
+                         'width:F', 'alpha:F')",
+                    ));
+                }
                 let mut tok = SpecTokens::split(&remaining[1..]);
                 let seed = opt_seed(tok.take("seed"))?;
                 let strands = opt_u32(
@@ -904,6 +938,12 @@ impl CanvasConfig {
                 }
             }
             "lowpoly" => {
+                if easing.is_some() {
+                    return Err(ArgParseErr::with_msg(
+                        "canvas lowpoly: unknown or repeated option (expected 'seed:N', \
+                         'points:N', 'smooth')",
+                    ));
+                }
                 let mut tok = SpecTokens::split(&remaining[1..]);
                 let smooth = tok.flag("smooth");
                 let seed = opt_seed(tok.take("seed"))?;
@@ -925,6 +965,12 @@ impl CanvasConfig {
                 CanvasSpec::LowPoly { seed, points, smooth, colors }
             }
             "flame" => {
+                if easing.is_some() {
+                    return Err(ArgParseErr::with_msg(
+                        "canvas flame: unknown or repeated option (expected 'seed:N', \
+                         'quality:N', 'transforms:N', 'gamma:F', 'continuous')",
+                    ));
+                }
                 let mut tok = SpecTokens::split(&remaining[1..]);
                 let continuous = tok.flag("continuous");
                 let seed = opt_seed(tok.take("seed"))?;
@@ -1020,10 +1066,11 @@ fn hex_u16(d: &[u8]) -> Result<u16, ArgParseErr> {
 fn parse_coord(s: &str) -> Option<Coord> {
     if let Some(px_str) = s.strip_suffix("px") {
         let px: f64 = px_str.parse().ok()?;
-        if px >= 0.0 {
+        if px.is_finite() && px >= 0.0 {
             return Some(Coord::Pixels(px));
         }
     } else if let Ok(ratio) = s.parse::<f64>()
+        && ratio.is_finite()
         && (0.0..=1.0).contains(&ratio)
     {
         return Some(Coord::Ratio(ratio));
@@ -2288,7 +2335,7 @@ fn render_lowpoly(
                     Oklab {
                         l: (ca.l * fa + cb.l * fb + cc.l * fc + shade).clamp(0.0, 1.0),
                         a: ca.a * fa + cb.a * fb + cc.a * fc,
-                        b: ca.b * fa + cb.b * fb + cc.b * fc,
+                        b: ca.b * fa + cb.b * fc + cc.b * fb,
                     }
                 } else {
                     Oklab { l: (ca.l + shade).clamp(0.0, 1.0), a: ca.a, b: ca.b }
@@ -2608,8 +2655,10 @@ fn render_flame(
 }
 
 pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickError> {
-    // 1. Determine size AND whether we should composite or replace
-    let (_width, _height, is_overlay) = match config.size {
+    // 1. Determine size AND whether we should composite or replace.
+    // With `size:WxH` the canvas creates a brand new image; without it, we
+    // overwrite the pixels of the current image while keeping its dimensions.
+    let (width, height, is_overlay) = match config.size {
         Some((w, h)) => (w, h, false),
         None => {
             let w = image.pixels.width();
@@ -2620,24 +2669,6 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
                 ));
             }
             (w, h, true)
-        }
-    };
-
-    // Resolve target dimensions. With `size:WxH` the canvas creates a brand
-    // new image; without it, we overwrite the pixels of the current image
-    // while keeping its dimensions. The latter is useful when canvas is
-    // chained AFTER another operation that already produced an image.
-    let (width, height) = match config.size {
-        Some((w, h)) => (w, h),
-        None => {
-            let w = image.pixels.width();
-            let h = image.pixels.height();
-            if w == 0 || h == 0 {
-                return Err(crate::wm_err!(
-                    "canvas: current image has zero dimensions; use 'size:WIDTHxHEIGHT,...' to create a new canvas"
-                ));
-            }
-            (w, h)
         }
     };
 

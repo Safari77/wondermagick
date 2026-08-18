@@ -215,7 +215,7 @@ impl Arg {
                 "render rotated multi-line text (format: 'effect,text,font,size,color,rotation,justify,x,y' | Effects: none, blur:<sigma>, gradualblur:<sigma>, shadow:dx:dy:sigma:<#color>, outline:<thickness>:<#color>, explode:strength, meltdown:strength:direction (-1=omnidirectional, 0-360=direction) | meltdown and explode can be added as displacement effect or used with plain text only, e.g. 'outline:3:#000000FF,Hello,Arial,5%,#FFFFFF,45.0,center,center,80%', 'outline:10:a0101080+explode:90,AAEEIIOO,Iosevka,10%,#EEEEEEF0,5,center,center,70%' | QR: 'none,{QR:H:0:#00000000:https://x.com},Arial,15%,#000000,0,center,center,center')"
             }
             Arg::Canvas => {
-                "create a canvas of given size filled with a solid color or gradient (format: WxH,solid|linear|radial,mesh,coons,voronoi,fbm,flow,lowpoly,flame)"
+                "create a canvas of given size filled with a solid color or gradient (format: [size:WxH,]solid|linear|radial,mesh,coons,voronoi,fbm,flow,lowpoly,flame — for linear,radial,coons also cubic-bezier CSS easing is supported: ease:x1:y1:x2:y2)"
             }
             Arg::Tonemap => {
                 "tonemap HDR image to SDR (use 'default' or cicp=9,16,0,1,nits=1000,tonemapping=rec2408)"
