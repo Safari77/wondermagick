@@ -77,6 +77,12 @@ impl FilmicSplineConfig {
             1600.0,
             "fs_white_target out of range (0 .. 1600)",
         )?;
+        if self.black_point_target >= self.grey_point_target {
+            return Err(ArgParseErr::with_msg("fs_black_target must be less than fs_grey_target"));
+        }
+        if self.grey_point_target >= self.white_point_target {
+            return Err(ArgParseErr::with_msg("fs_grey_target must be less than fs_white_target"));
+        }
         check_range(self.balance, -50.0, 50.0, "fs_balance out of range (-50 .. 50)")?;
         check_range(self.saturation, -200.0, 200.0, "fs_saturation out of range (-200 .. 200)")?;
         Ok(())
@@ -191,17 +197,22 @@ impl TonemapConfig {
     /// Or the literal `default`.
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
-        if s.eq_ignore_ascii_case("default") {
+        if s.is_empty() || s.eq_ignore_ascii_case("default") {
             return Ok(Self::default());
         }
 
         let mut config = Self::default();
+        let mut custom_agx_specified = false;
         let mut parts = s.split(',');
 
         while let Some(part) = parts.next() {
             let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
 
             if let Some(val) = part.strip_prefix("cicp=") {
+                let val = val.trim();
                 if val.eq_ignore_ascii_case("auto") {
                     config.cicp = None;
                 } else {
@@ -210,20 +221,40 @@ impl TonemapConfig {
                             ArgParseErr::with_msg("invalid cicp value (must be integer 0-255)")
                         })
                     };
-                    let p1 = parse_byte(val)?;
-                    let p2_val = parts
-                        .next()
-                        .ok_or_else(|| ArgParseErr::with_msg("cicp requires 4 values"))?;
-                    let p2 = parse_byte(p2_val)?;
-                    let p3_val = parts
-                        .next()
-                        .ok_or_else(|| ArgParseErr::with_msg("cicp requires 4 values"))?;
-                    let p3 = parse_byte(p3_val)?;
-                    let p4_val = parts
-                        .next()
-                        .ok_or_else(|| ArgParseErr::with_msg("cicp requires 4 values"))?;
-                    let p4 = parse_byte(p4_val)?;
-                    let cicp = [p1, p2, p3, p4];
+
+                    let cicp = if val.contains(':')
+                        || val.contains('/')
+                        || val.contains('-')
+                        || val.contains('_')
+                    {
+                        let pieces: Vec<&str> =
+                            val.split([':', '/', '-', '_']).collect();
+                        if pieces.len() != 4 {
+                            return Err(ArgParseErr::with_msg("cicp requires 4 values"));
+                        }
+                        [
+                            parse_byte(pieces[0])?,
+                            parse_byte(pieces[1])?,
+                            parse_byte(pieces[2])?,
+                            parse_byte(pieces[3])?,
+                        ]
+                    } else {
+                        let p1 = parse_byte(val)?;
+                        let p2_val = parts
+                            .next()
+                            .ok_or_else(|| ArgParseErr::with_msg("cicp requires 4 values"))?;
+                        let p2 = parse_byte(p2_val)?;
+                        let p3_val = parts
+                            .next()
+                            .ok_or_else(|| ArgParseErr::with_msg("cicp requires 4 values"))?;
+                        let p3 = parse_byte(p3_val)?;
+                        let p4_val = parts
+                            .next()
+                            .ok_or_else(|| ArgParseErr::with_msg("cicp requires 4 values"))?;
+                        let p4 = parse_byte(p4_val)?;
+                        [p1, p2, p3, p4]
+                    };
+
                     // Reject unsupported/ill-formed cICP now, before we spend
                     // CPU decoding an image we can't tone-map anyway.
                     validate_cicp_arg(cicp)?;
@@ -231,75 +262,149 @@ impl TonemapConfig {
                 }
             } else if let Some(val) = part.strip_prefix("nits=") {
                 config.nits = parse_f32(val, "invalid nits value (must be float)")?;
-            } else if let Some(val) =
-                part.strip_prefix("tonemapping=").or_else(|| part.strip_prefix("method="))
+            } else if let Some(val) = part
+                .strip_prefix("tonemapping=")
+                .or_else(|| part.strip_prefix("method="))
+                .or_else(|| part.strip_prefix("tm="))
             {
-                config.method = val.to_lowercase();
-            } else if let Some(val) = part.strip_prefix("exposure=") {
+                config.method = val.to_lowercase().replace('-', "_");
+            } else if let Some(val) =
+                part.strip_prefix("exposure=").or_else(|| part.strip_prefix("exp="))
+            {
                 config.exposure = parse_f32(val, "invalid exposure value (must be float)")?;
-            } else if let Some(val) =
-                part.strip_prefix("colorspace=").or_else(|| part.strip_prefix("cs="))
+            } else if let Some(val) = part
+                .strip_prefix("colorspace=")
+                .or_else(|| part.strip_prefix("color_space="))
+                .or_else(|| part.strip_prefix("color-space="))
+                .or_else(|| part.strip_prefix("cs="))
             {
-                config.color_space = val.to_lowercase();
-            } else if let Some(val) =
-                part.strip_prefix("gamut_clipping=").or_else(|| part.strip_prefix("gc="))
+                config.color_space = val.to_lowercase().replace('-', "_");
+            } else if let Some(val) = part
+                .strip_prefix("gamut_clipping=")
+                .or_else(|| part.strip_prefix("gamut-clipping="))
+                .or_else(|| part.strip_prefix("gamutclipping="))
+                .or_else(|| part.strip_prefix("gc="))
             {
-                config.gamut_clipping = val.to_lowercase();
-            } else if let Some(val) = part.strip_prefix("max_luma=") {
+                config.gamut_clipping = val.to_lowercase().replace('-', "_");
+            } else if let Some(val) = part
+                .strip_prefix("max_luma=")
+                .or_else(|| part.strip_prefix("max-luma="))
+                .or_else(|| part.strip_prefix("maxluma="))
+            {
                 config.max_luma = parse_f32(val, "invalid max_luma value (must be float)")?;
-            } else if let Some(val) =
-                part.strip_prefix("content_brightness=").or_else(|| part.strip_prefix("cb="))
+            } else if let Some(val) = part
+                .strip_prefix("content_brightness=")
+                .or_else(|| part.strip_prefix("content-brightness="))
+                .or_else(|| part.strip_prefix("contentbrightness="))
+                .or_else(|| part.strip_prefix("cb="))
             {
                 config.content_brightness =
                     Some(parse_f32(val, "invalid content_brightness value (must be float)")?);
             } else if let Some(val) = part
                 .strip_prefix("display_max_brightness=")
+                .or_else(|| part.strip_prefix("display-max-brightness="))
+                .or_else(|| part.strip_prefix("displaymaxbrightness="))
                 .or_else(|| part.strip_prefix("display_nits="))
+                .or_else(|| part.strip_prefix("display-nits="))
+                .or_else(|| part.strip_prefix("display_brightness="))
             {
                 config.display_max_brightness =
                     parse_f32(val, "invalid display_max_brightness value (must be float)")?;
             // --- Filmic Spline parameters ---
-            } else if let Some(val) = part.strip_prefix("fs_output_power=") {
+            } else if let Some(val) = part
+                .strip_prefix("fs_output_power=")
+                .or_else(|| part.strip_prefix("fs-output-power="))
+            {
                 config.filmic_spline.output_power =
                     parse_f32(val, "invalid fs_output_power value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_latitude=") {
+            } else if let Some(val) =
+                part.strip_prefix("fs_latitude=").or_else(|| part.strip_prefix("fs-latitude="))
+            {
                 config.filmic_spline.latitude =
                     parse_f32(val, "invalid fs_latitude value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_white_source=") {
+            } else if let Some(val) = part
+                .strip_prefix("fs_white_source=")
+                .or_else(|| part.strip_prefix("fs_white_point_source="))
+                .or_else(|| part.strip_prefix("fs-white-source="))
+                .or_else(|| part.strip_prefix("fs-white-point-source="))
+            {
                 config.filmic_spline.white_point_source =
                     parse_f32(val, "invalid fs_white_source value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_black_source=") {
+            } else if let Some(val) = part
+                .strip_prefix("fs_black_source=")
+                .or_else(|| part.strip_prefix("fs_black_point_source="))
+                .or_else(|| part.strip_prefix("fs-black-source="))
+                .or_else(|| part.strip_prefix("fs-black-point-source="))
+            {
                 config.filmic_spline.black_point_source =
                     parse_f32(val, "invalid fs_black_source value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_contrast=") {
+            } else if let Some(val) =
+                part.strip_prefix("fs_contrast=").or_else(|| part.strip_prefix("fs-contrast="))
+            {
                 config.filmic_spline.contrast =
                     parse_f32(val, "invalid fs_contrast value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_black_target=") {
+            } else if let Some(val) = part
+                .strip_prefix("fs_black_target=")
+                .or_else(|| part.strip_prefix("fs_black_point_target="))
+                .or_else(|| part.strip_prefix("fs-black-target="))
+                .or_else(|| part.strip_prefix("fs-black-point-target="))
+            {
                 config.filmic_spline.black_point_target =
                     parse_f32(val, "invalid fs_black_target value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_grey_target=") {
+            } else if let Some(val) = part
+                .strip_prefix("fs_grey_target=")
+                .or_else(|| part.strip_prefix("fs_gray_target="))
+                .or_else(|| part.strip_prefix("fs_grey_point_target="))
+                .or_else(|| part.strip_prefix("fs_gray_point_target="))
+                .or_else(|| part.strip_prefix("fs-grey-target="))
+                .or_else(|| part.strip_prefix("fs-gray-target="))
+            {
                 config.filmic_spline.grey_point_target =
                     parse_f32(val, "invalid fs_grey_target value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_white_target=") {
+            } else if let Some(val) = part
+                .strip_prefix("fs_white_target=")
+                .or_else(|| part.strip_prefix("fs_white_point_target="))
+                .or_else(|| part.strip_prefix("fs-white-target="))
+                .or_else(|| part.strip_prefix("fs-white-point-target="))
+            {
                 config.filmic_spline.white_point_target =
                     parse_f32(val, "invalid fs_white_target value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_balance=") {
+            } else if let Some(val) =
+                part.strip_prefix("fs_balance=").or_else(|| part.strip_prefix("fs-balance="))
+            {
                 config.filmic_spline.balance =
                     parse_f32(val, "invalid fs_balance value (must be float)")?;
-            } else if let Some(val) = part.strip_prefix("fs_saturation=") {
+            } else if let Some(val) =
+                part.strip_prefix("fs_saturation=").or_else(|| part.strip_prefix("fs-saturation="))
+            {
                 config.filmic_spline.saturation =
                     parse_f32(val, "invalid fs_saturation value (must be float)")?;
             // --- Agx look & custom overrides ---
-            } else if let Some(val) = part.strip_prefix("agx_look=") {
-                config.agx_look = val.to_lowercase();
-            } else if let Some(val) = part.strip_prefix("agx_slope=") {
+            } else if let Some(val) =
+                part.strip_prefix("agx_look=").or_else(|| part.strip_prefix("agx-look="))
+            {
+                config.agx_look = val.to_lowercase().replace('-', "_");
+            } else if let Some(val) =
+                part.strip_prefix("agx_slope=").or_else(|| part.strip_prefix("agx-slope="))
+            {
                 config.agx_custom.slope = parse_rgb3(val, "invalid agx_slope value")?;
-            } else if let Some(val) = part.strip_prefix("agx_power=") {
+                custom_agx_specified = true;
+            } else if let Some(val) =
+                part.strip_prefix("agx_power=").or_else(|| part.strip_prefix("agx-power="))
+            {
                 config.agx_custom.power = parse_rgb3(val, "invalid agx_power value")?;
-            } else if let Some(val) = part.strip_prefix("agx_saturation=") {
+                custom_agx_specified = true;
+            } else if let Some(val) = part
+                .strip_prefix("agx_saturation=")
+                .or_else(|| part.strip_prefix("agx-saturation="))
+            {
                 config.agx_custom.saturation = parse_rgb3(val, "invalid agx_saturation value")?;
-            } else if let Some(val) = part.strip_prefix("agx_offset=") {
+                custom_agx_specified = true;
+            } else if let Some(val) =
+                part.strip_prefix("agx_offset=").or_else(|| part.strip_prefix("agx-offset="))
+            {
                 config.agx_custom.offset = parse_rgb3(val, "invalid agx_offset value")?;
+                custom_agx_specified = true;
             } else {
                 return Err(ArgParseErr::with_msg(
                     "unknown tonemap parameter. Expected cicp, nits, tonemapping, exposure, colorspace, \
@@ -307,6 +412,10 @@ impl TonemapConfig {
                      fs_* (filmic spline), agx_look, agx_slope, agx_power, agx_saturation, or agx_offset",
                 ));
             }
+        }
+
+        if custom_agx_specified && config.agx_look == "default" {
+            config.agx_look = "custom".to_string();
         }
 
         // Sanity-check the most important numericals.
@@ -325,10 +434,11 @@ impl TonemapConfig {
             return Err(ArgParseErr::with_msg("max_luma must be positive and finite"));
         }
         if let Some(cb) = config.content_brightness
-            && (!cb.is_finite() || cb <= 0.0)
-        {
-            return Err(ArgParseErr::with_msg("content_brightness must be positive and finite"));
-        }
+            && (!cb.is_finite() || cb <= 0.0) {
+                return Err(ArgParseErr::with_msg(
+                    "content_brightness must be positive and finite",
+                ));
+            }
         // Filmic-spline and AgX knobs feed straight into gainforge, so range-check
         // them here too rather than trusting the mapper to handle garbage.
         config.filmic_spline.validate()?;
@@ -347,7 +457,7 @@ fn parse_f32(val: &str, err_label: &'static str) -> Result<f32, ArgParseErr> {
 
 /// Parse a 3-tuple either as a broadcast `v` or as `r:g:b`.
 fn parse_rgb3(val: &str, err_label: &'static str) -> Result<[f32; 3], ArgParseErr> {
-    let pieces: Vec<&str> = val.split(':').collect();
+    let pieces: Vec<&str> = val.split([':', '/', 'x']).collect();
     match pieces.len() {
         1 => {
             let v = parse_f32(pieces[0], err_label)?;
@@ -397,10 +507,10 @@ fn validate_cicp_arg(cicp: [u8; 4]) -> Result<(), ArgParseErr> {
     }
     // Only the primaries/transfer pairs handled by get_color_profile are valid.
     match (cicp[0], cicp[1]) {
-        (9, 16) | (9, 18) | (1, 13) | (12, 16) => Ok(()),
+        (9, 16) | (9, 18) | (1, 13) | (12, 16) | (12, 13) => Ok(()),
         _ => Err(ArgParseErr::with_msg(
             "unsupported cICP primaries/transfer. Supported: 9-16 (BT.2020 PQ), \
-             9-18 (BT.2020 HLG), 12-16 (Display P3 PQ), 1-13 (sRGB)",
+             9-18 (BT.2020 HLG), 12-16 (Display P3 PQ), 12-13 (Display P3), 1-13 (sRGB)",
         )),
     }
 }
@@ -424,6 +534,8 @@ enum GrayKind {
     La8,
     L16,
     La16,
+    L32F,
+    La32F,
 }
 
 // -----------------------------------------------------------------------------
@@ -452,11 +564,12 @@ fn get_color_profile(cicp: [u8; 4]) -> Result<ColorProfile, MagickError> {
         (9, 18) => Ok(ColorProfile::new_bt2020_hlg()),
         (1, 13) => Ok(ColorProfile::new_srgb()),
         (12, 16) => Ok(ColorProfile::new_display_p3_pq()),
+        (12, 13) => Ok(ColorProfile::new_display_p3()),
         // TODO: moxcms 0.8 ships no ready-made Display P3 HLG profile. Build one via
         // ColorProfile::new_from_cicp once we map raw cICP bytes to the moxcms CICP enums.
         (12, 18) => Err(wm_err!("Display P3 + HLG (cICP 12-18) is not supported yet")),
         _ => Err(wm_err!(
-            "Unsupported cICP profile: primaries={}, transfer={}. Common: 9-16 (BT.2020 PQ), 9-18 (BT.2020 HLG), 12-16 (Display P3 PQ), 1-13 (sRGB)",
+            "Unsupported cICP profile: primaries={}, transfer={}. Common: 9-16 (BT.2020 PQ), 9-18 (BT.2020 HLG), 12-16 (Display P3 PQ), 12-13 (Display P3), 1-13 (sRGB)",
             cicp[0],
             cicp[1]
         )),
@@ -469,6 +582,9 @@ fn get_color_profile(cicp: [u8; 4]) -> Result<ColorProfile, MagickError> {
 /// channels are colour (1 for luma, 3 for RGB). Alpha is always full range in
 /// PNG, so trailing channels beyond `color_channels` are left untouched.
 fn expand_narrow_lane_u8(data: &mut [u8], channels: usize, color_channels: usize) {
+    if channels == 0 || color_channels == 0 || channels < color_channels {
+        return;
+    }
     for px in data.chunks_exact_mut(channels) {
         for v in px[..color_channels].iter_mut() {
             let x = (i32::from(*v) - 16).clamp(0, 219) as u32;
@@ -480,10 +596,26 @@ fn expand_narrow_lane_u8(data: &mut [u8], channels: usize, color_channels: usize
 fn expand_narrow_lane_u16(data: &mut [u16], channels: usize, color_channels: usize) {
     const LO: i32 = 16 << 8; // 4096
     const SPAN: u64 = 219 << 8; // 56064
+    if channels == 0 || color_channels == 0 || channels < color_channels {
+        return;
+    }
     for px in data.chunks_exact_mut(channels) {
         for v in px[..color_channels].iter_mut() {
             let x = (i32::from(*v) - LO).clamp(0, SPAN as i32) as u64;
             *v = ((x * 65535 + SPAN / 2) / SPAN) as u16;
+        }
+    }
+}
+
+fn expand_narrow_lane_f32(data: &mut [f32], channels: usize, color_channels: usize) {
+    const LO: f32 = 16.0 / 255.0;
+    const SPAN: f32 = 219.0 / 255.0;
+    if channels == 0 || color_channels == 0 || channels < color_channels {
+        return;
+    }
+    for px in data.chunks_exact_mut(channels) {
+        for v in px[..color_channels].iter_mut() {
+            *v = ((*v - LO) / SPAN).clamp(0.0, 1.0);
         }
     }
 }
@@ -498,6 +630,10 @@ fn expand_narrow_range(image: &mut Image) -> Result<(), MagickError> {
         DynamicImage::ImageRgba16(buf) => expand_narrow_lane_u16(buf, 4, 3),
         DynamicImage::ImageLuma16(buf) => expand_narrow_lane_u16(buf, 1, 1),
         DynamicImage::ImageLumaA16(buf) => expand_narrow_lane_u16(buf, 2, 1),
+        DynamicImage::ImageRgb32F(buf) => expand_narrow_lane_f32(buf, 3, 3),
+        DynamicImage::ImageRgba32F(buf) => expand_narrow_lane_f32(buf, 4, 3),
+        DynamicImage::ImageLuma32F(buf) => expand_narrow_lane_f32(buf, 1, 1),
+        DynamicImage::ImageLumaA32F(buf) => expand_narrow_lane_f32(buf, 2, 1),
         _ => return Err(wm_err!("narrow range expansion is not supported for this pixel format")),
     }
     Ok(())
@@ -513,6 +649,9 @@ fn map_rows<T: Copy + Default>(
     row_len: usize,
     mut lane: impl FnMut(&[T], &mut [T]) -> Result<(), ForgeError>,
 ) -> Result<Vec<T>, MagickError> {
+    if row_len == 0 || src.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut dst = vec![T::default(); src.len()];
     for (y, (src_row, dst_row)) in
         src.chunks_exact(row_len).zip(dst.chunks_exact_mut(row_len)).enumerate()
@@ -534,9 +673,17 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
         expand_narrow_range(image)?;
     }
 
-    // sRGB-tagged input is already SDR; nothing useful to do. (Grayscale stays
-    // grayscale here because we never touch image.pixels on this path.)
-    if cicp[1] == 13 {
+    // sRGB-tagged input with default broadcast settings is already standard SDR;
+    // nothing useful to do unless custom exposure, gamut clipping, or tone curves are requested.
+    let is_default_curve =
+        matches!(config.method.as_str(), "itu2408" | "rec2408" | "bt2408" | "default");
+    let is_noclip = matches!(config.gamut_clipping.as_str(), "noclip" | "none" | "off" | "false");
+    if cicp[0] == 1
+        && cicp[1] == 13
+        && (config.exposure - 1.0).abs() < f32::EPSILON
+        && is_default_curve
+        && is_noclip
+    {
         return Ok(());
     }
 
@@ -655,6 +802,8 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
         DynamicImage::ImageLumaA8(_) => Some(GrayKind::La8),
         DynamicImage::ImageLuma16(_) => Some(GrayKind::L16),
         DynamicImage::ImageLumaA16(_) => Some(GrayKind::La16),
+        DynamicImage::ImageLuma32F(_) => Some(GrayKind::L32F),
+        DynamicImage::ImageLumaA32F(_) => Some(GrayKind::La32F),
         _ => None,
     };
 
@@ -666,6 +815,8 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
         Some(GrayKind::La8) => Cow::Owned(DynamicImage::ImageRgba8(image.pixels.to_rgba8())),
         Some(GrayKind::L16) => Cow::Owned(DynamicImage::ImageRgb16(image.pixels.to_rgb16())),
         Some(GrayKind::La16) => Cow::Owned(DynamicImage::ImageRgba16(image.pixels.to_rgba16())),
+        Some(GrayKind::L32F) => Cow::Owned(DynamicImage::ImageRgb32F(image.pixels.to_rgb32f())),
+        Some(GrayKind::La32F) => Cow::Owned(DynamicImage::ImageRgba32F(image.pixels.to_rgba32f())),
     };
 
     // --- 4. Tone-map at the native bit depth of the image -------------------
@@ -815,6 +966,8 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
         Some(GrayKind::La8) => DynamicImage::ImageLumaA8(mapped_rgb.to_luma_alpha8()),
         Some(GrayKind::L16) => DynamicImage::ImageLuma16(mapped_rgb.to_luma16()),
         Some(GrayKind::La16) => DynamicImage::ImageLumaA16(mapped_rgb.to_luma_alpha16()),
+        Some(GrayKind::L32F) => DynamicImage::ImageLuma32F(mapped_rgb.to_luma32f()),
+        Some(GrayKind::La32F) => DynamicImage::ImageLumaA32F(mapped_rgb.to_luma_alpha32f()),
     };
 
     image.pixels = mapped;
@@ -834,7 +987,7 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
 
 fn build_agx_look(config: &TonemapConfig) -> Result<AgxLook, MagickError> {
     let look = match config.agx_look.as_str() {
-        "" | "default" => AgxLook::Agx,
+        "" | "default" | "agx" | "ag_x" | "none" => AgxLook::Agx,
         "punchy" => AgxLook::Punchy,
         "golden" => AgxLook::Golden,
 
