@@ -7,6 +7,7 @@ use gainforge::{
 };
 use image::{DynamicImage, ImageBuffer, Rgb as ImgRgb, RgbImage, Rgba as ImgRgba, RgbaImage};
 use moxcms::{ColorProfile, Rgb};
+use rayon::prelude::*;
 use std::borrow::Cow;
 
 // -----------------------------------------------------------------------------
@@ -227,8 +228,7 @@ impl TonemapConfig {
                         || val.contains('-')
                         || val.contains('_')
                     {
-                        let pieces: Vec<&str> =
-                            val.split([':', '/', '-', '_']).collect();
+                        let pieces: Vec<&str> = val.split([':', '/', '-', '_']).collect();
                         if pieces.len() != 4 {
                             return Err(ArgParseErr::with_msg("cicp requires 4 values"));
                         }
@@ -434,11 +434,10 @@ impl TonemapConfig {
             return Err(ArgParseErr::with_msg("max_luma must be positive and finite"));
         }
         if let Some(cb) = config.content_brightness
-            && (!cb.is_finite() || cb <= 0.0) {
-                return Err(ArgParseErr::with_msg(
-                    "content_brightness must be positive and finite",
-                ));
-            }
+            && (!cb.is_finite() || cb <= 0.0)
+        {
+            return Err(ArgParseErr::with_msg("content_brightness must be positive and finite"));
+        }
         // Filmic-spline and AgX knobs feed straight into gainforge, so range-check
         // them here too rather than trusting the mapper to handle garbage.
         config.filmic_spline.validate()?;
@@ -643,21 +642,20 @@ fn expand_narrow_range(image: &mut Image) -> Result<(), MagickError> {
 // Tone-mapping core
 // -----------------------------------------------------------------------------
 
-/// Runs a gainforge tone mapper row by row over an interleaved pixel buffer.
-fn map_rows<T: Copy + Default>(
+fn map_rows<T: Copy + Default + Send + Sync>(
     src: &[T],
     row_len: usize,
-    mut lane: impl FnMut(&[T], &mut [T]) -> Result<(), ForgeError>,
+    lane: impl Fn(&[T], &mut [T]) -> Result<(), ForgeError> + Sync + Send,
 ) -> Result<Vec<T>, MagickError> {
     if row_len == 0 || src.is_empty() {
         return Ok(Vec::new());
     }
     let mut dst = vec![T::default(); src.len()];
-    for (y, (src_row, dst_row)) in
-        src.chunks_exact(row_len).zip(dst.chunks_exact_mut(row_len)).enumerate()
-    {
-        lane(src_row, dst_row).map_err(|e| wm_err!("Tone mapping failed on row {}: {}", y, e))?;
-    }
+    src.par_chunks_exact(row_len).zip(dst.par_chunks_exact_mut(row_len)).enumerate().try_for_each(
+        |(y, (src_row, dst_row))| {
+            lane(src_row, dst_row).map_err(|e| wm_err!("Tone mapping failed on row {}: {}", y, e))
+        },
+    )?;
     Ok(dst)
 }
 
