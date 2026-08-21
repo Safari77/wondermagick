@@ -442,6 +442,8 @@ pub enum CanvasSpec {
         points: u32,
         /// Interpolate across each triangle instead of flat-filling it.
         smooth: bool,
+        /// 2x2 Super-sample anti-aliasing to smooth inter-facet edges.
+        supersampling: bool,
         colors: Option<Vec<[u16; 4]>>,
     },
     /// Fractal flame: an iterated function system rendered through a
@@ -940,11 +942,12 @@ impl CanvasConfig {
                 if easing.is_some() {
                     return Err(ArgParseErr::with_msg(
                         "canvas lowpoly: unknown or repeated option (expected 'seed:N', \
-                         'points:N', 'smooth')",
+                         'points:N', 'smooth', 'supersampling')",
                     ));
                 }
                 let mut tok = SpecTokens::split(&remaining[1..]);
                 let smooth = tok.flag("smooth");
+                let supersampling = tok.flag("supersampling");
                 let seed = opt_seed(tok.take("seed"))?;
                 let points = opt_u32(
                     tok.take("points"),
@@ -959,9 +962,9 @@ impl CanvasConfig {
                 )?;
                 tok.finish(
                     "canvas lowpoly: unknown or repeated option (expected 'seed:N', \
-                     'points:N', 'smooth')",
+                     'points:N', 'smooth', 'supersampling')",
                 )?;
-                CanvasSpec::LowPoly { seed, points, smooth, colors }
+                CanvasSpec::LowPoly { seed, points, smooth, supersampling, colors }
             }
             "flame" => {
                 if easing.is_some() {
@@ -2211,8 +2214,56 @@ fn render_flow(
     });
 }
 
+/// Downsamples a 2x2 super-sampled buffer into the target buffer using a box filter.
+#[inline]
+fn downsample_2x2(ss_buf: &[u16], buf: &mut [u16], width: u32, _height: u32, ss_width: usize) {
+    let row_len = (width as usize) * 4;
+    let ss_row_stride = ss_width * 4;
+
+    buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+        let top_row_idx = (y * 2) * ss_row_stride;
+        let bot_row_idx = (y * 2 + 1) * ss_row_stride;
+
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let o0 = top_row_idx + (x * 2) * 4;
+            let o1 = top_row_idx + (x * 2 + 1) * 4;
+            let o2 = bot_row_idx + (x * 2) * 4;
+            let o3 = bot_row_idx + (x * 2 + 1) * 4;
+
+            // Integer 4-pixel average with rounding (+2)
+            let r =
+                (ss_buf[o0] as u32 + ss_buf[o1] as u32 + ss_buf[o2] as u32 + ss_buf[o3] as u32 + 2)
+                    >> 2;
+            let g = (ss_buf[o0 + 1] as u32
+                + ss_buf[o1 + 1] as u32
+                + ss_buf[o2 + 1] as u32
+                + ss_buf[o3 + 1] as u32
+                + 2)
+                >> 2;
+            let b = (ss_buf[o0 + 2] as u32
+                + ss_buf[o1 + 2] as u32
+                + ss_buf[o2 + 2] as u32
+                + ss_buf[o3 + 2] as u32
+                + 2)
+                >> 2;
+            let a = (ss_buf[o0 + 3] as u32
+                + ss_buf[o1 + 3] as u32
+                + ss_buf[o2 + 3] as u32
+                + ss_buf[o3 + 3] as u32
+                + 2)
+                >> 2;
+
+            px[0] = r as u16;
+            px[1] = g as u16;
+            px[2] = b as u16;
+            px[3] = a as u16;
+        }
+    });
+}
+
 /// Low-poly facets: a Delaunay triangulation of jittered points, each triangle
-/// filled from a smooth underlying color field.
+/// filled from a smooth underlying color field. When `supersampling` is true,
+/// rasterizes at 2x2 resolution and downsamples with a box filter.
 fn render_lowpoly(
     buf: &mut [u16],
     width: u32,
@@ -2220,9 +2271,17 @@ fn render_lowpoly(
     seed: u64,
     points: u32,
     smooth: bool,
+    supersampling: bool,
     palette: &[(Oklab, f32)],
 ) {
-    let (w, h) = (width as f64, height as f64);
+    let (w, h) = if supersampling {
+        (width as f64 * 2.0, height as f64 * 2.0)
+    } else {
+        (width as f64, height as f64)
+    };
+    let target_w = if supersampling { width * 2 } else { width };
+    let target_h = if supersampling { height * 2 } else { height };
+
     let mut rng = SplitMix64::new(seed);
 
     // Interior points on a jittered grid. Uniform random points leave clumps
@@ -2291,13 +2350,19 @@ fn render_lowpoly(
     };
 
     let tri = triangulate(&pts);
-    let width_us = width as usize;
+    let target_w_us = target_w as usize;
+    let target_h_us = target_h as usize;
+
+    // Allocate a dedicated target buffer for super-sampling, or render directly into buf
+    let mut ss_buf =
+        if supersampling { vec![0u16; target_w_us * target_h_us * 4] } else { Vec::new() };
+    let raster_buf: &mut [u16] = if supersampling { &mut ss_buf } else { buf };
 
     // Collinear input degenerates to an empty triangulation; fall back to the
     // bare color field rather than leaving the canvas blank.
     if tri.triangles.is_empty() {
-        let row_len = width_us * 4;
-        buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
+        let row_len = target_w_us * 4;
+        raster_buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
             for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let rgb = oklab_to_rgb16(field(
                     (x as f64).algebraic_add(0.5),
@@ -2306,6 +2371,9 @@ fn render_lowpoly(
                 px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], u16::MAX]);
             }
         });
+        if supersampling {
+            downsample_2x2(&ss_buf, buf, width, height, target_w_us);
+        }
         return;
     }
 
@@ -2342,9 +2410,9 @@ fn render_lowpoly(
         };
 
         let min_x = pa.x.min(pb.x).min(pc.x).floor().max(0.0) as usize;
-        let max_x = (pa.x.max(pb.x).max(pc.x).ceil() as i64).clamp(0, width as i64 - 1) as usize;
+        let max_x = (pa.x.max(pb.x).max(pc.x).ceil() as i64).clamp(0, target_w as i64 - 1) as usize;
         let min_y = pa.y.min(pb.y).min(pc.y).floor().max(0.0) as usize;
-        let max_y = (pa.y.max(pb.y).max(pc.y).ceil() as i64).clamp(0, height as i64 - 1) as usize;
+        let max_y = (pa.y.max(pb.y).max(pc.y).ceil() as i64).clamp(0, target_h as i64 - 1) as usize;
         if min_x > max_x || min_y > max_y {
             continue;
         }
@@ -2397,13 +2465,17 @@ fn render_lowpoly(
                 };
 
                 let rgb = oklab_to_rgb16(lab);
-                let o = (py * width_us + px_i) * 4;
-                buf[o] = rgb[0];
-                buf[o + 1] = rgb[1];
-                buf[o + 2] = rgb[2];
-                buf[o + 3] = u16::MAX;
+                let o = (py * target_w_us + px_i) * 4;
+                raster_buf[o] = rgb[0];
+                raster_buf[o + 1] = rgb[1];
+                raster_buf[o + 2] = rgb[2];
+                raster_buf[o + 3] = u16::MAX;
             }
         }
+    }
+
+    if supersampling {
+        downsample_2x2(&ss_buf, buf, width, height, target_w_us);
     }
 }
 
@@ -3026,11 +3098,20 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
                 &palette,
             );
         }
-        CanvasSpec::LowPoly { seed, points, smooth, colors } => {
+        CanvasSpec::LowPoly { seed, points, smooth, supersampling, colors } => {
             let actual_seed = resolve_seed(seed, "lowpoly");
             let mut rng = SplitMix64::new(actual_seed);
             let palette = resolve_palette(colors, 4, &mut rng);
-            render_lowpoly(&mut buf, width, height, actual_seed, *points, *smooth, &palette);
+            render_lowpoly(
+                &mut buf,
+                width,
+                height,
+                actual_seed,
+                *points,
+                *smooth,
+                *supersampling,
+                &palette,
+            );
         }
         CanvasSpec::Flame { seed, quality, transforms, gamma, continuous, colors } => {
             let actual_seed = resolve_seed(seed, "flame");
