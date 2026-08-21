@@ -139,6 +139,61 @@ impl CssEasing {
     }
 }
 
+/// Shared bilinear interpolation helper for 4 corner colors in Oklab space.
+#[inline]
+fn eval_bilinear_oklab(
+    top_left: (Oklab, f32),
+    top_right: (Oklab, f32),
+    bottom_left: (Oklab, f32),
+    bottom_right: (Oklab, f32),
+    u: f64,
+    v: f64,
+) -> [u16; 4] {
+    // Cast coordinates to f32 to match Oklab's internal precision
+    let u = u as f32;
+    let v = v as f32;
+
+    let u_inv = 1.0_f32.algebraic_sub(u);
+    let v_inv = 1.0_f32.algebraic_sub(v);
+
+    // Bilinear blend weights
+    let w00 = u_inv.algebraic_mul(v_inv);
+    let w10 = u.algebraic_mul(v_inv);
+    let w01 = u_inv.algebraic_mul(v);
+    let w11 = u.algebraic_mul(v);
+
+    // Blend Oklab color channels
+    let mixed_oklab = Oklab {
+        l: w00
+            .algebraic_mul(top_left.0.l)
+            .algebraic_add(w10.algebraic_mul(top_right.0.l))
+            .algebraic_add(w01.algebraic_mul(bottom_left.0.l))
+            .algebraic_add(w11.algebraic_mul(bottom_right.0.l)),
+        a: w00
+            .algebraic_mul(top_left.0.a)
+            .algebraic_add(w10.algebraic_mul(top_right.0.a))
+            .algebraic_add(w01.algebraic_mul(bottom_left.0.a))
+            .algebraic_add(w11.algebraic_mul(bottom_right.0.a)),
+        b: w00
+            .algebraic_mul(top_left.0.b)
+            .algebraic_add(w10.algebraic_mul(top_right.0.b))
+            .algebraic_add(w01.algebraic_mul(bottom_left.0.b))
+            .algebraic_add(w11.algebraic_mul(bottom_right.0.b)),
+    };
+
+    // Blend straight alpha channel
+    let mixed_alpha = w00
+        .algebraic_mul(top_left.1)
+        .algebraic_add(w10.algebraic_mul(top_right.1))
+        .algebraic_add(w01.algebraic_mul(bottom_left.1))
+        .algebraic_add(w11.algebraic_mul(bottom_right.1));
+
+    let rgb = oklab_to_rgb16(mixed_oklab);
+
+    // Return the RGB along with the calculated alpha
+    [rgb[0], rgb[1], rgb[2], mixed_alpha.round().clamp(0.0, MAX16) as u16]
+}
+
 /// Interpolates 4 corner colors using Bilinear interpolation in Oklab space.
 /// The `f32` beside each `Oklab` is straight alpha on the 16-bit scale
 /// (0.0 = transparent, 65535.0 = opaque).
@@ -153,32 +208,7 @@ pub struct MeshColors {
 impl MeshColors {
     #[inline]
     pub fn eval_color(&self, u: f64, v: f64) -> [u16; 4] {
-        // Cast coordinates to f32 to match Oklab's internal precision
-        let u = u as f32;
-        let v = v as f32;
-
-        let u_inv = 1.0 - u;
-        let v_inv = 1.0 - v;
-
-        let w00 = u_inv * v_inv;
-        let w10 = u * v_inv;
-        let w01 = u_inv * v;
-        let w11 = u * v;
-
-        // Blend Oklab color channels
-        let mixed_oklab = Oklab {
-            l: w00 * self.tl.0.l + w10 * self.tr.0.l + w01 * self.bl.0.l + w11 * self.br.0.l,
-            a: w00 * self.tl.0.a + w10 * self.tr.0.a + w01 * self.bl.0.a + w11 * self.br.0.a,
-            b: w00 * self.tl.0.b + w10 * self.tr.0.b + w01 * self.bl.0.b + w11 * self.br.0.b,
-        };
-
-        // Blend straight alpha channel
-        let mixed_alpha = w00 * self.tl.1 + w10 * self.tr.1 + w01 * self.bl.1 + w11 * self.br.1;
-
-        let rgb = oklab_to_rgb16(mixed_oklab);
-
-        // Return the RGB along with the calculated alpha
-        [rgb[0], rgb[1], rgb[2], mixed_alpha.round().clamp(0.0, MAX16) as u16]
+        eval_bilinear_oklab(self.tl, self.tr, self.bl, self.br, u, v)
     }
 }
 
@@ -291,45 +321,14 @@ pub struct PatchColors {
 impl PatchColors {
     #[inline]
     pub fn eval_color(&self, u: f64, v: f64) -> [u16; 4] {
-        // Cast coordinates to f32 to match Oklab's internal precision
-        let u = u as f32;
-        let v = v as f32;
-
-        let u_inv = 1.0 - u;
-        let v_inv = 1.0 - v;
-
-        // Bilinear blend weights
-        let w00 = u_inv * v_inv;
-        let w10 = u * v_inv;
-        let w01 = u_inv * v;
-        let w11 = u * v;
-
-        // Blend Oklab color channels
-        let mixed_oklab = Oklab {
-            l: w00 * self.top_left.0.l
-                + w10 * self.top_right.0.l
-                + w01 * self.bottom_left.0.l
-                + w11 * self.bottom_right.0.l,
-            a: w00 * self.top_left.0.a
-                + w10 * self.top_right.0.a
-                + w01 * self.bottom_left.0.a
-                + w11 * self.bottom_right.0.a,
-            b: w00 * self.top_left.0.b
-                + w10 * self.top_right.0.b
-                + w01 * self.bottom_left.0.b
-                + w11 * self.bottom_right.0.b,
-        };
-
-        // Blend straight alpha channel
-        let mixed_alpha = w00 * self.top_left.1
-            + w10 * self.top_right.1
-            + w01 * self.bottom_left.1
-            + w11 * self.bottom_right.1;
-
-        let rgb = oklab_to_rgb16(mixed_oklab);
-
-        // Return the RGB along with the calculated alpha
-        [rgb[0], rgb[1], rgb[2], mixed_alpha.round().clamp(0.0, MAX16) as u16]
+        eval_bilinear_oklab(
+            self.top_left,
+            self.top_right,
+            self.bottom_left,
+            self.bottom_right,
+            u,
+            v,
+        )
     }
 }
 
@@ -1728,10 +1727,15 @@ fn random_seed() -> u64 {
 /// makes sense.
 #[inline]
 fn bezier1d(y0: f64, y1: f64, y2: f64, y3: f64, t: f64) -> f64 {
-    let it = 1.0 - t;
-    let it2 = it * it;
-    let t2 = t * t;
-    it2 * it * y0 + 3.0 * it2 * t * y1 + 3.0 * it * t2 * y2 + t2 * t * y3
+    let it = 1.0_f64.algebraic_sub(t);
+    let it2 = it.algebraic_mul(it);
+    let t2 = t.algebraic_mul(t);
+
+    it2.algebraic_mul(it)
+        .algebraic_mul(y0)
+        .algebraic_add(3.0_f64.algebraic_mul(it2).algebraic_mul(t).algebraic_mul(y1))
+        .algebraic_add(3.0_f64.algebraic_mul(it).algebraic_mul(t2).algebraic_mul(y2))
+        .algebraic_add(t2.algebraic_mul(t).algebraic_mul(y3))
 }
 
 /// Pre-computed 2D scalar field that drives the Coons canvas transparency.
@@ -1822,21 +1826,21 @@ impl TransparencyField {
         // the sqrt to a single call at the end.
         let mut min_d2 = f64::INFINITY;
         for sp in self.spine_a.iter().chain(self.spine_b.iter()) {
-            let dx = x - sp.x;
-            let dy = y - sp.y;
-            let d2 = dx * dx + dy * dy;
+            let dx = x.algebraic_sub(sp.x);
+            let dy = y.algebraic_sub(sp.y);
+            let d2 = dx.algebraic_mul(dx).algebraic_add(dy.algebraic_mul(dy));
             if d2 < min_d2 {
                 min_d2 = d2;
             }
         }
 
         let d = min_d2.sqrt();
-        let d_norm = (d * self.inv_max_dist).clamp(0.0, 1.0);
+        let d_norm = (d.algebraic_mul(self.inv_max_dist)).clamp(0.0, 1.0);
 
         let shaped = bezier1d(self.shape[0], self.shape[1], self.shape[2], self.shape[3], d_norm)
             .clamp(0.0, 1.0);
 
-        self.t_min + shaped * (self.t_max - self.t_min)
+        self.t_min.algebraic_add(shaped.algebraic_mul(self.t_max.algebraic_sub(self.t_min)))
     }
 }
 
@@ -1904,9 +1908,14 @@ fn render_voronoi(
                 let (cx, cy) = (gx + ox, gy + oy);
                 let h = hash2d(cx, cy, seed);
                 let (jx, jy) = hash_unit2(h);
-                let dx = (cx as f64 + jx) * cell - pxf;
-                let dy = (cy as f64 + jy) * cell - py;
-                ((dx * dx + dy * dy).sqrt() * inv_cell, h)
+                let dx = (cx as f64).algebraic_add(jx).algebraic_mul(cell).algebraic_sub(pxf);
+                let dy = (cy as f64).algebraic_add(jy).algebraic_mul(cell).algebraic_sub(py);
+                (
+                    (dx.algebraic_mul(dx).algebraic_add(dy.algebraic_mul(dy)))
+                        .sqrt()
+                        .algebraic_mul(inv_cell),
+                    h,
+                )
             };
 
             // The palette index uses the low hash bits, which are
@@ -1958,20 +1967,23 @@ fn render_voronoi(
                         // support radius, so a cell's contribution fades
                         // out smoothly instead of being cut off at the
                         // edge of the search block.
-                        let t = d * (1.0 / BLOB_SUPPORT);
-                        let window = 1.0 - t * t;
-                        let window = window * window * window;
+                        let t = d.algebraic_mul(1.0 / BLOB_SUPPORT);
+                        let t2 = t.algebraic_mul(t);
+                        let window_base = 1.0_f64.algebraic_sub(t2);
+                        let window =
+                            window_base.algebraic_mul(window_base).algebraic_mul(window_base);
                         // Offsetting by d_min keeps exp() off its
                         // underflow floor; it is a common factor across
                         // every weight, so it cancels in the normalization
                         // and cannot affect the result.
-                        let w = (-(d - d_min) * falloff).exp() * window;
+                        let w = (-(d - d_min) * falloff).exp().algebraic_mul(window);
                         let c = palette[(h & 0xFFF) as usize % pal_n];
-                        l += w * c.0.l as f64;
-                        a += w * c.0.a as f64;
-                        b += w * c.0.b as f64;
-                        al += w * c.1 as f64;
-                        wsum += w;
+
+                        l = l.algebraic_add(w.algebraic_mul(c.0.l as f64));
+                        a = a.algebraic_add(w.algebraic_mul(c.0.a as f64));
+                        b = b.algebraic_add(w.algebraic_mul(c.0.b as f64));
+                        al = al.algebraic_add(w.algebraic_mul(c.1 as f64));
+                        wsum = wsum.algebraic_add(w);
                     }
 
                     if wsum > 1e-12 {
@@ -2063,19 +2075,21 @@ fn splat(acc: &mut [[f32; 4]], width: u32, height: u32, x: f64, y: f64, c: Oklab
     if a <= 0.0 {
         return;
     }
-    let fx = x - 0.5;
-    let fy = y - 0.5;
+    let fx = x.algebraic_sub(0.5);
+    let fy = y.algebraic_sub(0.5);
     let bx = fx.floor();
     let by = fy.floor();
-    let tx = (fx - bx) as f32;
-    let ty = (fy - by) as f32;
+    let tx = (fx.algebraic_sub(bx)) as f32;
+    let ty = (fy.algebraic_sub(by)) as f32;
     let x0 = bx as i64;
     let y0 = by as i64;
+    let one_tx = 1.0_f32.algebraic_sub(tx);
+    let one_ty = 1.0_f32.algebraic_sub(ty);
     let corners = [
-        (0_i64, 0_i64, (1.0 - tx) * (1.0 - ty)),
-        (1, 0, tx * (1.0 - ty)),
-        (0, 1, (1.0 - tx) * ty),
-        (1, 1, tx * ty),
+        (0_i64, 0_i64, one_tx.algebraic_mul(one_ty)),
+        (1, 0, tx.algebraic_mul(one_ty)),
+        (0, 1, one_tx.algebraic_mul(ty)),
+        (1, 1, tx.algebraic_mul(ty)),
     ];
     for (dx, dy, wgt) in corners {
         let px = x0 + dx;
@@ -2083,15 +2097,15 @@ fn splat(acc: &mut [[f32; 4]], width: u32, height: u32, x: f64, y: f64, c: Oklab
         if px < 0 || py < 0 || px >= width as i64 || py >= height as i64 {
             continue;
         }
-        let cw = wgt * a;
+        let cw = wgt.algebraic_mul(a);
         if cw <= 0.0 {
             continue;
         }
         let cell = &mut acc[py as usize * width as usize + px as usize];
-        cell[0] += cw * c.l;
-        cell[1] += cw * c.a;
-        cell[2] += cw * c.b;
-        cell[3] += cw;
+        cell[0] = cell[0].algebraic_add(cw.algebraic_mul(c.l));
+        cell[1] = cell[1].algebraic_add(cw.algebraic_mul(c.a));
+        cell[2] = cell[2].algebraic_add(cw.algebraic_mul(c.b));
+        cell[3] = cell[3].algebraic_add(cw);
     }
 }
 
@@ -2214,9 +2228,9 @@ fn render_lowpoly(
     // Interior points on a jittered grid. Uniform random points leave clumps
     // and slivers; jittered grid points give evenly sized facets.
     let target = points.max(3) as f64;
-    let aspect = (w / h).max(1e-6);
-    let cols = ((target * aspect).sqrt().round() as usize).max(2);
-    let rows = ((target / aspect).sqrt().round() as usize).max(2);
+    let aspect = (w.algebraic_div(h)).max(1e-6);
+    let cols = ((target.algebraic_mul(aspect)).sqrt().round() as usize).max(2);
+    let rows = ((target.algebraic_div(aspect)).sqrt().round() as usize).max(2);
 
     let mut pts: Vec<DelaunayPoint> = Vec::with_capacity(cols * rows + 4 * (cols + rows) + 8);
     for gy in 0..rows {
@@ -2224,8 +2238,8 @@ fn render_lowpoly(
             let jx = rng.range(0.12, 0.88);
             let jy = rng.range(0.12, 0.88);
             pts.push(DelaunayPoint {
-                x: (gx as f64 + jx) / cols as f64 * w,
-                y: (gy as f64 + jy) / rows as f64 * h,
+                x: (gx as f64).algebraic_add(jx).algebraic_div(cols as f64).algebraic_mul(w),
+                y: (gy as f64).algebraic_add(jy).algebraic_div(rows as f64).algebraic_mul(h),
             });
         }
     }
@@ -2237,29 +2251,42 @@ fn render_lowpoly(
     let edge_x = cols.max(2);
     let edge_y = rows.max(2);
     for i in 0..=edge_x {
-        let t = i as f64 / edge_x as f64;
-        pts.push(DelaunayPoint { x: t * w, y: 0.0 });
-        pts.push(DelaunayPoint { x: t * w, y: h });
+        let t = (i as f64).algebraic_div(edge_x as f64);
+        pts.push(DelaunayPoint { x: t.algebraic_mul(w), y: 0.0 });
+        pts.push(DelaunayPoint { x: t.algebraic_mul(w), y: h });
     }
     for i in 1..edge_y {
-        let t = i as f64 / edge_y as f64;
-        pts.push(DelaunayPoint { x: 0.0, y: t * h });
-        pts.push(DelaunayPoint { x: w, y: t * h });
+        let t = (i as f64).algebraic_div(edge_y as f64);
+        pts.push(DelaunayPoint { x: 0.0, y: t.algebraic_mul(h) });
+        pts.push(DelaunayPoint { x: w, y: t.algebraic_mul(h) });
     }
 
     // Underlying color field: a bilinear Oklab blend of four palette entries,
     // so adjacent facets differ subtly instead of at random.
-    let corner = |i: usize| palette_sample(palette, i as f64 / 3.0).0;
+    let corner = |i: usize| palette_sample(palette, (i as f64).algebraic_div(3.0)).0;
     let (c_tl, c_tr, c_bl, c_br) = (corner(0), corner(1), corner(2), corner(3));
     let field = |x: f64, y: f64| -> Oklab {
-        let u = (x / w).clamp(0.0, 1.0) as f32;
-        let v = (y / h).clamp(0.0, 1.0) as f32;
-        let (ui, vi) = (1.0 - u, 1.0 - v);
-        let (w00, w10, w01, w11) = (ui * vi, u * vi, ui * v, u * v);
+        let u = (x.algebraic_div(w)).clamp(0.0, 1.0) as f32;
+        let v = (y.algebraic_div(h)).clamp(0.0, 1.0) as f32;
+        let (ui, vi) = (1.0_f32.algebraic_sub(u), 1.0_f32.algebraic_sub(v));
+        let (w00, w10, w01, w11) =
+            (ui.algebraic_mul(vi), u.algebraic_mul(vi), ui.algebraic_mul(v), u.algebraic_mul(v));
         Oklab {
-            l: w00 * c_tl.l + w10 * c_tr.l + w01 * c_bl.l + w11 * c_br.l,
-            a: w00 * c_tl.a + w10 * c_tr.a + w01 * c_bl.a + w11 * c_br.a,
-            b: w00 * c_tl.b + w10 * c_tr.b + w01 * c_bl.b + w11 * c_br.b,
+            l: w00
+                .algebraic_mul(c_tl.l)
+                .algebraic_add(w10.algebraic_mul(c_tr.l))
+                .algebraic_add(w01.algebraic_mul(c_bl.l))
+                .algebraic_add(w11.algebraic_mul(c_br.l)),
+            a: w00
+                .algebraic_mul(c_tl.a)
+                .algebraic_add(w10.algebraic_mul(c_tr.a))
+                .algebraic_add(w01.algebraic_mul(c_bl.a))
+                .algebraic_add(w11.algebraic_mul(c_br.a)),
+            b: w00
+                .algebraic_mul(c_tl.b)
+                .algebraic_add(w10.algebraic_mul(c_tr.b))
+                .algebraic_add(w01.algebraic_mul(c_bl.b))
+                .algebraic_add(w11.algebraic_mul(c_br.b)),
         }
     };
 
@@ -2272,7 +2299,10 @@ fn render_lowpoly(
         let row_len = width_us * 4;
         buf.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
             for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let rgb = oklab_to_rgb16(field(x as f64 + 0.5, y as f64 + 0.5));
+                let rgb = oklab_to_rgb16(field(
+                    (x as f64).algebraic_add(0.5),
+                    (y as f64).algebraic_add(0.5),
+                ));
                 px.copy_from_slice(&[rgb[0], rgb[1], rgb[2], u16::MAX]);
             }
         });
@@ -2286,19 +2316,23 @@ fn render_lowpoly(
 
         // Twice the signed area. Dividing the barycentric weights by it also
         // normalizes the winding, so the inside test works either way round.
-        let area2 = (pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x);
+        let area2 = (pb.x.algebraic_sub(pa.x))
+            .algebraic_mul(pc.y.algebraic_sub(pa.y))
+            .algebraic_sub((pb.y.algebraic_sub(pa.y)).algebraic_mul(pc.x.algebraic_sub(pa.x)));
         if area2.abs() < 1e-12 {
             continue;
         }
-        let inv_area = 1.0 / area2;
+        let inv_area = 1.0_f64.algebraic_div(area2);
 
         // Per-facet lightness offset, keyed off the triangle's own position so
         // it stays stable for a given seed. This is what sells the "faceted
         // 3-D surface" read; without it the mesh looks like a flat gradient.
-        let cx = (pa.x + pb.x + pc.x) / 3.0;
-        let cy = (pa.y + pb.y + pc.y) / 3.0;
-        let facet = (hash2d(cx as i64, cy as i64, seed) >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
-        let shade = facet * 0.09;
+        let cx = (pa.x.algebraic_add(pb.x).algebraic_add(pc.x)).algebraic_div(3.0);
+        let cy = (pa.y.algebraic_add(pb.y).algebraic_add(pc.y)).algebraic_div(3.0);
+        let facet = ((hash2d(cx as i64, cy as i64, seed) >> 40) as f32)
+            .algebraic_div((1u64 << 24) as f32)
+            .algebraic_sub(0.5);
+        let shade = facet.algebraic_mul(0.09);
 
         let (ca, cb, cc) = if smooth {
             (field(pa.x, pa.y), field(pb.x, pb.y), field(pc.x, pc.y))
@@ -2316,13 +2350,23 @@ fn render_lowpoly(
         }
 
         for py in min_y..=max_y {
-            let fy = py as f64 + 0.5;
+            let fy = (py as f64).algebraic_add(0.5);
             for px_i in min_x..=max_x {
-                let fx = px_i as f64 + 0.5;
+                let fx = (px_i as f64).algebraic_add(0.5);
                 // Barycentric weights: wb for B, wc for C, wa the remainder.
-                let wb = ((fx - pa.x) * (pc.y - pa.y) - (fy - pa.y) * (pc.x - pa.x)) * inv_area;
-                let wc = ((pb.x - pa.x) * (fy - pa.y) - (pb.y - pa.y) * (fx - pa.x)) * inv_area;
-                let wa = 1.0 - wb - wc;
+                let wb = ((fx.algebraic_sub(pa.x))
+                    .algebraic_mul(pc.y.algebraic_sub(pa.y))
+                    .algebraic_sub(
+                        (fy.algebraic_sub(pa.y)).algebraic_mul(pc.x.algebraic_sub(pa.x)),
+                    ))
+                .algebraic_mul(inv_area);
+                let wc = ((pb.x.algebraic_sub(pa.x))
+                    .algebraic_mul(fy.algebraic_sub(pa.y))
+                    .algebraic_sub(
+                        (pb.y.algebraic_sub(pa.y)).algebraic_mul(fx.algebraic_sub(pa.x)),
+                    ))
+                .algebraic_mul(inv_area);
+                let wa = 1.0_f64.algebraic_sub(wb).algebraic_sub(wc);
                 // A hair of slack on the edges: neighbouring triangles then
                 // overlap by a sliver instead of leaving a seam of unwritten
                 // pixels where the two tests disagree by a rounding error.
@@ -2333,12 +2377,23 @@ fn render_lowpoly(
                 let lab = if smooth {
                     let (fa, fb, fc) = (wa as f32, wb as f32, wc as f32);
                     Oklab {
-                        l: (ca.l * fa + cb.l * fb + cc.l * fc + shade).clamp(0.0, 1.0),
-                        a: ca.a * fa + cb.a * fb + cc.a * fc,
-                        b: ca.b * fa + cb.b * fc + cc.b * fb,
+                        l: (fa
+                            .algebraic_mul(ca.l)
+                            .algebraic_add(fb.algebraic_mul(cb.l))
+                            .algebraic_add(fc.algebraic_mul(cc.l))
+                            .algebraic_add(shade))
+                        .clamp(0.0, 1.0),
+                        a: fa
+                            .algebraic_mul(ca.a)
+                            .algebraic_add(fb.algebraic_mul(cb.a))
+                            .algebraic_add(fc.algebraic_mul(cc.a)),
+                        b: fa
+                            .algebraic_mul(ca.b)
+                            .algebraic_add(fb.algebraic_mul(cb.b))
+                            .algebraic_add(fc.algebraic_mul(cc.b)),
                     }
                 } else {
-                    Oklab { l: (ca.l + shade).clamp(0.0, 1.0), a: ca.a, b: ca.b }
+                    Oklab { l: (ca.l.algebraic_add(shade)).clamp(0.0, 1.0), a: ca.a, b: ca.b }
                 };
 
                 let rgb = oklab_to_rgb16(lab);
