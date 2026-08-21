@@ -81,15 +81,20 @@ impl CentroidsSoA {
 
 #[inline(always)]
 fn oklch_weighted_dist_soa_single(p: OkPt, soa: &CentroidsSoA, idx: usize) -> f32 {
-    let dl = p.l - soa.l[idx];
-    let dc = p.chroma - soa.chroma[idx];
-    let da = p.a - soa.a[idx];
-    let db = p.b - soa.b[idx];
-    let dh_sq = (da * da + db * db - dc * dc).max(0.0);
+    let dl = p.l.algebraic_sub(soa.l[idx]);
+    let dc = p.chroma.algebraic_sub(soa.chroma[idx]);
+    let da = p.a.algebraic_sub(soa.a[idx]);
+    let db = p.b.algebraic_sub(soa.b[idx]);
+    let dh_sq = (da.algebraic_mul(da))
+        .algebraic_add(db.algebraic_mul(db))
+        .algebraic_sub(dc.algebraic_mul(dc))
+        .max(0.0);
     // Perceptually balanced weights: 1.0 Lightness, 2.0 Chroma, 3.5 Hue.
     // Balances contrast preservation in light/dark areas while ensuring distinct
     // hue tints (e.g. subtle blues in dark/gray scenes) are not collapsed into gray.
-    (dl * dl * 1.0) + (dc * dc * 2.0) + (dh_sq * 3.5)
+    (dl.algebraic_mul(dl))
+        .algebraic_add(dc.algebraic_mul(dc).algebraic_mul(2.0))
+        .algebraic_add(dh_sq.algebraic_mul(3.5))
 }
 
 /// Parse an f32 that must be finite — NaN or ±inf in any of these parameters
@@ -796,11 +801,12 @@ fn generate_palette_rgb(pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]> {
         let mut changed = false;
         for (i, c) in centroids.iter_mut().enumerate() {
             if new_counts[i] > 0 {
-                let count = new_counts[i] as f32;
+                // Compute reciprocal once to avoid 3 separate hardware divisions
+                let inv_count = (1.0f32).algebraic_div(new_counts[i] as f32);
                 let new_c = [
-                    new_sums[i * 3] / count,
-                    new_sums[i * 3 + 1] / count,
-                    new_sums[i * 3 + 2] / count,
+                    new_sums[i * 3].algebraic_mul(inv_count),
+                    new_sums[i * 3 + 1].algebraic_mul(inv_count),
+                    new_sums[i * 3 + 2].algebraic_mul(inv_count),
                 ];
                 if (c[0] - new_c[0]).abs() > 0.5
                     || (c[1] - new_c[1]).abs() > 0.5
@@ -863,7 +869,7 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
 
     let compute_box_stats = |pixels: &[Oklab], start: usize, len: usize| -> McBox {
         let slice = &pixels[start..start + len];
-        let n = len as f32;
+        let inv_n = (1.0f32).algebraic_div(len as f32);
 
         let mut sum = [0.0f32; 3];
         for p in slice {
@@ -871,7 +877,8 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
             sum[1] = sum[1].algebraic_add(p.a);
             sum[2] = sum[2].algebraic_add(p.b);
         }
-        let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
+        let mean =
+            [sum[0].algebraic_mul(inv_n), sum[1].algebraic_mul(inv_n), sum[2].algebraic_mul(inv_n)];
 
         let mut var = [0.0f32; 3];
         for p in slice {
@@ -943,7 +950,7 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
         .par_iter()
         .map(|bx| {
             let slice = &oklab_pixels[bx.start..bx.start + bx.len];
-            let n = slice.len() as f64;
+            let inv_n = 1.0f64.algebraic_div(slice.len() as f64);
             let (sum_l, sum_a, sum_b) =
                 slice.iter().fold((0.0f64, 0.0f64, 0.0f64), |(sl, sa, sb), p| {
                     (
@@ -953,9 +960,9 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
                     )
                 });
             oklab_to_srgb_u8(Oklab {
-                l: (sum_l / n) as f32,
-                a: (sum_a / n) as f32,
-                b: (sum_b / n) as f32,
+                l: (sum_l.algebraic_mul(inv_n)) as f32,
+                a: (sum_a.algebraic_mul(inv_n)) as f32,
+                b: (sum_b.algebraic_mul(inv_n)) as f32,
             })
         })
         .collect()
@@ -1037,16 +1044,18 @@ fn generate_palette_oklab(
     let oklab_pts: Vec<OkPt> = oklab_pixels.par_iter().map(|&o| OkPt::from_oklab(o)).collect();
 
     // 1. Per-pixel weights: uniform base with optional linear chroma boost and highlight boost.
-    let chroma_multiplier = (sat_bias - 1.0).max(0.0);
+    let chroma_multiplier = (sat_bias.algebraic_sub(1.0)).max(0.0);
     let chromas: Vec<f32> = oklab_pts.iter().map(|p| p.chroma).collect();
     let mut weights: Vec<f32> = oklab_pixels
         .iter()
         .zip(chromas.iter())
         .map(|(p, &c)| {
-            let mut w = 1.0 + (c * chroma_multiplier);
+            let mut w = 1.0f32.algebraic_add(c.algebraic_mul(chroma_multiplier));
             if light_boost > 1.0 && p.l > 0.65 {
-                let l_norm = (p.l - 0.65) / 0.35;
-                w *= 1.0 + (light_boost - 1.0) * (l_norm * l_norm);
+                let l_norm = (p.l.algebraic_sub(0.65)).algebraic_div(0.35);
+                let boost_factor =
+                    (light_boost.algebraic_sub(1.0)).algebraic_mul(l_norm.algebraic_mul(l_norm));
+                w = w.algebraic_mul(1.0f32.algebraic_add(boost_factor));
             }
             w
         })
@@ -1056,7 +1065,8 @@ fn generate_palette_oklab(
     // Partitioning chromatic space into an 8x8x8 grid (512 bins) ensures that distinct
     // hue pockets (such as subtle blues in dark/gray scenes) are not smothered by massive
     // neutral gray clusters.
-    let eq_power = (0.35_f32).max(0.85 - 0.4 / light_boost.max(0.1));
+    let eq_power =
+        (0.35_f32).max(0.85f32.algebraic_sub((0.4f32).algebraic_div(light_boost.max(0.1))));
 
     let oklab_pixels_slice = &oklab_pixels[..n_unique];
     let weights_slice = &mut weights[..n_unique];
@@ -1066,59 +1076,80 @@ fn generate_palette_oklab(
     const L_BINS: usize = 16;
     let mut l_bin_weights = [0.0f32; L_BINS];
     for u in 0..n_unique {
-        let bin = ((oklab_pixels_slice[u].l * L_BINS as f32) as usize).min(L_BINS - 1);
-        let w = weights_slice[u] * (unique_counts_slice[u] as f32);
+        let bin = ((oklab_pixels_slice[u].l.algebraic_mul(L_BINS as f32)) as usize).min(L_BINS - 1);
+        let w = weights_slice[u].algebraic_mul(unique_counts_slice[u] as f32);
         l_bin_weights[bin] = l_bin_weights[bin].algebraic_add(w);
     }
     let active_l = l_bin_weights.iter().filter(|&&w| w > 0.0).count() as f32;
-    let avg_l = if active_l > 0.0 { l_bin_weights.iter().sum::<f32>() / active_l } else { 1.0 };
+    let avg_l = if active_l > 0.0 {
+        let sum_l = l_bin_weights.iter().copied().fold(0.0f32, |acc, x| acc.algebraic_add(x));
+        sum_l.algebraic_mul((1.0f32).algebraic_div(active_l))
+    } else {
+        1.0
+    };
 
     // --- 3D (L, a, b) Grid histogram (8x8x8 = 512 bins) ---
     let mut grid_weights = [0.0f32; 512];
     for u in 0..n_unique {
         let p = oklab_pixels_slice[u];
-        let l_bin = ((p.l * 8.0) as usize).min(7);
-        let a_bin = (((p.a + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
-        let b_bin = (((p.b + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
+        let l_bin = ((p.l.algebraic_mul(8.0)) as usize).min(7);
+        let a_bin = (((p.a.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
+        let b_bin = (((p.b.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
         let bin = (l_bin << 6) | (a_bin << 3) | b_bin;
-        let w = weights_slice[u] * (unique_counts_slice[u] as f32);
+        let w = weights_slice[u].algebraic_mul(unique_counts_slice[u] as f32);
         grid_weights[bin] = grid_weights[bin].algebraic_add(w);
     }
     let active_grid = grid_weights.iter().filter(|&&w| w > 0.0).count() as f32;
-    let avg_grid =
-        if active_grid > 0.0 { grid_weights.iter().sum::<f32>() / active_grid } else { 1.0 };
+    let avg_grid = if active_grid > 0.0 {
+        let sum_grid = grid_weights.iter().copied().fold(0.0f32, |acc, x| acc.algebraic_add(x));
+        sum_grid.algebraic_mul((1.0f32).algebraic_div(active_grid))
+    } else {
+        1.0
+    };
 
     // --- Apply blended equalization ---
     // Keep 3D chromatic equalization active by default so subtle hues are preserved,
     // using lc_priority to smoothly shift priority from lightness-balance to pure hue-balance.
-    let l_eff = 1.0 - (lc_priority * 0.5);
-    let c_eff = 0.5 + (lc_priority * 0.5);
+    let l_eff = 1.0f32.algebraic_sub(lc_priority.algebraic_mul(0.5));
+    let c_eff = 0.5f32.algebraic_add(lc_priority.algebraic_mul(0.5));
+
+    // Precompute combined equalization multipliers for all 16 L bins and 512 Grid bins.
+    // Folding the powers (eq_power * l_eff / c_eff) into the LUT eliminates all divisions
+    // and powf calls from the O(n_unique) loop.
+    let l_power = eq_power.algebraic_mul(l_eff);
+    let mut l_eq_lut = [1.0f32; L_BINS];
+    for b in 0..L_BINS {
+        if l_bin_weights[b] > 0.0 {
+            l_eq_lut[b] = (avg_l.algebraic_div(l_bin_weights[b])).powf(l_power);
+        }
+    }
+
+    let c_power = eq_power.algebraic_mul(c_eff);
+    let mut grid_eq_lut = [1.0f32; 512];
+    for b in 0..512 {
+        if grid_weights[b] > 0.0 {
+            grid_eq_lut[b] = (avg_grid.algebraic_div(grid_weights[b])).powf(c_power);
+        }
+    }
 
     for u in 0..n_unique {
         let p = oklab_pixels_slice[u];
-        let l_bin = ((p.l * L_BINS as f32) as usize).min(L_BINS - 1);
-        let gl_bin = ((p.l * 8.0) as usize).min(7);
-        let a_bin = (((p.a + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
-        let b_bin = (((p.b + 0.3) * (8.0 / 0.6)) as usize).clamp(0, 7);
+        let l_bin = ((p.l.algebraic_mul(L_BINS as f32)) as usize).min(L_BINS - 1);
+        let gl_bin = ((p.l.algebraic_mul(8.0)) as usize).min(7);
+        let a_bin = (((p.a.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
+        let b_bin = (((p.b.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
         let g_bin = (gl_bin << 6) | (a_bin << 3) | b_bin;
 
-        let l_eq = if l_bin_weights[l_bin] > 0.0 {
-            (avg_l / l_bin_weights[l_bin]).powf(eq_power)
-        } else {
-            1.0
-        };
-        let c_eq = if grid_weights[g_bin] > 0.0 {
-            (avg_grid / grid_weights[g_bin]).powf(eq_power)
-        } else {
-            1.0
-        };
-
-        weights_slice[u] *= l_eq.powf(l_eff) * c_eq.powf(c_eff);
+        let eq_factor = l_eq_lut[l_bin].algebraic_mul(grid_eq_lut[g_bin]);
+        weights_slice[u] = weights_slice[u].algebraic_mul(eq_factor);
     }
 
     // Precompute the effective weights array once to avoid millions of redundant multiplications
-    let effective_weights: Vec<f32> =
-        weights_slice.iter().zip(unique_counts_slice.iter()).map(|(&w, &c)| w * c as f32).collect();
+    let effective_weights: Vec<f32> = weights_slice
+        .iter()
+        .zip(unique_counts_slice.iter())
+        .map(|(&w, &c)| w.algebraic_mul(c as f32))
+        .collect();
 
     // 3. K-Means++ initialization using CentroidsSoA with multi-candidate local trial evaluation
     let mut centroids_soa = CentroidsSoA::with_capacity(k);
@@ -1136,11 +1167,11 @@ fn generate_palette_oklab(
     } else {
         let total_w: f32 =
             effective_weights.iter().copied().fold(0.0f32, |acc, x| acc.algebraic_add(x));
-        let mut threshold = rng.unit_f32(TAG_FIRST, 0) * total_w;
+        let mut threshold = (rng.unit_f32(TAG_FIRST, 0)).algebraic_mul(total_w);
         let mut chosen_u = 0;
         for u in 0..n_unique {
             let w = effective_weights[u];
-            threshold = threshold.algebraic_add(-w);
+            threshold = threshold.algebraic_sub(w);
             if threshold <= 0.0 {
                 chosen_u = u;
                 break;
@@ -1160,7 +1191,7 @@ fn generate_palette_oklab(
     for ki in 1..k {
         let total: f32 = (0..n_unique)
             .into_par_iter()
-            .map(|u| min_dists[u] * effective_weights[u])
+            .map(|u| min_dists[u].algebraic_mul(effective_weights[u]))
             .reduce(|| 0.0f32, |a, b| a.algebraic_add(b));
 
         if total <= 0.0 {
@@ -1173,11 +1204,11 @@ fn generate_palette_oklab(
 
             for trial in 0..CANDIDATES_PER_STEP {
                 let sub_tag = TAG_TARGET_BASE + (trial as u8);
-                let mut target = rng.unit_f32(sub_tag, ki as u64) * total;
+                let mut target = (rng.unit_f32(sub_tag, ki as u64)).algebraic_mul(total);
                 let mut cand_u = n_unique - 1;
                 for u in 0..n_unique {
-                    let w = min_dists[u] * effective_weights[u];
-                    target = target.algebraic_add(-w);
+                    let w = min_dists[u].algebraic_mul(effective_weights[u]);
+                    target = target.algebraic_sub(w);
                     if target <= 0.0 {
                         cand_u = u;
                         break;
@@ -1216,12 +1247,17 @@ fn generate_palette_oklab(
                 let mut best = 0;
                 // Unrolled SoA loop for contiguous vector loads
                 for i in 0..centroids_soa.len() {
-                    let dl = p.l - centroids_soa.l[i];
-                    let dc = p.chroma - centroids_soa.chroma[i];
-                    let da = p.a - centroids_soa.a[i];
-                    let db = p.b - centroids_soa.b[i];
-                    let dh_sq = (da * da + db * db - dc * dc).max(0.0);
-                    let d = (dl * dl * 1.0) + (dc * dc * 2.0) + (dh_sq * 3.5);
+                    let dl = p.l.algebraic_sub(centroids_soa.l[i]);
+                    let dc = p.chroma.algebraic_sub(centroids_soa.chroma[i]);
+                    let da = p.a.algebraic_sub(centroids_soa.a[i]);
+                    let db = p.b.algebraic_sub(centroids_soa.b[i]);
+                    let dh_sq = (da.algebraic_mul(da))
+                        .algebraic_add(db.algebraic_mul(db))
+                        .algebraic_sub(dc.algebraic_mul(dc))
+                        .max(0.0);
+                    let d = (dl.algebraic_mul(dl))
+                        .algebraic_add(dc.algebraic_mul(dc).algebraic_mul(2.0))
+                        .algebraic_add(dh_sq.algebraic_mul(3.5));
                     if d < min_dist {
                         min_dist = d;
                         best = i;
@@ -1245,9 +1281,9 @@ fn generate_palette_oklab(
                     let effective_w = effective_weights[u];
                     let best = best_per_unique[u] as usize;
 
-                    sums[best].0 = sums[best].0.algebraic_add(p.l * effective_w);
-                    sums[best].1 = sums[best].1.algebraic_add(p.a * effective_w);
-                    sums[best].2 = sums[best].2.algebraic_add(p.b * effective_w);
+                    sums[best].0 = sums[best].0.algebraic_add(p.l.algebraic_mul(effective_w));
+                    sums[best].1 = sums[best].1.algebraic_add(p.a.algebraic_mul(effective_w));
+                    sums[best].2 = sums[best].2.algebraic_add(p.b.algebraic_mul(effective_w));
                     counts[best] = counts[best].algebraic_add(effective_w);
                 }
                 (sums, counts)
@@ -1268,10 +1304,12 @@ fn generate_palette_oklab(
         let mut max_shift = 0.0f32;
         for i in 0..k {
             if counts[i] > 0.0 {
+                // Reciprocal multiplication: compute inv_count once to avoid 3 divisions per centroid
+                let inv_count = (1.0f32).algebraic_div(counts[i]);
                 let new_ok = Oklab {
-                    l: sums[i].0 / counts[i],
-                    a: sums[i].1 / counts[i],
-                    b: sums[i].2 / counts[i],
+                    l: sums[i].0.algebraic_mul(inv_count),
+                    a: sums[i].1.algebraic_mul(inv_count),
+                    b: sums[i].2.algebraic_mul(inv_count),
                 };
                 let new_ok_pt = OkPt::from_oklab(new_ok);
                 let cur_pt = centroids_soa.get_pt(i);
@@ -1361,30 +1399,34 @@ impl OkPt {
 /// The weighted OkLCh metric with both chromas precomputed — zero sqrts, pure
 /// FMA. Same expression order as the original inline-sqrt version, so results
 /// are bit-identical.
-#[inline(always)]
 fn oklch_weighted_dist_pt(p: OkPt, c: OkPt) -> f32 {
     // 1. Lightness difference
-    let dl = p.l - c.l;
+    let dl = p.l.algebraic_sub(c.l);
     // 2. Chroma difference
-    let dc = p.chroma - c.chroma;
+    let dc = p.chroma.algebraic_sub(c.chroma);
     // 3. Hue difference (chord length trick to avoid expensive atan2)
-    let da = p.a - c.a;
-    let db = p.b - c.b;
-    let dh_sq = (da * da + db * db - dc * dc).max(0.0);
+    let da = p.a.algebraic_sub(c.a);
+    let db = p.b.algebraic_sub(c.b);
+    let dh_sq = (da.algebraic_mul(da))
+        .algebraic_add(db.algebraic_mul(db))
+        .algebraic_sub(dc.algebraic_mul(dc))
+        .max(0.0);
 
     // Perceptual Weights: 1.0 Lightness, 2.0 Chroma, 3.5 Hue — forces the
     // algorithm to preserve vibrant gradients and distinct minority hues (like dark blues)
     // instead of settling for mathematically safe but pale averages.
-    (dl * dl * 1.0) + (dc * dc * 2.0) + (dh_sq * 3.5)
+    (dl.algebraic_mul(dl))
+        .algebraic_add(dc.algebraic_mul(dc).algebraic_mul(2.0))
+        .algebraic_add(dh_sq.algebraic_mul(3.5))
 }
 
 /// Squared Euclidean distance in u8-scale RGB — the metric for classic mode.
 #[inline(always)]
 fn rgb_dist_sq(p: [f32; 3], c: [f32; 3]) -> f32 {
-    let dr = p[0] - c[0];
-    let dg = p[1] - c[1];
-    let db = p[2] - c[2];
-    dr * dr + dg * dg + db * db
+    let dr = p[0].algebraic_sub(c[0]);
+    let dg = p[1].algebraic_sub(c[1]);
+    let db = p[2].algebraic_sub(c[2]);
+    (dr.algebraic_mul(dr)).algebraic_add(dg.algebraic_mul(dg)).algebraic_add(db.algebraic_mul(db))
 }
 
 #[inline(always)]
@@ -1472,18 +1514,30 @@ fn srgb_to_oklab(rgb: [u8; 3]) -> Oklab {
     let g = srgb_u8_to_linear(rgb[1]);
     let b = srgb_u8_to_linear(rgb[2]);
 
-    let l = 0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b;
-    let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
-    let s = 0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b;
+    let l = (0.412_221_46f32.algebraic_mul(r))
+        .algebraic_add(0.536_332_55f32.algebraic_mul(g))
+        .algebraic_add(0.051_445_995f32.algebraic_mul(b));
+    let m = (0.211_903_5f32.algebraic_mul(r))
+        .algebraic_add(0.680_699_5f32.algebraic_mul(g))
+        .algebraic_add(0.107_396_96f32.algebraic_mul(b));
+    let s = (0.088_302_46f32.algebraic_mul(r))
+        .algebraic_add(0.281_718_85f32.algebraic_mul(g))
+        .algebraic_add(0.629_978_7f32.algebraic_mul(b));
 
     let l_ = l.cbrt();
     let m_ = m.cbrt();
     let s_ = s.cbrt();
 
     Oklab {
-        l: 0.210_454_26 * l_ + 0.793_617_8 * m_ - 0.004_072_047 * s_,
-        a: 1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_,
-        b: 0.025_904_037 * l_ + 0.782_771_77 * m_ - 0.808_675_77 * s_,
+        l: (0.210_454_26f32.algebraic_mul(l_))
+            .algebraic_add(0.793_617_8f32.algebraic_mul(m_))
+            .algebraic_sub(0.004_072_047f32.algebraic_mul(s_)),
+        a: (1.977_998_5f32.algebraic_mul(l_))
+            .algebraic_sub(2.428_592_2f32.algebraic_mul(m_))
+            .algebraic_add(0.450_593_7f32.algebraic_mul(s_)),
+        b: (0.025_904_037f32.algebraic_mul(l_))
+            .algebraic_add(0.782_771_77f32.algebraic_mul(m_))
+            .algebraic_sub(0.808_675_77f32.algebraic_mul(s_)),
     }
 }
 
