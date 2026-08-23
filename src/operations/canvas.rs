@@ -2043,12 +2043,6 @@ fn render_fbm(
     // edge is extended in proportion rather than stretching the noise.
     let (w, h) = (width as f64, height as f64);
     let (ex, ey) = if w >= h { (zoom * w / h, zoom) } else { (zoom, zoom * h / w) };
-
-    // `new_fn` rather than `new`: in noise 0.9 the 2-D `build` is only
-    // implemented for a builder whose source went through `new_fn`, so
-    // `PlaneMapBuilder::<_, 2>::new(&fbm)` (as the crate README shows) has no
-    // `set_size` or `build` to call. The turbofish pins the dimension rather
-    // than leaving it to be inferred through the closure's `Fn` bound.
     let map = PlaneMapBuilder::<_, 2>::new_fn(|p: [f64; 2]| fbm.get(p))
         .set_size(width as usize, height as usize)
         .set_x_bounds(-ex, ex)
