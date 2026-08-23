@@ -2,7 +2,12 @@ use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
 use delaunator::{Point as DelaunayPoint, triangulate};
 use image::{DynamicImage, ImageBuffer, Rgba};
 use kurbo::{CubicBez, ParamCurve, Point};
-use noise::{Fbm, MultiFractal, NoiseFn, Perlin, utils::PlaneMapBuilder};
+use noise::{
+    Fbm, MultiFractal, NoiseFn, Perlin, Vector2,
+    core::worley::{ReturnType, distance_functions, worley_2d},
+    permutationtable::PermutationTable,
+    utils::PlaneMapBuilder,
+};
 use oklab::{
     Oklab, Rgb, linear_srgb_to_oklab, oklab_to_linear_srgb, oklab_to_srgb_f32, srgb_f32_to_oklab,
 };
@@ -349,6 +354,15 @@ pub enum VoronoiStyle {
     Blob,
 }
 
+/// Distance metrics supported for Worley cellular noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorleyDistance {
+    Euclidean,
+    EuclideanSquared,
+    Manhattan,
+    Chebyshev,
+}
+
 /// What to fill the canvas with.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanvasSpec {
@@ -397,7 +411,7 @@ pub enum CanvasSpec {
         /// Explicit cell palette. If `None`, a harmonious one is generated.
         colors: Option<Vec<[u16; 4]>>,
     },
-    /// Fractal Brownian motion -- summed Perlin octaves from the `noise`
+    /// Fractal Brownian motion -- summed Perlin or Worley octaves from the `noise`
     /// crate -- mapped through a color ramp.
     Fbm {
         seed: Option<u64>,
@@ -410,6 +424,9 @@ pub enum CanvasSpec {
         zoom: f64,
         /// Make the field tile seamlessly across the canvas edges.
         seamless: bool,
+        /// If set, generate cellular Worley noise using the specified distance metric
+        /// instead of default Perlin gradient noise.
+        worley: Option<WorleyDistance>,
         /// Ramp the noise value is mapped through. If `None`, one is generated
         /// from the seed.
         stops: Option<Vec<GradientStop>>,
@@ -483,7 +500,8 @@ impl CanvasConfig {
     ///   [size:WxH,]mesh,TL_COLOR,TR_COLOR,BL_COLOR,BR_COLOR
     ///   [size:WxH,]coons[,seed:N][,transparency:MIN-MAX][,TL_COLOR,TR_COLOR,BL_COLOR,BR_COLOR]
     ///   [size:WxH,]voronoi[,sharp|blob][,cells:N][,softness:F][,seed:N][,COLOR...]
-    ///   [size:WxH,]fbm[,seed:N][,octaves:N][,freq:F][,lacunarity:F][,persistence:F]
+    ///   [size:WxH,]fbm[,worley][,dist:euclidean|euclidean_squared|manhattan|chebyshev]
+    ///                 [,seed:N][,octaves:N][,freq:F][,lacunarity:F][,persistence:F]
     ///                 [,zoom:F][,seamless][,STOP...]
     ///   [size:WxH,]flow[,seed:N][,strands:N][,steps:N][,step:F][,zoom:F][,turns:F]
     ///                  [,width:F][,alpha:F][,COLOR...]
@@ -801,6 +819,23 @@ impl CanvasConfig {
             "fbm" => {
                 let mut tok = SpecTokens::split(&remaining[1..]);
                 let seamless = tok.flag("seamless");
+                let is_worley_flag = tok.flag("worley");
+                let worley_opt = tok.take("worley");
+                let dist_opt = tok.take("dist").or_else(|| tok.take("distance"));
+
+                let worley = match (is_worley_flag, worley_opt, dist_opt) {
+                    (false, None, None) => None,
+                    (true, None, None) => Some(WorleyDistance::Euclidean),
+                    (_, Some(d_str), None) | (_, None, Some(d_str)) => {
+                        Some(parse_worley_dist(d_str)?)
+                    }
+                    (true, Some(_), Some(_)) | (false, Some(_), Some(_)) => {
+                        return Err(ArgParseErr::with_msg(
+                            "canvas fbm: distance function specified more than once",
+                        ));
+                    }
+                };
+
                 let seed = opt_seed(tok.take("seed"))?;
                 let octaves = opt_u32(
                     tok.take("octaves"),
@@ -844,7 +879,7 @@ impl CanvasConfig {
                 tok.finish(
                     "canvas fbm: unknown or repeated option (expected 'seed:N', \
                      'octaves:N', 'freq:F', 'lacunarity:F', 'persistence:F', \
-                     'zoom:F', 'seamless')",
+                     'zoom:F', 'seamless', 'worley', 'dist:DIST')",
                 )?;
                 CanvasSpec::Fbm {
                     seed,
@@ -854,6 +889,7 @@ impl CanvasConfig {
                     persistence,
                     zoom,
                     seamless,
+                    worley,
                     stops,
                     easing,
                 }
@@ -1016,6 +1052,20 @@ impl CanvasConfig {
         };
 
         Ok(Self { size, spec })
+    }
+}
+
+fn parse_worley_dist(s: &str) -> Result<WorleyDistance, ArgParseErr> {
+    match s.to_ascii_lowercase().as_str() {
+        "euclidean" => Ok(WorleyDistance::Euclidean),
+        "euclidean_squared" | "euclidean-squared" | "euclidean_sq" | "sq_euclidean" | "squared" => {
+            Ok(WorleyDistance::EuclideanSquared)
+        }
+        "manhattan" => Ok(WorleyDistance::Manhattan),
+        "chebyshev" => Ok(WorleyDistance::Chebyshev),
+        _ => Err(ArgParseErr::with_msg(
+            "canvas fbm: invalid distance function (expected 'euclidean', 'euclidean_squared', 'manhattan', or 'chebyshev')",
+        )),
     }
 }
 
@@ -1186,13 +1236,25 @@ fn parse_stops(tokens: &[&str]) -> Result<Vec<GradientStop>, ArgParseErr> {
         let n = tokens.len();
         tokens
             .iter()
-            .enumerate()
-            .map(|(i, t)| -> Result<GradientStop, ArgParseErr> {
-                let pos = i as f64 / (n - 1) as f64; // n >= 2 ensured above
+            .map(|t| -> Result<GradientStop, ArgParseErr> {
+                let pos = if n > 1 {
+                    0.0 // computed dynamically after allocation below if needed
+                } else {
+                    0.0
+                };
+                let _ = pos;
                 let color = parse_color(t)?;
-                Ok(GradientStop { pos, color })
+                Ok(GradientStop { pos: 0.0, color })
             })
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut auto_stops = Vec::with_capacity(n);
+        for (i, t) in tokens.iter().enumerate() {
+            let pos = i as f64 / (n - 1) as f64; // n >= 2 ensured above
+            let color = parse_color(t)?;
+            auto_stops.push(GradientStop { pos, color });
+        }
+        auto_stops
     };
 
     // Stable sort by position so equal positions preserve input order.
@@ -2027,9 +2089,50 @@ fn render_fbm(
     persistence: f64,
     zoom: f64,
     seamless: bool,
+    worley: Option<WorleyDistance>,
     grad: &PreparedGradient,
     easing: Option<&CssEasing>,
 ) {
+    // Keep the field isotropic: the short edge spans `zoom` units and the long
+    // edge is extended in proportion rather than stretching the noise.
+    let (w, h) = (width as f64, height as f64);
+    let (ex, ey) = if w >= h { (zoom * w / h, zoom) } else { (zoom, zoom * h / w) };
+
+    let map = if let Some(dist) = worley {
+        let octaves_count = octaves.clamp(1, 32);
+        let tables: Vec<PermutationTable> = (0..octaves_count)
+            .map(|i| PermutationTable::new((seed as u32).wrapping_add(i as u32)))
+            .collect();
+
+        let dist_fn: fn(&[f64], &[f64]) -> f64 = match dist {
+            WorleyDistance::Euclidean => distance_functions::euclidean,
+            WorleyDistance::EuclideanSquared => distance_functions::euclidean_squared,
+            WorleyDistance::Manhattan => distance_functions::manhattan,
+            WorleyDistance::Chebyshev => distance_functions::chebyshev,
+        };
+
+        PlaneMapBuilder::<_, 2>::new_fn(|p: [f64; 2]| {
+            let mut signal = 0.0;
+            let mut cur_persistence = 1.0;
+            let mut weight_sum = 0.0;
+            let mut cur_freq = frequency;
+
+            for table in &tables {
+                let pt = Vector2::from([p[0] * cur_freq, p[1] * cur_freq]);
+                let val = worley_2d(table, dist_fn, ReturnType::Distance, pt);
+                signal += val * cur_persistence;
+                weight_sum += cur_persistence;
+                cur_persistence *= persistence;
+                cur_freq *= lacunarity;
+            }
+            if weight_sum > 0.0 { signal / weight_sum } else { signal }
+        })
+        .set_size(width as usize, height as usize)
+        .set_x_bounds(-ex, ex)
+        .set_y_bounds(-ey, ey)
+        .set_is_seamless(seamless)
+        .build()
+    } else {
     // Order matters: `set_persistence` recomputes the internal scale factor
     // from the octave count, so octaves has to be set first.
     // `noise` seeds are u32, so the canvas seed is deliberately narrowed here.
@@ -2039,16 +2142,13 @@ fn render_fbm(
         .set_lacunarity(lacunarity)
         .set_persistence(persistence);
 
-    // Keep the field isotropic: the short edge spans `zoom` units and the long
-    // edge is extended in proportion rather than stretching the noise.
-    let (w, h) = (width as f64, height as f64);
-    let (ex, ey) = if w >= h { (zoom * w / h, zoom) } else { (zoom, zoom * h / w) };
-    let map = PlaneMapBuilder::<_, 2>::new_fn(|p: [f64; 2]| fbm.get(p))
+        PlaneMapBuilder::<_, 2>::new_fn(|p: [f64; 2]| fbm.get(p))
         .set_size(width as usize, height as usize)
         .set_x_bounds(-ex, ex)
         .set_y_bounds(-ey, ey)
         .set_is_seamless(seamless)
-        .build();
+            .build()
+    };
 
     let row_len = width as usize * 4;
     let map = &map;
@@ -3025,6 +3125,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
             persistence,
             zoom,
             seamless,
+            worley,
             stops,
             easing,
         } => {
@@ -3059,6 +3160,7 @@ pub fn canvas(image: &mut Image, config: &CanvasConfig) -> Result<(), MagickErro
                 *persistence,
                 *zoom,
                 *seamless,
+                *worley,
                 &grad,
                 easing.as_ref(),
             );
