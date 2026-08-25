@@ -31,7 +31,8 @@ siphasher = "1"
 getrandom = "0.4"
 gainforge = "0.5"
 moxcms = "0.9"
-noise = "0.9"
+#noise = "0.9"
+noise = { git = "https://github.com/Safari77/noise-rs", branch = "all-fixes" }
 delaunator = "1"
 
 [features]
