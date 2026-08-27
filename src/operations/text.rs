@@ -35,7 +35,7 @@ enum TextSegment {
 }
 
 /// Parse the text field into segments, handling `{QR:EcLevel:blur:light_color:content}` blocks
-/// and `\{QR` escape sequences.
+/// and escape sequences (`\{`, `\\`, and `\}` within QR content).
 ///
 /// - `{QR:L:0:#00000000:hello}` → QR block, no blur, transparent light color
 /// - `{QR:H:3.0:#FFFFFFCC:https://x.com}` → QR block, blur sigma=3.0 (sharp edges)
@@ -54,16 +54,21 @@ fn parse_text_segments(text: &str) -> Result<Vec<TextSegment>, ArgParseErr> {
     let mut i = 0;
 
     while i < len {
-        // Handle escape: \{QR → literal {QR
+        // Handle escapes: \\ -> literal \, \{ -> literal {
         if bytes[i] == b'\\' {
-            // Check if this looks like an escaped QR block.
-            // `i + 1` is always a char boundary because `\` is ASCII.
-            if text[i + 1..].starts_with("{QR") {
-                plain.push('{');
-                i += 2; // skip \ and {
-                continue;
+            if i + 1 < len {
+                if bytes[i + 1] == b'\\' {
+                    plain.push('\\');
+                    i += 2;
+                    continue;
+                }
+                if bytes[i + 1] == b'{' {
+                    plain.push('{');
+                    i += 2;
+                    continue;
+                }
             }
-            // Not a QR escape, keep backslash as-is
+            // Not a supported escape, keep backslash as-is
             plain.push('\\');
             i += 1;
             continue;
@@ -73,93 +78,124 @@ fn parse_text_segments(text: &str) -> Result<Vec<TextSegment>, ArgParseErr> {
         if bytes[i] == b'{' {
             let rest = &text[i..];
             if rest.starts_with("{QR:") {
-                // Find the closing brace
-                if let Some(close_pos) = rest.find('}') {
-                    let inner = &rest[4..close_pos]; // after "{QR:" and before "}"
-
-                    // Parse: EcLevel:blur_sigma:light_color:content
-                    // Split at first 3 colons to get 4 parts.
-                    // The first `next()` on a `SplitN` always yields a value
-                    // (possibly empty), so only the later fields can be absent.
-                    let mut parts = inner.splitn(4, ':');
-                    let ec_str = parts.next().unwrap_or("");
-                    let blur_str = parts
-                        .next()
-                        .ok_or_else(|| ArgParseErr::with_msg("QR block missing blur sigma"))?;
-                    let light_str = parts
-                        .next()
-                        .ok_or_else(|| ArgParseErr::with_msg("QR block missing light_color"))?;
-                    let content = parts
-                        .next()
-                        .ok_or_else(|| ArgParseErr::with_msg("QR block missing content"))?;
-
-                    let ec_level = match ec_str {
-                        "L" => EcLevel::L,
-                        "M" => EcLevel::M,
-                        "Q" => EcLevel::Q,
-                        "H" => EcLevel::H,
-                        _ => {
-                            return Err(ArgParseErr::with_msg("QR EcLevel must be L, M, Q, or H"));
-                        }
-                    };
-
-                    // Parse blur field: either "sigma" (sharp) or "sigma+pct" (gradual).
-                    // E.g. "100" → sigma=100, sharp edges.
-                    //      "100+15" → sigma=100, gradual 15% of QR size.
-                    let (blur_sigma, blur_gradual_pct) = if let Some(plus_pos) = blur_str.find('+')
-                    {
-                        let sigma_str = &blur_str[..plus_pos];
-                        let pct_str = &blur_str[plus_pos + 1..];
-                        let sigma = sigma_str.parse::<f32>().map_err(|_| {
-                            ArgParseErr::with_msg("QR blur sigma must be a number (e.g. '100+15')")
-                        })?;
-                        let pct = pct_str.parse::<f32>().map_err(|_| {
-                            ArgParseErr::with_msg(
-                                "QR blur gradual percentage must be a number (e.g. '100+15')",
-                            )
-                        })?;
-                        (sigma, pct)
-                    } else {
-                        let sigma = blur_str.parse::<f32>().map_err(|_| {
-                            ArgParseErr::with_msg(
-                                "QR blur must be a number (0 to disable, e.g. 3.0) \
-                                 or sigma+pct for gradual blur (e.g. 100+15)",
-                            )
-                        })?;
-                        (sigma, 0.0)
-                    };
-
-                    // Reject values the renderer can't act on rather than
-                    // letting NaN/negatives reach the blur kernel.
-                    if !blur_sigma.is_finite() || blur_sigma < 0.0 {
-                        return Err(ArgParseErr::with_msg(
-                            "QR blur sigma must be a finite number >= 0",
-                        ));
+                // Find the closing brace, respecting escapes inside the QR block
+                let mut close_pos = None;
+                let mut escaped = false;
+                for (offset, ch) in rest[4..].char_indices() {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '}' {
+                        close_pos = Some(4 + offset);
+                        break;
                     }
-                    if !blur_gradual_pct.is_finite() || blur_gradual_pct < 0.0 {
-                        return Err(ArgParseErr::with_msg(
-                            "QR blur gradual percentage must be a finite number >= 0",
-                        ));
-                    }
-
-                    let light_color = parse_hex_color(light_str)?;
-
-                    // Flush accumulated plain text
-                    if !plain.is_empty() {
-                        segments.push(TextSegment::Plain(std::mem::take(&mut plain)));
-                    }
-
-                    segments.push(TextSegment::Qr(QrBlock {
-                        ec_level,
-                        content: content.to_string(),
-                        blur_sigma,
-                        blur_gradual_pct,
-                        light_color,
-                    }));
-
-                    i += close_pos + 1; // skip past '}' (both are byte offsets)
-                    continue;
                 }
+
+                let close_pos = close_pos
+                    .ok_or_else(|| ArgParseErr::with_msg("unclosed QR block: missing '}'"))?;
+
+                let inner = &rest[4..close_pos]; // after "{QR:" and before "}"
+
+                // Parse: EcLevel:blur_sigma:light_color:content
+                // Split at first 3 colons to get 4 parts.
+                // The first `next()` on a `SplitN` always yields a value
+                // (possibly empty), so only the later fields can be absent.
+                let mut parts = inner.splitn(4, ':');
+                let ec_str = parts.next().unwrap_or("");
+                let blur_str = parts
+                    .next()
+                    .ok_or_else(|| ArgParseErr::with_msg("QR block missing blur sigma"))?;
+                let light_str = parts
+                    .next()
+                    .ok_or_else(|| ArgParseErr::with_msg("QR block missing light_color"))?;
+                let content_raw = parts
+                    .next()
+                    .ok_or_else(|| ArgParseErr::with_msg("QR block missing content"))?;
+
+                let ec_level = match ec_str {
+                    "L" => EcLevel::L,
+                    "M" => EcLevel::M,
+                    "Q" => EcLevel::Q,
+                    "H" => EcLevel::H,
+                    _ => {
+                        return Err(ArgParseErr::with_msg("QR EcLevel must be L, M, Q, or H"));
+                    }
+                };
+
+                // Parse blur field: either "sigma" (sharp) or "sigma+pct" (gradual).
+                // E.g. "100" → sigma=100, sharp edges.
+                //      "100+15" → sigma=100, gradual 15% of QR size.
+                let (blur_sigma, blur_gradual_pct) = if let Some(plus_pos) = blur_str.find('+') {
+                    let sigma_str = &blur_str[..plus_pos];
+                    let pct_str = &blur_str[plus_pos + 1..];
+                    let sigma = sigma_str.parse::<f32>().map_err(|_| {
+                        ArgParseErr::with_msg("QR blur sigma must be a number (e.g. '100+15')")
+                    })?;
+                    let pct = pct_str.parse::<f32>().map_err(|_| {
+                        ArgParseErr::with_msg(
+                            "QR blur gradual percentage must be a number (e.g. '100+15')",
+                        )
+                    })?;
+                    (sigma, pct)
+                } else {
+                    let sigma = blur_str.parse::<f32>().map_err(|_| {
+                        ArgParseErr::with_msg(
+                            "QR blur must be a number (0 to disable, e.g. 3.0) \
+                             or sigma+pct for gradual blur (e.g. 100+15)",
+                        )
+                    })?;
+                    (sigma, 0.0)
+                };
+
+                // Reject values the renderer can't act on rather than
+                // letting NaN/negatives reach the blur kernel.
+                if !blur_sigma.is_finite() || blur_sigma < 0.0 {
+                    return Err(ArgParseErr::with_msg(
+                        "QR blur sigma must be a finite number >= 0",
+                    ));
+                }
+                if !blur_gradual_pct.is_finite() || blur_gradual_pct < 0.0 {
+                    return Err(ArgParseErr::with_msg(
+                        "QR blur gradual percentage must be a finite number >= 0",
+                    ));
+                }
+
+                let light_color = parse_hex_color(light_str)?;
+
+                // Unescape content (e.g. \} -> }, \\ -> \)
+                let mut content = String::with_capacity(content_raw.len());
+                let mut chars = content_raw.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if let Some(&next) = chars.peek() {
+                            if next == '}' || next == '\\' {
+                                content.push(next);
+                                chars.next();
+                                continue;
+                            }
+                        }
+                        content.push('\\');
+                    } else {
+                        content.push(c);
+                    }
+                }
+
+                // Flush accumulated plain text
+                if !plain.is_empty() {
+                    segments.push(TextSegment::Plain(std::mem::take(&mut plain)));
+                }
+
+                segments.push(TextSegment::Qr(QrBlock {
+                    ec_level,
+                    content,
+                    blur_sigma,
+                    blur_gradual_pct,
+                    light_color,
+                }));
+
+                i += close_pos + 1; // skip past '}' (both are byte offsets)
+                continue;
             }
         }
 
@@ -200,11 +236,15 @@ impl Position {
         if s == "center" || s == "middle" {
             Ok(Position::Center)
         } else if let Some(pct) = s.strip_suffix('%') {
-            Ok(Position::Percent(finite(
-                pct.parse::<f32>()
-                    .map_err(|_| ArgParseErr::with_msg("invalid percentage position"))?,
-                "position must be a finite number",
-            )?))
+            let val = pct
+                .parse::<f32>()
+                .map_err(|_| ArgParseErr::with_msg("invalid percentage position"))?;
+            if !val.is_finite() || !(0.0..=100.0).contains(&val) {
+                return Err(ArgParseErr::with_msg(
+                    "position percentage must be between 0% and 100%",
+                ));
+            }
+            Ok(Position::Percent(val))
         } else if let Some(em) = s.strip_suffix("em") {
             Ok(Position::Em(finite(
                 em.parse::<f32>().map_err(|_| ArgParseErr::with_msg("invalid em position"))?,
@@ -249,6 +289,8 @@ pub enum TextEffect {
     /// Soft drop shadow behind the text glyphs, offset by (dx, dy) pixels
     /// and gaussian-blurred to give depth.
     Shadow { dx: f32, dy: f32, sigma: f32, color: (u8, u8, u8, u8) },
+    /// Combination of a background blur effect and a glyph effect (outline or shadow).
+    Combined { bg: Box<TextEffect>, glyph: Box<TextEffect> },
 }
 
 /// Optional pixel-displacement layer that runs *after* the base `TextEffect`,
@@ -258,15 +300,19 @@ pub enum TextEffect {
 pub enum DisplacementEffect {
     None,
     /// Radial push from the text centroid.
+    /// `binding` controls outline/shadow follow-up strength (0.0–1.0, default 1.0).
     Explode {
         strength: f32,
+        binding: f32,
     },
     /// Text-shape-driven displacement via a proximity field.
     /// `direction` = -1 → omnidirectional; 0–360 → fixed bearing in degrees
     /// (0 = right, 90 = down, 180 = left, 270 = up).
+    /// `binding` controls outline/shadow follow-up strength (0.0–1.0, default 1.0).
     Meltdown {
         strength: f32,
         direction: f32,
+        binding: f32,
     },
 }
 
@@ -323,14 +369,21 @@ impl TextConfig {
     ///   - `outline:3:#000000FF`  — subtitle-style outline (thickness 3, black)
     ///   - `shadow:3:3:4.0:#00000080` — drop shadow (dx, dy, sigma, color)
     ///
+    /// Combined effects (join background blur + glyph effect with `+`):
+    ///   - `blur:5.0+outline:3:#000000FF` — blur background and outline text
+    ///   - `gradualblur:5.0+shadow:3:3:4.0:#00000080` — gradual blur + drop shadow
+    ///
     /// Displacement modifiers (append with `+`):
-    ///   - `+explode:30`          — radial pixel explosion (strength in px)
-    ///   - `+meltdown:40:-1`      — text-shaped blast, omnidirectional
-    ///   - `+meltdown:40:90`      — text-shaped blast downward (0=right…360°)
+    ///   - `+explode:30`          — radial pixel explosion (strength in px, binding default 1.0)
+    ///   - `+explode:30:0.5`      — radial pixel explosion with binding=0.5
+    ///   - `+meltdown:40:-1`      — text-shaped blast, omnidirectional (binding default 1.0)
+    ///   - `+meltdown:40:90:0.8`  — text-shaped blast downward with binding=0.8
+    ///   - `+binding:0.5`         — explicit modifier flag setting outline/shadow follow-up strength (0.0–1.0)
     ///
     /// Combined examples:
     ///   - `blur:5.0+explode:30`  — blur then explode
     ///   - `outline:3:#000000FF+meltdown:40:-1` — outline with meltdown
+    ///   - `blur:5.0+outline:3:#000000FF+explode:30+binding:0.5` — blur + outline + explode with 50% binding
     ///   - `explode:30`           — plain text with explode (implicit `none` base)
     ///
     /// Example: "outline:3:#000000FF,Hello\\nWorld,Arial,5%,#FFFFFF,-45.0,center,center,80%"
@@ -368,15 +421,15 @@ impl TextConfig {
         let size_str = parts[2].trim();
         let font_size = if let Some(pct) = size_str.strip_suffix('%') {
             let v = pct.parse::<f32>().map_err(|_| ArgParseErr::with_msg("invalid pct size"))?;
-            if !v.is_finite() || v <= 0.0 {
-                return Err(ArgParseErr::with_msg("font size percentage must be > 0"));
+            if !v.is_finite() || v <= 0.0 || v > 1000.0 {
+                return Err(ArgParseErr::with_msg("font size percentage must be > 0 and <= 1000%"));
             }
             FontSize::RelativePercent(v)
         } else {
             let v =
                 size_str.parse::<f32>().map_err(|_| ArgParseErr::with_msg("invalid abs size"))?;
-            if !v.is_finite() || v <= 0.0 {
-                return Err(ArgParseErr::with_msg("absolute font size must be > 0"));
+            if !v.is_finite() || v <= 0.0 || v > 20_000.0 {
+                return Err(ArgParseErr::with_msg("absolute font size must be > 0 and <= 20000"));
             }
             FontSize::Absolute(v)
         };
@@ -419,30 +472,120 @@ impl TextConfig {
         })
     }
 
-    /// Split on `+`, parse base effect and optional displacement modifier.
+    /// Split on `+`, parsing background effects, glyph effects, and optional displacement modifiers.
+    /// Supports combining background blur (blur/gradualblur) with glyph effects (outline/shadow).
     /// Standalone `explode:…` / `meltdown:…` (no `+`) is accepted as an
     /// implicit `none` base for backward compatibility.
     fn parse_effect_field(s: &str) -> Result<(TextEffect, DisplacementEffect), ArgParseErr> {
         let s = s.trim();
-
-        // Check for '+' separator → base+displacement
-        if let Some(pos) = s.find('+') {
-            let base_str = &s[..pos];
-            let disp_str = &s[pos + 1..];
-            let effect = Self::parse_base_effect(base_str)?;
-            let displacement = Self::parse_displacement(disp_str)?;
-            return Ok((effect, displacement));
+        if s.is_empty() || s.eq_ignore_ascii_case("none") {
+            return Ok((TextEffect::None, DisplacementEffect::None));
         }
 
-        // No '+' — try as displacement-only first (backward compat)
-        if s.starts_with("explode:") || s.starts_with("meltdown:") {
-            let displacement = Self::parse_displacement(s)?;
-            return Ok((TextEffect::None, displacement));
+        const SEPARATOR_PREFIXES: &[&str] = &[
+            "blur:",
+            "gradualblur:",
+            "outline:",
+            "shadow:",
+            "explode:",
+            "meltdown:",
+            "binding:",
+            "none",
+        ];
+
+        let mut parts = Vec::new();
+        let mut last_start = 0;
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'+' {
+                let after = &s[i + 1..];
+                let is_sep = SEPARATOR_PREFIXES.iter().any(|prefix| {
+                    after.len() >= prefix.len()
+                        && after[..prefix.len()].eq_ignore_ascii_case(prefix)
+                });
+                if is_sep {
+                    parts.push(&s[last_start..i]);
+                    last_start = i + 1;
+                }
+            }
+            i += 1;
+        }
+        parts.push(&s[last_start..]);
+
+        let mut bg_effect: Option<TextEffect> = None;
+        let mut glyph_effect: Option<TextEffect> = None;
+        let mut displacement: Option<DisplacementEffect> = None;
+        let mut explicit_binding: Option<f32> = None;
+
+        for part in parts {
+            let part = part.trim();
+            if part.is_empty() || part.eq_ignore_ascii_case("none") {
+                continue;
+            }
+
+            if let Some(binding_str) = part.strip_prefix("binding:") {
+                let b = binding_str.parse::<f32>().map_err(|_| {
+                    ArgParseErr::with_msg(
+                        "binding must be a float between 0.0 and 1.0 (e.g. 'binding:0.5')",
+                    )
+                })?;
+                if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+                    return Err(ArgParseErr::with_msg("binding must be between 0.0 and 1.0"));
+                }
+                explicit_binding = Some(b);
+            } else if part.starts_with("explode:") || part.starts_with("meltdown:") {
+                if displacement.is_some() {
+                    return Err(ArgParseErr::with_msg("multiple displacement modifiers specified"));
+                }
+                displacement = Some(Self::parse_displacement(part)?);
+            } else if part.starts_with("blur:") || part.starts_with("gradualblur:") {
+                if bg_effect.is_some() {
+                    return Err(ArgParseErr::with_msg(
+                        "multiple background blur effects specified",
+                    ));
+                }
+                bg_effect = Some(Self::parse_base_effect(part)?);
+            } else if part.starts_with("outline:") || part.starts_with("shadow:") {
+                if glyph_effect.is_some() {
+                    return Err(ArgParseErr::with_msg(
+                        "multiple glyph effects specified (outline/shadow)",
+                    ));
+                }
+                glyph_effect = Some(Self::parse_base_effect(part)?);
+            } else {
+                return Err(ArgParseErr::with_msg(
+                    "effect must be 'none', 'blur:<sigma>', 'gradualblur:<sigma>', \
+                     'outline:<thickness>:<#color>', 'shadow:<dx>:<dy>:<sigma>:<#color>', \
+                     'explode:<strength>[:<binding>]', 'meltdown:<strength>:<direction>[:<binding>]', \
+                     or 'binding:<0.0-1.0>'",
+                ));
+            }
         }
 
-        // Otherwise it's a plain base effect with no displacement
-        let effect = Self::parse_base_effect(s)?;
-        Ok((effect, DisplacementEffect::None))
+        let effect = match (bg_effect, glyph_effect) {
+            (Some(bg), Some(glyph)) => {
+                TextEffect::Combined { bg: Box::new(bg), glyph: Box::new(glyph) }
+            }
+            (Some(bg), None) => bg,
+            (None, Some(glyph)) => glyph,
+            (None, None) => TextEffect::None,
+        };
+
+        let mut disp = displacement.unwrap_or(DisplacementEffect::None);
+        if let Some(b) = explicit_binding {
+            match &mut disp {
+                DisplacementEffect::Explode { binding, .. } => *binding = b,
+                DisplacementEffect::Meltdown { binding, .. } => *binding = b,
+                DisplacementEffect::None => {
+                    return Err(ArgParseErr::with_msg(
+                        "binding modifier specified without explode or meltdown displacement",
+                    ));
+                }
+            }
+        }
+
+        Ok((effect, disp))
     }
 
     fn parse_base_effect(s: &str) -> Result<TextEffect, ArgParseErr> {
@@ -539,25 +682,40 @@ impl TextConfig {
 
     fn parse_displacement(s: &str) -> Result<DisplacementEffect, ArgParseErr> {
         let s = s.trim();
-        if let Some(strength_str) = s.strip_prefix("explode:") {
+        if let Some(rest) = s.strip_prefix("explode:") {
+            let mut parts = rest.split(':');
+            let strength_str = parts.next().unwrap_or("");
             let strength = strength_str.parse::<f32>().map_err(|_| {
                 ArgParseErr::with_msg("explode requires a float strength (e.g. 'explode:30')")
             })?;
             if !strength.is_finite() || strength <= 0.0 {
                 return Err(ArgParseErr::with_msg("explode strength must be a finite number > 0"));
             }
-            return Ok(DisplacementEffect::Explode { strength });
+            let binding = if let Some(b_str) = parts.next() {
+                let b = b_str.parse::<f32>().map_err(|_| {
+                    ArgParseErr::with_msg("explode binding must be a float between 0.0 and 1.0")
+                })?;
+                if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+                    return Err(ArgParseErr::with_msg(
+                        "explode binding must be between 0.0 and 1.0",
+                    ));
+                }
+                b
+            } else {
+                1.0
+            };
+            return Ok(DisplacementEffect::Explode { strength, binding });
         }
         if let Some(rest) = s.strip_prefix("meltdown:") {
-            // Format: meltdown:strength:direction
-            let colon_pos = rest.find(':').ok_or_else(|| {
+            // Format: meltdown:strength:direction[:binding]
+            let mut parts = rest.split(':');
+            let strength_str = parts.next().unwrap_or("");
+            let dir_str = parts.next().ok_or_else(|| {
                 ArgParseErr::with_msg(
                     "meltdown requires strength:direction \
                      (e.g. 'meltdown:40:-1' or 'meltdown:40:90')",
                 )
             })?;
-            let strength_str = &rest[..colon_pos];
-            let dir_str = &rest[colon_pos + 1..];
             let strength = strength_str
                 .parse::<f32>()
                 .map_err(|_| ArgParseErr::with_msg("meltdown strength must be a float"))?;
@@ -567,16 +725,30 @@ impl TextConfig {
             if !strength.is_finite() || strength <= 0.0 {
                 return Err(ArgParseErr::with_msg("meltdown strength must be a finite number > 0"));
             }
-            if !direction.is_finite() {
+            if !direction.is_finite() || (direction != -1.0 && !(0.0..=360.0).contains(&direction))
+            {
                 return Err(ArgParseErr::with_msg(
                     "meltdown direction must be -1 (omni) or 0-360 (degrees)",
                 ));
             }
-            return Ok(DisplacementEffect::Meltdown { strength, direction });
+            let binding = if let Some(b_str) = parts.next() {
+                let b = b_str.parse::<f32>().map_err(|_| {
+                    ArgParseErr::with_msg("meltdown binding must be a float between 0.0 and 1.0")
+                })?;
+                if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+                    return Err(ArgParseErr::with_msg(
+                        "meltdown binding must be between 0.0 and 1.0",
+                    ));
+                }
+                b
+            } else {
+                1.0
+            };
+            return Ok(DisplacementEffect::Meltdown { strength, direction, binding });
         }
         Err(ArgParseErr::with_msg(
-            "displacement modifier must be 'explode:<strength>' \
-             or 'meltdown:<strength>:<direction>'",
+            "displacement modifier must be 'explode:<strength>[:<binding>]' \
+             or 'meltdown:<strength>:<direction>[:<binding>]'",
         ))
     }
 }
@@ -649,89 +821,503 @@ fn same_pixel(a: PremultipliedColorU8, b: PremultipliedColorU8) -> bool {
     a.red() == b.red() && a.green() == b.green() && a.blue() == b.blue() && a.alpha() == b.alpha()
 }
 
-/// How a >8-bit source image's channel layout should be restored on the way out.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HiKind {
-    /// More than 8 bits per channel, with an alpha channel.
-    Rgba,
-    /// More than 8 bits per channel, no alpha channel.
-    Rgb,
-}
-
 /// What we need to remember about the source image in order to write the
 /// rendered result back without silently degrading it.
 ///
 /// tiny_skia composites in 8-bit premultiplied RGBA, so the drawing itself is
-/// necessarily 8-bit. Rather than flattening a 16-bit source to 8 bits wholesale
-/// (which is what `to_rgba8()` on the way in and `ImageRgba8` on the way out
-/// used to do), keep the original high-precision pixels and only replace the
-/// ones the pipeline actually wrote. Everything the text and its effects didn't
-/// touch keeps full precision, and a source without an alpha channel gets one
-/// back without.
+/// necessarily 8-bit. Keep the original source image and only replace the
+/// pixels the pipeline actually modified, preserving the original precision and
+/// layout for untouched areas.
 struct SourcePrecision {
-    /// Original pixels at 16 bits per channel; `None` for 8-bit sources.
-    orig_hi: Option<(ImageBuffer<image::Rgba<u16>, Vec<u16>>, HiKind)>,
+    orig: DynamicImage,
     /// The 8-bit starting point, used to detect which pixels changed.
     base: Vec<PremultipliedColorU8>,
-}
-
-/// `None` for sources that are already 8 bits per channel, so there is nothing
-/// to preserve beyond what the pipeline itself produces.
-fn high_precision_kind(img: &DynamicImage) -> Option<HiKind> {
-    match img {
-        DynamicImage::ImageLumaA16(_)
-        | DynamicImage::ImageRgba16(_)
-        | DynamicImage::ImageRgba32F(_) => Some(HiKind::Rgba),
-        DynamicImage::ImageLuma16(_)
-        | DynamicImage::ImageRgb16(_)
-        | DynamicImage::ImageRgb32F(_) => Some(HiKind::Rgb),
-        _ => None,
-    }
 }
 
 /// Build the 8-bit working pixmap for the tiny_skia pipeline and capture what's
 /// needed to restore the source's precision afterwards.
 fn begin_render(image: &Image) -> Result<(Pixmap, SourcePrecision), MagickError> {
-    if let Some(kind) = high_precision_kind(&image.pixels) {
-        let hi = image.pixels.to_rgba16();
-        let (w, h) = (hi.width(), hi.height());
-        let mut pixmap = new_pixmap(w, h, "main")?;
-        for (src, dst) in hi.pixels().iter().zip(pixmap.pixels_mut()) {
-            // `/ 257` is the exact inverse of the `* 257` expansion used on the
-            // way back out, so 8-bit-valued samples survive a round trip.
-            *dst = ColorU8::from_rgba(
-                (src[0] / 257) as u8,
-                (src[1] / 257) as u8,
-                (src[2] / 257) as u8,
-                (src[3] / 257) as u8,
-            )
-            .premultiply();
+    let (w, h) = (image.pixels.width(), image.pixels.height());
+    let mut pixmap = new_pixmap(w, h, "main")?;
+
+    match &image.pixels {
+        DynamicImage::ImageLuma8(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                *dst = ColorU8::from_rgba(src[0], src[0], src[0], 255).premultiply();
+            }
         }
-        let base = pixmap.pixels().to_vec();
-        Ok((pixmap, SourcePrecision { orig_hi: Some((hi, kind)), base }))
-    } else {
-        let rgba = image.pixels.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        let mut pixmap = new_pixmap(w, h, "main")?;
-        for (src, dst) in rgba.pixels().iter().zip(pixmap.pixels_mut()) {
-            *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+        DynamicImage::ImageLumaA8(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                *dst = ColorU8::from_rgba(src[0], src[0], src[0], src[1]).premultiply();
+            }
         }
-        Ok((pixmap, SourcePrecision { orig_hi: None, base: Vec::new() }))
+        DynamicImage::ImageRgb8(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                *dst = ColorU8::from_rgba(src[0], src[1], src[2], 255).premultiply();
+            }
+        }
+        DynamicImage::ImageRgba8(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+            }
+        }
+        DynamicImage::ImageLuma16(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                let l = ((src[0] as u32 + 128) / 257) as u8;
+                *dst = ColorU8::from_rgba(l, l, l, 255).premultiply();
+            }
+        }
+        DynamicImage::ImageLumaA16(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                let l = ((src[0] as u32 + 128) / 257) as u8;
+                let a = ((src[1] as u32 + 128) / 257) as u8;
+                *dst = ColorU8::from_rgba(l, l, l, a).premultiply();
+            }
+        }
+        DynamicImage::ImageRgb16(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                let r = ((src[0] as u32 + 128) / 257) as u8;
+                let g = ((src[1] as u32 + 128) / 257) as u8;
+                let b = ((src[2] as u32 + 128) / 257) as u8;
+                *dst = ColorU8::from_rgba(r, g, b, 255).premultiply();
+            }
+        }
+        DynamicImage::ImageRgba16(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                let r = ((src[0] as u32 + 128) / 257) as u8;
+                let g = ((src[1] as u32 + 128) / 257) as u8;
+                let b = ((src[2] as u32 + 128) / 257) as u8;
+                let a = ((src[3] as u32 + 128) / 257) as u8;
+                *dst = ColorU8::from_rgba(r, g, b, a).premultiply();
+            }
+        }
+        DynamicImage::ImageRgb32F(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                let r = (src[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let g = (src[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let b = (src[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                *dst = ColorU8::from_rgba(r, g, b, 255).premultiply();
+            }
+        }
+        DynamicImage::ImageRgba32F(img) => {
+            for (src, dst) in img.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                let r = (src[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let g = (src[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let b = (src[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let a = (src[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+                *dst = ColorU8::from_rgba(r, g, b, a).premultiply();
+            }
+        }
+        _ => {
+            let rgba = image.pixels.to_rgba8();
+            for (src, dst) in rgba.pixels().iter().zip(pixmap.pixels_mut().iter_mut()) {
+                *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+            }
+        }
     }
+
+    let base = pixmap.pixels().to_vec();
+    Ok((pixmap, SourcePrecision { orig: image.pixels.clone(), base }))
 }
 
 /// Store the finished pixmap back into the image at the source's bit depth.
 fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision) {
     let (w, h) = (pixmap.width(), pixmap.height());
-    match precision.orig_hi {
-        Some((orig, kind)) => {
-            let mut out = ImageBuffer::<image::Rgba<u16>, Vec<u16>>::new(w, h);
+    match precision.orig {
+        DynamicImage::ImageLuma8(orig) => {
+            let mut can_stay_luma = true;
+            let mut can_stay_rgb = true;
+
+            for (i, res) in pixmap.pixels().iter().enumerate() {
+                if !same_pixel(*res, precision.base[i]) {
+                    let un_pre = res.demultiply();
+                    if un_pre.alpha() != 255 {
+                        can_stay_luma = false;
+                        can_stay_rgb = false;
+                        break;
+                    }
+                    if un_pre.red() != un_pre.green() || un_pre.green() != un_pre.blue() {
+                        can_stay_luma = false;
+                    }
+                }
+            }
+
+            if can_stay_luma {
+                let mut out = GrayImage::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(out.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = *orig_px;
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Luma([un_pre.red()]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageLuma8(out);
+            } else if can_stay_rgb {
+                let mut rgb = image::RgbImage::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgb.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgb([orig_px[0], orig_px[0], orig_px[0]]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgb([un_pre.red(), un_pre.green(), un_pre.blue()]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgb8(rgb);
+            } else {
+                let mut rgba = RgbaImage::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgba.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgba([orig_px[0], orig_px[0], orig_px[0], 255]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgba([
+                            un_pre.red(),
+                            un_pre.green(),
+                            un_pre.blue(),
+                            un_pre.alpha(),
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgba8(rgba);
+            }
+        }
+        DynamicImage::ImageLumaA8(orig) => {
+            let mut can_stay_luma = true;
+            for (i, res) in pixmap.pixels().iter().enumerate() {
+                if !same_pixel(*res, precision.base[i]) {
+                    let un_pre = res.demultiply();
+                    if un_pre.red() != un_pre.green() || un_pre.green() != un_pre.blue() {
+                        can_stay_luma = false;
+                        break;
+                    }
+                }
+            }
+            if can_stay_luma {
+                let mut out = ImageBuffer::<image::LumaA<u8>, Vec<u8>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(out.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = *orig_px;
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::LumaA([un_pre.red(), un_pre.alpha()]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageLumaA8(out);
+            } else {
+                let mut rgba = RgbaImage::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgba.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgba([orig_px[0], orig_px[0], orig_px[0], orig_px[1]]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgba([
+                            un_pre.red(),
+                            un_pre.green(),
+                            un_pre.blue(),
+                            un_pre.alpha(),
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgba8(rgba);
+            }
+        }
+        DynamicImage::ImageRgb8(orig) => {
             let mut opaque = true;
-            for (i, ((res, orig_px), dst)) in
-                pixmap.pixels().iter().zip(orig.pixels()).zip(out.pixels_mut()).enumerate()
+            for (i, res) in pixmap.pixels().iter().enumerate() {
+                if !same_pixel(*res, precision.base[i]) {
+                    if res.alpha() != 255 {
+                        opaque = false;
+                        break;
+                    }
+                }
+            }
+            if opaque {
+                let mut rgb = image::RgbImage::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgb.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = *orig_px;
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgb([un_pre.red(), un_pre.green(), un_pre.blue()]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgb8(rgb);
+            } else {
+                let mut rgba = RgbaImage::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgba.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgba([orig_px[0], orig_px[1], orig_px[2], 255]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgba([
+                            un_pre.red(),
+                            un_pre.green(),
+                            un_pre.blue(),
+                            un_pre.alpha(),
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgba8(rgba);
+            }
+        }
+        DynamicImage::ImageRgba8(orig) => {
+            let mut rgba = RgbaImage::new(w, h);
+            for (i, ((res, orig_px), dst)) in pixmap
+                .pixels()
+                .iter()
+                .zip(orig.pixels().iter())
+                .zip(rgba.pixels_mut().iter_mut())
+                .enumerate()
             {
                 if same_pixel(*res, precision.base[i]) {
-                    // Untouched by this render - keep the full source precision.
+                    *dst = *orig_px;
+                } else {
+                    let un_pre = res.demultiply();
+                    *dst =
+                        image::Rgba([un_pre.red(), un_pre.green(), un_pre.blue(), un_pre.alpha()]);
+                }
+            }
+            image.pixels = DynamicImage::ImageRgba8(rgba);
+        }
+        DynamicImage::ImageLuma16(orig) => {
+            let mut can_stay_luma = true;
+            let mut can_stay_rgb = true;
+            for (i, res) in pixmap.pixels().iter().enumerate() {
+                if !same_pixel(*res, precision.base[i]) {
+                    let un_pre = res.demultiply();
+                    if un_pre.alpha() != 255 {
+                        can_stay_luma = false;
+                        can_stay_rgb = false;
+                        break;
+                    }
+                    if un_pre.red() != un_pre.green() || un_pre.green() != un_pre.blue() {
+                        can_stay_luma = false;
+                    }
+                }
+            }
+            if can_stay_luma {
+                let mut out = ImageBuffer::<image::Luma<u16>, Vec<u16>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(out.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = *orig_px;
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Luma([un_pre.red() as u16 * 257]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageLuma16(out);
+            } else if can_stay_rgb {
+                let mut rgb = ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgb.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgb([orig_px[0], orig_px[0], orig_px[0]]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgb([
+                            un_pre.red() as u16 * 257,
+                            un_pre.green() as u16 * 257,
+                            un_pre.blue() as u16 * 257,
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgb16(rgb);
+            } else {
+                let mut rgba = ImageBuffer::<image::Rgba<u16>, Vec<u16>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgba.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgba([orig_px[0], orig_px[0], orig_px[0], u16::MAX]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgba([
+                            un_pre.red() as u16 * 257,
+                            un_pre.green() as u16 * 257,
+                            un_pre.blue() as u16 * 257,
+                            un_pre.alpha() as u16 * 257,
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgba16(rgba);
+            }
+        }
+        DynamicImage::ImageLumaA16(orig) => {
+            let mut can_stay_luma = true;
+            for (i, res) in pixmap.pixels().iter().enumerate() {
+                if !same_pixel(*res, precision.base[i]) {
+                    let un_pre = res.demultiply();
+                    if un_pre.red() != un_pre.green() || un_pre.green() != un_pre.blue() {
+                        can_stay_luma = false;
+                        break;
+                    }
+                }
+            }
+            if can_stay_luma {
+                let mut out = ImageBuffer::<image::LumaA<u16>, Vec<u16>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(out.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = *orig_px;
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst =
+                            image::LumaA([un_pre.red() as u16 * 257, un_pre.alpha() as u16 * 257]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageLumaA16(out);
+            } else {
+                let mut rgba = ImageBuffer::<image::Rgba<u16>, Vec<u16>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgba.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgba([orig_px[0], orig_px[0], orig_px[0], orig_px[1]]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgba([
+                            un_pre.red() as u16 * 257,
+                            un_pre.green() as u16 * 257,
+                            un_pre.blue() as u16 * 257,
+                            un_pre.alpha() as u16 * 257,
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgba16(rgba);
+            }
+        }
+        DynamicImage::ImageRgb16(orig) => {
+            let mut opaque = true;
+            for (i, res) in pixmap.pixels().iter().enumerate() {
+                if !same_pixel(*res, precision.base[i]) {
+                    if res.alpha() != 255 {
+                        opaque = false;
+                        break;
+                    }
+                }
+            }
+            if opaque {
+                let mut rgb = ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgb.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = *orig_px;
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgb([
+                            un_pre.red() as u16 * 257,
+                            un_pre.green() as u16 * 257,
+                            un_pre.blue() as u16 * 257,
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgb16(rgb);
+            } else {
+                let mut rgba = ImageBuffer::<image::Rgba<u16>, Vec<u16>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgba.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgba([orig_px[0], orig_px[1], orig_px[2], u16::MAX]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgba([
+                            un_pre.red() as u16 * 257,
+                            un_pre.green() as u16 * 257,
+                            un_pre.blue() as u16 * 257,
+                            un_pre.alpha() as u16 * 257,
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgba16(rgba);
+            }
+        }
+        DynamicImage::ImageRgba16(orig) => {
+            let mut rgba = ImageBuffer::<image::Rgba<u16>, Vec<u16>>::new(w, h);
+            for (i, ((res, orig_px), dst)) in pixmap
+                .pixels()
+                .iter()
+                .zip(orig.pixels().iter())
+                .zip(rgba.pixels_mut().iter_mut())
+                .enumerate()
+            {
+                if same_pixel(*res, precision.base[i]) {
                     *dst = *orig_px;
                 } else {
                     let un_pre = res.demultiply();
@@ -742,25 +1328,90 @@ fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision)
                         un_pre.alpha() as u16 * 257,
                     ]);
                 }
-                if dst[3] != u16::MAX {
-                    opaque = false;
+            }
+            image.pixels = DynamicImage::ImageRgba16(rgba);
+        }
+        DynamicImage::ImageRgb32F(orig) => {
+            let mut opaque = true;
+            for (i, res) in pixmap.pixels().iter().enumerate() {
+                if !same_pixel(*res, precision.base[i]) {
+                    if res.alpha() != 255 {
+                        opaque = false;
+                        break;
+                    }
                 }
             }
-            image.pixels = if kind == HiKind::Rgb && opaque {
-                // The source had no alpha channel and nothing introduced one,
-                // so hand back the same layout instead of promoting to RGBA.
-                let mut rgb = ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(w, h);
-                for (src, dst) in out.pixels().iter().zip(rgb.pixels_mut()) {
-                    *dst = image::Rgb([src[0], src[1], src[2]]);
+            if opaque {
+                let mut rgb = ImageBuffer::<image::Rgb<f32>, Vec<f32>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgb.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = *orig_px;
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgb([
+                            un_pre.red() as f32 / 255.0,
+                            un_pre.green() as f32 / 255.0,
+                            un_pre.blue() as f32 / 255.0,
+                        ]);
+                    }
                 }
-                DynamicImage::ImageRgb16(rgb)
+                image.pixels = DynamicImage::ImageRgb32F(rgb);
             } else {
-                DynamicImage::ImageRgba16(out)
-            };
+                let mut rgba = ImageBuffer::<image::Rgba<f32>, Vec<f32>>::new(w, h);
+                for (i, ((res, orig_px), dst)) in pixmap
+                    .pixels()
+                    .iter()
+                    .zip(orig.pixels().iter())
+                    .zip(rgba.pixels_mut().iter_mut())
+                    .enumerate()
+                {
+                    if same_pixel(*res, precision.base[i]) {
+                        *dst = image::Rgba([orig_px[0], orig_px[1], orig_px[2], 1.0]);
+                    } else {
+                        let un_pre = res.demultiply();
+                        *dst = image::Rgba([
+                            un_pre.red() as f32 / 255.0,
+                            un_pre.green() as f32 / 255.0,
+                            un_pre.blue() as f32 / 255.0,
+                            un_pre.alpha() as f32 / 255.0,
+                        ]);
+                    }
+                }
+                image.pixels = DynamicImage::ImageRgba32F(rgba);
+            }
         }
-        None => {
+        DynamicImage::ImageRgba32F(orig) => {
+            let mut rgba = ImageBuffer::<image::Rgba<f32>, Vec<f32>>::new(w, h);
+            for (i, ((res, orig_px), dst)) in pixmap
+                .pixels()
+                .iter()
+                .zip(orig.pixels().iter())
+                .zip(rgba.pixels_mut().iter_mut())
+                .enumerate()
+            {
+                if same_pixel(*res, precision.base[i]) {
+                    *dst = *orig_px;
+                } else {
+                    let un_pre = res.demultiply();
+                    *dst = image::Rgba([
+                        un_pre.red() as f32 / 255.0,
+                        un_pre.green() as f32 / 255.0,
+                        un_pre.blue() as f32 / 255.0,
+                        un_pre.alpha() as f32 / 255.0,
+                    ]);
+                }
+            }
+            image.pixels = DynamicImage::ImageRgba32F(rgba);
+        }
+        _ => {
             let mut out_rgba = RgbaImage::new(w, h);
-            for (src, dst) in pixmap.pixels().iter().zip(out_rgba.pixels_mut()) {
+            for (src, dst) in pixmap.pixels().iter().zip(out_rgba.pixels_mut().iter_mut()) {
                 let un_pre = src.demultiply();
                 *dst = image::Rgba([un_pre.red(), un_pre.green(), un_pre.blue(), un_pre.alpha()]);
             }
@@ -911,8 +1562,9 @@ fn apply_blur_under_rotated_region(
     let crop_h = y1 - y0 + 1;
 
     // Copy the sub-rect out row by row rather than going through a crop helper,
-    // whose signature differs between `image` versions. The whole-image
-    // `to_rgba8` is a linear pass; the blur it saves is the expensive part.
+    // whose signature differs between `image` versions.
+    // Premultiply the crop before blurring so transparent pixels' straight RGB
+    // (usually black) does not bleed into the blurred fringe.
     let src_rgba = source_image.pixels.to_rgba8();
     let src_raw = src_rgba.as_raw();
     let src_stride = src_rgba.width() as usize * 4;
@@ -921,7 +1573,15 @@ fn apply_blur_under_rotated_region(
     for cy in 0..crop_h as usize {
         let s = (y0 as usize + cy) * src_stride + x0 as usize * 4;
         let d = cy * crop_stride;
-        crop_raw[d..d + crop_stride].copy_from_slice(&src_raw[s..s + crop_stride]);
+        for cx in 0..crop_w as usize {
+            let sp = s + cx * 4;
+            let dp = d + cx * 4;
+            let a = src_raw[sp + 3] as u32;
+            crop_raw[dp] = ((src_raw[sp] as u32 * a) / 255) as u8;
+            crop_raw[dp + 1] = ((src_raw[sp + 1] as u32 * a) / 255) as u8;
+            crop_raw[dp + 2] = ((src_raw[sp + 2] as u32 * a) / 255) as u8;
+            crop_raw[dp + 3] = a as u8;
+        }
     }
     let crop = RgbaImage::from_raw(crop_w, crop_h, crop_raw)
         .ok_or_else(|| wm_err!("failed to build blur crop buffer"))?;
@@ -959,13 +1619,12 @@ fn apply_blur_under_rotated_region(
                 continue;
             }
             let bi = (blur_row + (x - bx0)) * 4;
-            let blurred_pre = ColorU8::from_rgba(
-                blurred_raw[bi],
-                blurred_raw[bi + 1],
-                blurred_raw[bi + 2],
-                blurred_raw[bi + 3],
-            )
-            .premultiply();
+            let ba = blurred_raw[bi + 3];
+            let br = blurred_raw[bi].min(ba);
+            let bg = blurred_raw[bi + 1].min(ba);
+            let bb = blurred_raw[bi + 2].min(ba);
+            let blurred_pre = PremultipliedColorU8::from_rgba(br, bg, bb, ba)
+                .unwrap_or_else(|| PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
 
             let orig = row[x];
             let inv = 255 - ma;
@@ -1104,7 +1763,7 @@ fn disc_rectangles(r: usize) -> Vec<(usize, usize)> {
 }
 
 /// Morphological dilation on an alpha channel using a circular structuring
-/// element. `thickness` is the kernel diameter (will be forced to odd).
+/// element. `thickness` is the outline stroke width in pixels.
 ///
 /// The structuring element is the exact digital disc `dx^2 + dy^2 <= radius^2`,
 /// so the output is byte-for-byte what direct evaluation of the k^2 kernel
@@ -1123,8 +1782,7 @@ fn disc_rectangles(r: usize) -> Vec<(usize, usize)> {
 /// reads its own row and the vertical pass only its own column, so nothing that
 /// spills off an edge could have come back.
 fn dilate_alpha(alpha: &[u8], width: u32, height: u32, thickness: u32) -> Vec<u8> {
-    let ksize = if thickness.is_multiple_of(2) { thickness + 1 } else { thickness };
-    let radius = (ksize / 2) as usize;
+    let radius = thickness as usize;
 
     let w = width as usize;
     let h = height as usize;
@@ -1156,9 +1814,153 @@ fn dilate_alpha(alpha: &[u8], width: u32, height: u32, thickness: u32) -> Vec<u8
     transpose(&acc_t, h, w)
 }
 
+/// Apply radial explode displacement to a pixmap in-place.
+fn apply_explode(
+    pixmap: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    effect_radius: f32,
+    strength: f32,
+    img_w: u32,
+    img_h: u32,
+) {
+    if strength <= 0.0 || effect_radius <= 0.0 {
+        return;
+    }
+    let inv_radius = 1.0 / effect_radius;
+    let src_snap: Vec<PremultipliedColorU8> = pixmap.pixels().to_vec();
+    let w = img_w as usize;
+    let h = img_h as usize;
+
+    pixmap.pixels_mut().par_chunks_mut(w).enumerate().for_each(|(y_idx, row)| {
+        for x_idx in 0..w {
+            let dx = x_idx as f32 - cx;
+            let dy = y_idx as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            if dist >= effect_radius || dist < 0.001 {
+                continue;
+            }
+
+            // Quadratic falloff: strong near center, zero at radius
+            let t = dist * inv_radius;
+            let displacement = strength * (1.0 - t) * (1.0 - t);
+
+            // Pull source position back toward centroid
+            let scale = ((dist - displacement) / dist).max(0.0);
+            let src_x = (cx + dx * scale).clamp(0.0, (w - 1) as f32);
+            let src_y = (cy + dy * scale).clamp(0.0, (h - 1) as f32);
+
+            let x0 = src_x.floor() as usize;
+            let y0 = src_y.floor() as usize;
+            let x1 = (x0 + 1).min(w - 1);
+            let y1 = (y0 + 1).min(h - 1);
+            let fx = src_x - x0 as f32;
+            let fy = src_y - y0 as f32;
+
+            let p00 = src_snap[y0 * w + x0];
+            let p10 = src_snap[y0 * w + x1];
+            let p01 = src_snap[y1 * w + x0];
+            let p11 = src_snap[y1 * w + x1];
+
+            let blerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+                let top = a as f32 * (1.0 - fx) + b as f32 * fx;
+                let bot = c as f32 * (1.0 - fx) + d as f32 * fx;
+                (top * (1.0 - fy) + bot * fy) as u8
+            };
+
+            let r = blerp(p00.red(), p10.red(), p01.red(), p11.red());
+            let g = blerp(p00.green(), p10.green(), p01.green(), p11.green());
+            let b = blerp(p00.blue(), p10.blue(), p01.blue(), p11.blue());
+            let a = blerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha());
+
+            if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, a) {
+                row[x_idx] = c;
+            }
+        }
+    });
+}
+
+/// Apply text-shaped meltdown displacement to a pixmap in-place.
+fn apply_meltdown(
+    pixmap: &mut Pixmap,
+    field: &[f32],
+    is_omni: bool,
+    fixed_dx: f32,
+    fixed_dy: f32,
+    strength: f32,
+    img_w: u32,
+    img_h: u32,
+) {
+    if strength <= 0.0 {
+        return;
+    }
+    let src_snap: Vec<PremultipliedColorU8> = pixmap.pixels().to_vec();
+    let w = img_w as usize;
+    let h = img_h as usize;
+
+    pixmap.pixels_mut().par_chunks_mut(w).enumerate().for_each(|(y_idx, row)| {
+        for x_idx in 0..w {
+            let fv = field[y_idx * w + x_idx];
+            if fv < 0.002 {
+                continue;
+            }
+
+            let displacement = strength * fv;
+
+            // Determine push direction
+            let (push_dx, push_dy) = if is_omni {
+                let x0 = x_idx.saturating_sub(1);
+                let x1 = (x_idx + 1).min(w - 1);
+                let y0 = y_idx.saturating_sub(1);
+                let y1 = (y_idx + 1).min(h - 1);
+                let gx = field[y_idx * w + x1] - field[y_idx * w + x0];
+                let gy = field[y1 * w + x_idx] - field[y0 * w + x_idx];
+                let glen = (gx * gx + gy * gy).sqrt();
+                if glen < 1e-6 {
+                    continue;
+                }
+                (-gx / glen, -gy / glen)
+            } else {
+                (fixed_dx, fixed_dy)
+            };
+
+            let src_x = (x_idx as f32 - displacement * push_dx).clamp(0.0, (w - 1) as f32);
+            let src_y = (y_idx as f32 - displacement * push_dy).clamp(0.0, (h - 1) as f32);
+
+            let sx0 = src_x.floor() as usize;
+            let sy0 = src_y.floor() as usize;
+            let sx1 = (sx0 + 1).min(w - 1);
+            let sy1 = (sy0 + 1).min(h - 1);
+            let fx = src_x - sx0 as f32;
+            let fy = src_y - sy0 as f32;
+
+            let p00 = src_snap[sy0 * w + sx0];
+            let p10 = src_snap[sy0 * w + sx1];
+            let p01 = src_snap[sy1 * w + sx0];
+            let p11 = src_snap[sy1 * w + sx1];
+
+            let blerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+                let top = a as f32 * (1.0 - fx) + b as f32 * fx;
+                let bot = c as f32 * (1.0 - fx) + d as f32 * fx;
+                (top * (1.0 - fy) + bot * fy) as u8
+            };
+
+            let r = blerp(p00.red(), p10.red(), p01.red(), p11.red());
+            let g = blerp(p00.green(), p10.green(), p01.green(), p11.green());
+            let b = blerp(p00.blue(), p10.blue(), p01.blue(), p11.blue());
+            let a = blerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha());
+
+            if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, a) {
+                row[x_idx] = c;
+            }
+        }
+    });
+}
+
 /// Render a QR code block onto the image, using the same position/rotation/color
 /// system as text rendering. The QR code size is determined by font_size.
-/// Renders at 4x internal resolution to anti-alias rotated edges.
+/// Renders at 4x internal resolution and downsamples with area-averaging for smooth rotated edges.
 fn render_qr_block(
     image: &mut Image,
     config: &TextConfig,
@@ -1204,18 +2006,12 @@ fn render_qr_block(
         .build();
 
     let (ss_w, ss_h) = qr_rgba.dimensions();
-    // Final display size after downscale. `min_dimensions` rounds up to a whole
-    // number of QR modules, so `ss_w` is usually larger than `ss_size` and
-    // rarely an exact multiple of `ss`. Keeping the display size as a float
-    // means positioning and masking match what is actually drawn instead of
-    // being off by the truncated fraction (and by however much the module
-    // rounding grew the code).
     let qw = ss_w as f32 / ss as f32;
     let qh = ss_h as f32 / ss as f32;
 
     // Build a tiny_skia pixmap from the supersampled QR image
     let mut qr_pixmap = new_pixmap(ss_w, ss_h, "QR")?;
-    for (src, dst) in qr_rgba.pixels().iter().zip(qr_pixmap.pixels_mut()) {
+    for (src, dst) in qr_rgba.pixels().iter().zip(qr_pixmap.pixels_mut().iter_mut()) {
         *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
     }
 
@@ -1238,12 +2034,6 @@ fn render_qr_block(
     let start_x = desired_x + (rot_w - qw) / 2.0;
     let start_y = desired_y + (rot_h - qh) / 2.0;
 
-    // Scale down from supersampled size + translate + rotate
-    let scale = 1.0 / ss as f32;
-    let transform = Transform::from_translate(start_x, start_y)
-        .pre_concat(Transform::from_rotate_at(config.rotation, qw / 2.0, qh / 2.0))
-        .pre_concat(Transform::from_scale(scale, scale));
-
     // If blur_sigma > 0, blur the region under the *rotated* QR footprint.
     if qr.blur_sigma > 0.0 {
         // Build the mask at display resolution using shared blur mask builder.
@@ -1257,8 +2047,7 @@ fn render_qr_block(
             if qr.blur_gradual_pct > 0.0 { qw * (qr.blur_gradual_pct / 100.0) } else { 0.0 };
         let (mask_src, total_margin) = build_blur_mask(qw, qh, inner_margin, falloff)?;
 
-        // Position the mask so it's centered on the QR display footprint,
-        // using a transform without the supersampled scale factor.
+        // Position the mask so it's centered on the QR display footprint.
         let mask_x = start_x - total_margin;
         let mask_y = start_y - total_margin;
         let mask_transform =
@@ -1279,8 +2068,34 @@ fn render_qr_block(
         )?;
     }
 
-    // Composite the QR code on top of the (optionally blurred) base
-    main_pixmap.draw_pixmap(
+    // To anti-alias the outside rotated edges as well as the interior QR modules,
+    // draw the 4x QR onto a 4x supersampled local crop pixmap at 4x resolution,
+    // then downsample the entire rotated crop with Lanczos3 area-averaging.
+    let center_x = start_x + qw / 2.0;
+    let center_y = start_y + qh / 2.0;
+    let bx0 = (center_x - rot_w / 2.0).floor() as i64 - 1;
+    let by0 = (center_y - rot_h / 2.0).floor() as i64 - 1;
+    let bx1 = (center_x + rot_w / 2.0).ceil() as i64 + 1;
+    let by1 = (center_y + rot_h / 2.0).ceil() as i64 + 1;
+    let bw = (bx1 - bx0 + 1).max(1) as u32;
+    let bh = (by1 - by0 + 1).max(1) as u32;
+
+    let ss_crop_w = layer_dim((bw * ss) as f32, "QR SS crop")?;
+    let ss_crop_h = layer_dim((bh * ss) as f32, "QR SS crop")?;
+    let mut ss_crop_pixmap = new_pixmap(ss_crop_w, ss_crop_h, "QR SS crop")?;
+
+    let crop_cx_4x = (center_x - bx0 as f32) * ss as f32;
+    let crop_cy_4x = (center_y - by0 as f32) * ss as f32;
+
+    let transform_4x =
+        Transform::from_translate(crop_cx_4x - ss_w as f32 / 2.0, crop_cy_4x - ss_h as f32 / 2.0)
+            .pre_concat(Transform::from_rotate_at(
+                config.rotation,
+                ss_w as f32 / 2.0,
+                ss_h as f32 / 2.0,
+            ));
+
+    ss_crop_pixmap.draw_pixmap(
         0,
         0,
         qr_pixmap.as_ref(),
@@ -1289,7 +2104,35 @@ fn render_qr_block(
             blend_mode: BlendMode::SourceOver,
             quality: FilterQuality::Bilinear,
         },
-        transform,
+        transform_4x,
+        None,
+    );
+
+    let mut ss_img = RgbaImage::new(ss_crop_w, ss_crop_h);
+    for (src, dst) in ss_crop_pixmap.pixels().iter().zip(ss_img.pixels_mut().iter_mut()) {
+        let un_pre = src.demultiply();
+        *dst = image::Rgba([un_pre.red(), un_pre.green(), un_pre.blue(), un_pre.alpha()]);
+    }
+
+    let downscaled =
+        image::imageops::resize(&ss_img, bw, bh, image::imageops::FilterType::Lanczos3);
+
+    let mut crop_1x_pixmap = new_pixmap(bw, bh, "QR downscaled")?;
+    for (src, dst) in downscaled.pixels().iter().zip(crop_1x_pixmap.pixels_mut().iter_mut()) {
+        *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+    }
+
+    let final_transform = Transform::from_translate(bx0 as f32, by0 as f32);
+    main_pixmap.draw_pixmap(
+        0,
+        0,
+        crop_1x_pixmap.as_ref(),
+        &PixmapPaint {
+            opacity: 1.0,
+            blend_mode: BlendMode::SourceOver,
+            quality: FilterQuality::Bilinear,
+        },
+        final_transform,
         None,
     );
 
@@ -1464,12 +2307,11 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
     for run in buffer.layout_runs() {
         for glyph in run.glyphs.iter() {
             total_glyphs += 1;
-            let physical_glyph = glyph.physical((0., 0.), 1.0);
+            let physical_glyph = glyph.physical((pad, pad + run.line_y), 1.0);
             if let Some(img) = swash_cache.get_image(&mut *font_system, physical_glyph.cache_key) {
-                // Offset by pad to utilize the padding margin and avoid clipping.
-                // run.line_y positions each line vertically for multiline text.
-                let gx = physical_glyph.x as f32 + img.placement.left as f32 + pad;
-                let gy = run.line_y + physical_glyph.y as f32 - img.placement.top as f32 + pad;
+                // Offset by pad is included in physical_glyph coordinate.
+                let gx = physical_glyph.x + img.placement.left;
+                let gy = physical_glyph.y - img.placement.top;
 
                 draw_glyph_pixels(&mut text_pixmap, tw_u32, th_u32, img, gx, gy, config.color);
             } else {
@@ -1490,11 +2332,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                     .max(start);
                 let ch = &rt[start..end];
                 if !ch.is_empty() {
-                    failed.push(FailedGlyph {
-                        text: ch.to_string(),
-                        x: physical_glyph.x as f32,
-                        y: run.line_y + physical_glyph.y as f32,
-                    });
+                    failed.push(FailedGlyph { text: ch.to_string(), x: glyph.x, y: run.line_y });
                 }
             }
         }
@@ -1518,12 +2356,12 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                 let mut rendered = false;
                 for run in fb_buf.layout_runs() {
                     for glyph in run.glyphs.iter() {
-                        let pg = glyph.physical((0., 0.), 1.0);
+                        let pg = glyph.physical((pad + fg.x, pad + fg.y + run.line_y), 1.0);
                         if let Some(img) = swash_cache.get_image(&mut *font_system, pg.cache_key) {
                             rendered = true;
                             // Draw at the original position from primary font layout
-                            let gx = fg.x + img.placement.left as f32 + pad;
-                            let gy = fg.y - img.placement.top as f32 + pad;
+                            let gx = pg.x + img.placement.left;
+                            let gy = pg.y - img.placement.top;
                             draw_glyph_pixels(
                                 &mut text_pixmap,
                                 tw_u32,
@@ -1581,13 +2419,17 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
         quality: FilterQuality::Bilinear,
     };
 
-    // Apply the configured background effect
-    match &config.effect {
-        TextEffect::None => {}
-        TextEffect::Blur { sigma } | TextEffect::GradualBlur { sigma } => {
-            // Scan the text pixmap alpha to find the tight bounding box of
-            // the actually-rendered glyphs. This avoids line-height padding
-            // that makes the blur region asymmetric.
+    // Separate background blur and glyph effects (outline/shadow), supporting combined effects.
+    let (bg_effect, glyph_effect) = match &config.effect {
+        TextEffect::None => (None, None),
+        TextEffect::Blur { .. } | TextEffect::GradualBlur { .. } => (Some(&config.effect), None),
+        TextEffect::Outline { .. } | TextEffect::Shadow { .. } => (None, Some(&config.effect)),
+        TextEffect::Combined { bg, glyph } => (Some(&**bg), Some(&**glyph)),
+    };
+
+    // 1. Apply background blur effect (if any)
+    if let Some(bg) = bg_effect {
+        if let TextEffect::Blur { sigma } | TextEffect::GradualBlur { sigma } = bg {
             if let Some((min_x, max_x, min_y, max_y)) =
                 compute_alpha_bbox(text_pixmap.pixels(), tw_u32, th_u32)
             {
@@ -1597,7 +2439,7 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                 // Small symmetric margin around the tight glyph bounds
                 let inner_margin = font_size * 0.3;
                 // GradualBlur gets a smooth falloff zone; plain Blur stays sharp
-                let falloff = if matches!(&config.effect, TextEffect::GradualBlur { .. }) {
+                let falloff = if matches!(bg, TextEffect::GradualBlur { .. }) {
                     (*sigma * 3.0).max(font_size * 0.5)
                 } else {
                     0.0
@@ -1630,112 +2472,125 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                 )?;
             }
         }
-        TextEffect::Outline { thickness, color } => {
-            // Dilation grows the mask by up to thickness/2 in every direction,
-            // which the text pixmap's own `pad` margin doesn't necessarily
-            // cover, so work in a buffer expanded by that much and composite it
-            // back at the matching offset.
-            let grow = thickness / 2 + 1;
-            let ow = tw_u32 + grow * 2;
-            let oh = th_u32 + grow * 2;
-
-            // Extract alpha channel from text_pixmap into the expanded buffer
-            let mut alpha_buf = vec![0u8; ow as usize * oh as usize];
-            for (i, px) in text_pixmap.pixels().iter().enumerate() {
-                let x = (i as u32) % tw_u32 + grow;
-                let y = (i as u32) / tw_u32 + grow;
-                alpha_buf[(y * ow + x) as usize] = px.alpha();
-            }
-
-            // Dilate the alpha channel
-            let dilated = dilate_alpha(&alpha_buf, ow, oh, *thickness);
-
-            // Build an outline pixmap: dilated area filled with outline color
-            let mut outline_pixmap = new_pixmap(ow, oh, "outline")?;
-            let (or, og, ob, oa) = *color;
-            for (i, out_px) in outline_pixmap.pixels_mut().iter_mut().enumerate() {
-                let da = dilated[i] as u32;
-                if da > 0 {
-                    // Modulate outline color alpha by the dilated mask
-                    let final_a = (oa as u32 * da) / 255;
-                    let pr = (or as u32 * final_a) / 255;
-                    let pg = (og as u32 * final_a) / 255;
-                    let pb = (ob as u32 * final_a) / 255;
-                    if let Some(c) =
-                        PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, final_a as u8)
-                    {
-                        *out_px = c;
-                    }
-                }
-            }
-
-            // Composite outline first (behind text), pivoting about the same
-            // canvas point as the text pixmap.
-            let outline_transform =
-                Transform::from_translate(start_x - grow as f32, start_y - grow as f32).pre_concat(
-                    Transform::from_rotate_at(
-                        config.rotation,
-                        text_w / 2.0 + grow as f32,
-                        text_h / 2.0 + grow as f32,
-                    ),
-                );
-            main_pixmap.draw_pixmap(0, 0, outline_pixmap.as_ref(), &paint, outline_transform, None);
-        }
-        TextEffect::Shadow { dx, dy, sigma, color } => {
-            // Build a shadow image from the already-rendered text alpha,
-            // filled with the shadow color. This captures all glyphs
-            // including fallback-rendered ones without re-rasterizing.
-            let (sr, sg, sb, sa) = *color;
-            // Give the gaussian room to spread. The text pixmap only has `pad`
-            // of slack, so a large sigma used to have its soft edge sheared off
-            // square at the pixmap bounds.
-            let grow = (*sigma * 3.0).ceil().max(0.0) as u32;
-            let sw = tw_u32 + grow * 2;
-            let sh = th_u32 + grow * 2;
-
-            // Pre-fill every pixel with the shadow colour at zero alpha.
-            // `image`'s gaussian blur mixes each channel independently and
-            // unpremultiplied, so leaving untouched pixels at RGB (0,0,0)
-            // dragged the soft edge of any non-black shadow toward black.
-            let mut shadow_rgba = RgbaImage::from_pixel(sw, sh, image::Rgba([sr, sg, sb, 0]));
-            for (i, text_px) in text_pixmap.pixels().iter().enumerate() {
-                let ta = text_px.alpha() as u32;
-                if ta > 0 {
-                    // Modulate shadow alpha by the glyph alpha
-                    let final_a = ((sa as u32 * ta) / 255) as u8;
-                    let x = (i as u32) % tw_u32 + grow;
-                    let y = (i as u32) / tw_u32 + grow;
-                    shadow_rgba.put_pixel(x, y, image::Rgba([sr, sg, sb, final_a]));
-                }
-            }
-
-            // Gaussian blur the shadow to soften it
-            let shadow_dyn = DynamicImage::ImageRgba8(shadow_rgba);
-            let blurred_shadow = if *sigma > 0.0 { shadow_dyn.blur(*sigma) } else { shadow_dyn };
-            let blurred_rgba = blurred_shadow.to_rgba8();
-
-            // Convert blurred shadow back to a Pixmap for compositing
-            let mut shadow_pixmap = new_pixmap(sw, sh, "shadow")?;
-            for (src, dst) in blurred_rgba.pixels().iter().zip(shadow_pixmap.pixels_mut()) {
-                *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
-            }
-
-            // Composite shadow behind text, offset by (dx, dy) in canvas space
-            let shadow_transform =
-                Transform::from_translate(start_x + dx - grow as f32, start_y + dy - grow as f32)
-                    .pre_concat(Transform::from_rotate_at(
-                        config.rotation,
-                        text_w / 2.0 + grow as f32,
-                        text_h / 2.0 + grow as f32,
-                    ));
-            main_pixmap.draw_pixmap(0, 0, shadow_pixmap.as_ref(), &paint, shadow_transform, None);
-        }
     }
 
-    // --- Apply displacement modifier (warps the already-effected background) ---
+    // 2. Prepare glyph outline or shadow layer (if configured)
+    let effect_layer = if let Some(glyph) = glyph_effect {
+        match glyph {
+            TextEffect::Outline { thickness, color } => {
+                // Dilation grows the mask by up to thickness in every direction,
+                // which the text pixmap's own `pad` margin doesn't necessarily
+                // cover, so work in a buffer expanded by that much and composite it
+                // back at the matching offset.
+                let grow = *thickness + 1;
+                let ow = tw_u32 + grow * 2;
+                let oh = th_u32 + grow * 2;
+
+                // Extract alpha channel from text_pixmap into the expanded buffer
+                let mut alpha_buf = vec![0u8; ow as usize * oh as usize];
+                for (i, px) in text_pixmap.pixels().iter().enumerate() {
+                    let x = (i as u32) % tw_u32 + grow;
+                    let y = (i as u32) / tw_u32 + grow;
+                    alpha_buf[(y * ow + x) as usize] = px.alpha();
+                }
+
+                // Dilate the alpha channel
+                let dilated = dilate_alpha(&alpha_buf, ow, oh, *thickness);
+
+                // Build an outline pixmap: dilated area filled with outline color
+                let mut outline_pixmap = new_pixmap(ow, oh, "outline")?;
+                let (or, og, ob, oa) = *color;
+                for (i, out_px) in outline_pixmap.pixels_mut().iter_mut().enumerate() {
+                    let da = dilated[i] as u32;
+                    if da > 0 {
+                        // Modulate outline color alpha by the dilated mask
+                        let final_a = (oa as u32 * da) / 255;
+                        let pr = (or as u32 * final_a) / 255;
+                        let pg = (og as u32 * final_a) / 255;
+                        let pb = (ob as u32 * final_a) / 255;
+                        if let Some(c) = PremultipliedColorU8::from_rgba(
+                            pr as u8,
+                            pg as u8,
+                            pb as u8,
+                            final_a as u8,
+                        ) {
+                            *out_px = c;
+                        }
+                    }
+                }
+
+                // Project outline to canvas space
+                let outline_transform =
+                    Transform::from_translate(start_x - grow as f32, start_y - grow as f32)
+                        .pre_concat(Transform::from_rotate_at(
+                            config.rotation,
+                            text_w / 2.0 + grow as f32,
+                            text_h / 2.0 + grow as f32,
+                        ));
+                let mut layer = new_pixmap(img_w, img_h, "outline layer")?;
+                layer.draw_pixmap(0, 0, outline_pixmap.as_ref(), &paint, outline_transform, None);
+                Some(layer)
+            }
+            TextEffect::Shadow { dx, dy, sigma, color } => {
+                // Build a shadow image from the already-rendered text alpha,
+                // filled with the shadow color. This captures all glyphs
+                // including fallback-rendered ones without re-rasterizing.
+                let (sr, sg, sb, sa) = *color;
+                let grow = (*sigma * 3.0).ceil().max(0.0) as u32;
+                let sw = tw_u32 + grow * 2;
+                let sh = th_u32 + grow * 2;
+
+                let mut shadow_rgba = RgbaImage::from_pixel(sw, sh, image::Rgba([sr, sg, sb, 0]));
+                for (i, text_px) in text_pixmap.pixels().iter().enumerate() {
+                    let ta = text_px.alpha() as u32;
+                    if ta > 0 {
+                        let final_a = ((sa as u32 * ta) / 255) as u8;
+                        let x = (i as u32) % tw_u32 + grow;
+                        let y = (i as u32) / tw_u32 + grow;
+                        shadow_rgba.put_pixel(x, y, image::Rgba([sr, sg, sb, final_a]));
+                    }
+                }
+
+                let shadow_dyn = DynamicImage::ImageRgba8(shadow_rgba);
+                let blurred_shadow =
+                    if *sigma > 0.0 { shadow_dyn.blur(*sigma) } else { shadow_dyn };
+                let blurred_rgba = blurred_shadow.to_rgba8();
+
+                let mut shadow_pixmap = new_pixmap(sw, sh, "shadow")?;
+                for (src, dst) in
+                    blurred_rgba.pixels().iter().zip(shadow_pixmap.pixels_mut().iter_mut())
+                {
+                    *dst = ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+                }
+
+                let shadow_transform = Transform::from_translate(
+                    start_x + dx - grow as f32,
+                    start_y + dy - grow as f32,
+                )
+                .pre_concat(Transform::from_rotate_at(
+                    config.rotation,
+                    text_w / 2.0 + grow as f32,
+                    text_h / 2.0 + grow as f32,
+                ));
+                let mut layer = new_pixmap(img_w, img_h, "shadow layer")?;
+                layer.draw_pixmap(0, 0, shadow_pixmap.as_ref(), &paint, shadow_transform, None);
+                Some(layer)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // 3. Render / displace layers according to configuration
     match &config.displacement {
-        DisplacementEffect::None => {}
-        DisplacementEffect::Explode { strength } => {
+        DisplacementEffect::None => {
+            if let Some(el) = effect_layer {
+                main_pixmap.draw_pixmap(0, 0, el.as_ref(), &paint, Transform::identity(), None);
+            }
+            main_pixmap.draw_pixmap(0, 0, text_pixmap.as_ref(), &paint, transform, None);
+        }
+        DisplacementEffect::Explode { strength, binding } => {
             // Compute the centroid of all rendered glyphs in the text pixmap
             let pixels = text_pixmap.pixels();
             let mut sum_x: f64 = 0.0;
@@ -1755,8 +2610,6 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                 let cx_local = (sum_x / count as f64) as f32;
                 let cy_local = (sum_y / count as f64) as f32;
 
-                // Transform the text-local centroid into canvas space,
-                // accounting for the text pixmap's translate + rotate.
                 let angle_rad = config.rotation.to_radians();
                 let cos_a = angle_rad.cos();
                 let sin_a = angle_rad.sin();
@@ -1765,81 +2618,47 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                 let cx = start_x + text_w / 2.0 + rel_x * cos_a - rel_y * sin_a;
                 let cy = start_y + text_h / 2.0 + rel_x * sin_a + rel_y * cos_a;
 
-                // The explosion reaches from the centroid out to the text
-                // diagonal plus extra room proportional to strength.
                 let text_diag = (actual_w * actual_w + actual_h * actual_h).sqrt();
                 let effect_radius = text_diag / 2.0 + *strength * 2.0;
 
-                if effect_radius > 0.0 {
-                    let inv_radius = 1.0 / effect_radius;
+                // 1. Warp the background canvas
+                apply_explode(&mut main_pixmap, cx, cy, effect_radius, *strength, img_w, img_h);
 
-                    // Snapshot the undistorted canvas so we can sample from it
-                    // while writing displaced pixels in parallel.
-                    let src_snap: Vec<PremultipliedColorU8> = main_pixmap.pixels().to_vec();
-                    let w = img_w as usize;
-                    let h = img_h as usize;
-
-                    // Inverse radial displacement: for each output pixel, find the
-                    // source position closer to the centroid that was "pushed" here.
-                    main_pixmap.pixels_mut().par_chunks_mut(w).enumerate().for_each(
-                        |(y_idx, row)| {
-                            for x_idx in 0..w {
-                                let dx = x_idx as f32 - cx;
-                                let dy = y_idx as f32 - cy;
-                                let dist = (dx * dx + dy * dy).sqrt();
-
-                                if dist >= effect_radius || dist < 0.001 {
-                                    continue;
-                                }
-
-                                // Quadratic falloff: strong near center, zero at radius
-                                let t = dist * inv_radius;
-                                let displacement = *strength * (1.0 - t) * (1.0 - t);
-
-                                // Pull source position back toward centroid. Clamped
-                                // at the centroid: without this, pixels closer to the
-                                // centre than `displacement` sampled from the far
-                                // side and the "hole" came out mirrored instead of
-                                // stretched.
-                                let scale = ((dist - displacement) / dist).max(0.0);
-                                let src_x = (cx + dx * scale).clamp(0.0, (w - 1) as f32);
-                                let src_y = (cy + dy * scale).clamp(0.0, (h - 1) as f32);
-
-                                // Bilinear interpolation on premultiplied pixels
-                                let x0 = src_x.floor() as usize;
-                                let y0 = src_y.floor() as usize;
-                                let x1 = (x0 + 1).min(w - 1);
-                                let y1 = (y0 + 1).min(h - 1);
-                                let fx = src_x - x0 as f32;
-                                let fy = src_y - y0 as f32;
-
-                                let p00 = src_snap[y0 * w + x0];
-                                let p10 = src_snap[y0 * w + x1];
-                                let p01 = src_snap[y1 * w + x0];
-                                let p11 = src_snap[y1 * w + x1];
-
-                                let blerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
-                                    let top = a as f32 * (1.0 - fx) + b as f32 * fx;
-                                    let bot = c as f32 * (1.0 - fx) + d as f32 * fx;
-                                    (top * (1.0 - fy) + bot * fy) as u8
-                                };
-
-                                let r = blerp(p00.red(), p10.red(), p01.red(), p11.red());
-                                let g = blerp(p00.green(), p10.green(), p01.green(), p11.green());
-                                let b = blerp(p00.blue(), p10.blue(), p01.blue(), p11.blue());
-                                let a = blerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha());
-
-                                if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, a) {
-                                    row[x_idx] = c;
-                                }
-                            }
-                        },
+                // 2. Warp and composite glyph effect layer using the binding factor
+                if let Some(mut el) = effect_layer {
+                    apply_explode(
+                        &mut el,
+                        cx,
+                        cy,
+                        effect_radius,
+                        *strength * *binding,
+                        img_w,
+                        img_h,
                     );
+                    main_pixmap.draw_pixmap(0, 0, el.as_ref(), &paint, Transform::identity(), None);
                 }
+
+                // 3. Warp and composite text layer at 100% strength
+                let mut text_layer = new_pixmap(img_w, img_h, "text layer")?;
+                text_layer.draw_pixmap(0, 0, text_pixmap.as_ref(), &paint, transform, None);
+                apply_explode(&mut text_layer, cx, cy, effect_radius, *strength, img_w, img_h);
+                main_pixmap.draw_pixmap(
+                    0,
+                    0,
+                    text_layer.as_ref(),
+                    &paint,
+                    Transform::identity(),
+                    None,
+                );
+            } else {
+                if let Some(el) = effect_layer {
+                    main_pixmap.draw_pixmap(0, 0, el.as_ref(), &paint, Transform::identity(), None);
+                }
+                main_pixmap.draw_pixmap(0, 0, text_pixmap.as_ref(), &paint, transform, None);
             }
         }
-        DisplacementEffect::Meltdown { strength, direction } => {
-            // --- 1. Build a binary text-shape mask in text-pixmap space ---
+        DisplacementEffect::Meltdown { strength, direction, binding } => {
+            // Build proximity field from rendered text glyphs
             let pixels = text_pixmap.pixels();
             let mut text_mask_src = new_pixmap(tw_u32, th_u32, "meltdown text mask")?;
             {
@@ -1852,15 +2671,9 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                 }
             }
 
-            // --- 2. Project mask to canvas space through the rotation transform ---
             let mut canvas_mask = new_pixmap(img_w, img_h, "meltdown canvas mask")?;
             canvas_mask.draw_pixmap(0, 0, text_mask_src.as_ref(), &paint, transform, None);
 
-            // --- 3. Blur the mask → smooth proximity field ---
-            //     Store the alpha channel in a single-channel image so we can
-            //     use the `image` crate's gaussian blur that's already a
-            //     dependency, without an alpha channel for it to premultiply
-            //     against.
             let mut mask_img = GrayImage::new(img_w, img_h);
             for (i, px) in canvas_mask.pixels().iter().enumerate() {
                 let x = (i as u32) % img_w;
@@ -1870,87 +2683,57 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
             let blur_sigma = (*strength * 0.4).max(1.0);
             let blurred_mask = DynamicImage::ImageLuma8(mask_img).blur(blur_sigma).to_luma8();
 
-            // Extract as a flat f32 field (blurred proximity, 0.0 - 1.0)
-            let w = img_w as usize;
-            let h = img_h as usize;
             let field: Vec<f32> =
                 blurred_mask.pixels().iter().map(|px| px[0] as f32 / 255.0).collect();
 
-            // --- 4. Inverse displacement warp, parallel over rows ---
-            let src_snap: Vec<PremultipliedColorU8> = main_pixmap.pixels().to_vec();
             let is_omni = *direction < 0.0;
             let dir_rad = direction.to_radians();
             let fixed_dx = dir_rad.cos();
             let fixed_dy = dir_rad.sin();
 
-            main_pixmap.pixels_mut().par_chunks_mut(w).enumerate().for_each(|(y_idx, row)| {
-                for x_idx in 0..w {
-                    let fv = field[y_idx * w + x_idx];
-                    if fv < 0.002 {
-                        continue;
-                    }
+            // 1. Warp the background canvas
+            apply_meltdown(
+                &mut main_pixmap,
+                &field,
+                is_omni,
+                fixed_dx,
+                fixed_dy,
+                *strength,
+                img_w,
+                img_h,
+            );
 
-                    let displacement = *strength * fv;
+            // 2. Warp and composite glyph effect layer using the binding factor
+            if let Some(mut el) = effect_layer {
+                apply_meltdown(
+                    &mut el,
+                    &field,
+                    is_omni,
+                    fixed_dx,
+                    fixed_dy,
+                    *strength * *binding,
+                    img_w,
+                    img_h,
+                );
+                main_pixmap.draw_pixmap(0, 0, el.as_ref(), &paint, Transform::identity(), None);
+            }
 
-                    // Determine push direction
-                    let (push_dx, push_dy) = if is_omni {
-                        // Gradient of the proximity field points *toward*
-                        // the text; negate to push *away* from it.
-                        let x0 = x_idx.saturating_sub(1);
-                        let x1 = (x_idx + 1).min(w - 1);
-                        let y0 = y_idx.saturating_sub(1);
-                        let y1 = (y_idx + 1).min(h - 1);
-                        let gx = field[y_idx * w + x1] - field[y_idx * w + x0];
-                        let gy = field[y1 * w + x_idx] - field[y0 * w + x_idx];
-                        let glen = (gx * gx + gy * gy).sqrt();
-                        if glen < 1e-6 {
-                            // At a local maximum (text interior) — no clear
-                            // direction.  Text composites on top anyway.
-                            continue;
-                        }
-                        (-gx / glen, -gy / glen)
-                    } else {
-                        (fixed_dx, fixed_dy)
-                    };
-
-                    // Inverse map: find where this pixel was before the blast
-                    let src_x = (x_idx as f32 - displacement * push_dx).clamp(0.0, (w - 1) as f32);
-                    let src_y = (y_idx as f32 - displacement * push_dy).clamp(0.0, (h - 1) as f32);
-
-                    // Bilinear sample from the undistorted snapshot
-                    let sx0 = src_x.floor() as usize;
-                    let sy0 = src_y.floor() as usize;
-                    let sx1 = (sx0 + 1).min(w - 1);
-                    let sy1 = (sy0 + 1).min(h - 1);
-                    let fx = src_x - sx0 as f32;
-                    let fy = src_y - sy0 as f32;
-
-                    let p00 = src_snap[sy0 * w + sx0];
-                    let p10 = src_snap[sy0 * w + sx1];
-                    let p01 = src_snap[sy1 * w + sx0];
-                    let p11 = src_snap[sy1 * w + sx1];
-
-                    let blerp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
-                        let top = a as f32 * (1.0 - fx) + b as f32 * fx;
-                        let bot = c as f32 * (1.0 - fx) + d as f32 * fx;
-                        (top * (1.0 - fy) + bot * fy) as u8
-                    };
-
-                    let r = blerp(p00.red(), p10.red(), p01.red(), p11.red());
-                    let g = blerp(p00.green(), p10.green(), p01.green(), p11.green());
-                    let b = blerp(p00.blue(), p10.blue(), p01.blue(), p11.blue());
-                    let a = blerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha());
-
-                    if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, a) {
-                        row[x_idx] = c;
-                    }
-                }
-            });
+            // 3. Warp and composite text layer at 100% strength
+            let mut text_layer = new_pixmap(img_w, img_h, "text layer")?;
+            text_layer.draw_pixmap(0, 0, text_pixmap.as_ref(), &paint, transform, None);
+            apply_meltdown(
+                &mut text_layer,
+                &field,
+                is_omni,
+                fixed_dx,
+                fixed_dy,
+                *strength,
+                img_w,
+                img_h,
+            );
+            main_pixmap.draw_pixmap(0, 0, text_layer.as_ref(), &paint, Transform::identity(), None);
         }
     }
-
-    // Composite the text on top
-    main_pixmap.draw_pixmap(0, 0, text_pixmap.as_ref(), &paint, transform, None);
 
     finish_render(image, &main_pixmap, precision);
     Ok(())
@@ -1962,14 +2745,12 @@ fn draw_glyph_pixels(
     tw: u32,
     th: u32,
     img: &cosmic_text::SwashImage,
-    gx: f32,
-    gy: f32,
+    gx: i32,
+    gy: i32,
     color: (u8, u8, u8, u8),
 ) {
-    // `floor`, not a plain `as i32` cast: casting truncates toward zero, which
-    // shifts every glyph at a negative offset one pixel the wrong way.
-    let origin_x = gx.floor() as i32;
-    let origin_y = gy.floor() as i32;
+    let origin_x = gx;
+    let origin_y = gy;
 
     for r in 0..img.placement.height as i32 {
         for c in 0..img.placement.width as i32 {
