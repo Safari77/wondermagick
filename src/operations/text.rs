@@ -168,13 +168,12 @@ fn parse_text_segments(text: &str) -> Result<Vec<TextSegment>, ArgParseErr> {
                 let mut chars = content_raw.chars().peekable();
                 while let Some(c) = chars.next() {
                     if c == '\\' {
-                        if let Some(&next) = chars.peek() {
-                            if next == '}' || next == '\\' {
+                        if let Some(&next) = chars.peek()
+                            && (next == '}' || next == '\\') {
                                 content.push(next);
                                 chars.next();
                                 continue;
                             }
-                        }
                         content.push('\\');
                     } else {
                         content.push(c);
@@ -1055,12 +1054,11 @@ fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision)
         DynamicImage::ImageRgb8(orig) => {
             let mut opaque = true;
             for (i, res) in pixmap.pixels().iter().enumerate() {
-                if !same_pixel(*res, precision.base[i]) {
-                    if res.alpha() != 255 {
+                if !same_pixel(*res, precision.base[i])
+                    && res.alpha() != 255 {
                         opaque = false;
                         break;
                     }
-                }
             }
             if opaque {
                 let mut rgb = image::RgbImage::new(w, h);
@@ -1256,12 +1254,11 @@ fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision)
         DynamicImage::ImageRgb16(orig) => {
             let mut opaque = true;
             for (i, res) in pixmap.pixels().iter().enumerate() {
-                if !same_pixel(*res, precision.base[i]) {
-                    if res.alpha() != 255 {
+                if !same_pixel(*res, precision.base[i])
+                    && res.alpha() != 255 {
                         opaque = false;
                         break;
                     }
-                }
             }
             if opaque {
                 let mut rgb = ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(w, h);
@@ -1334,12 +1331,11 @@ fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision)
         DynamicImage::ImageRgb32F(orig) => {
             let mut opaque = true;
             for (i, res) in pixmap.pixels().iter().enumerate() {
-                if !same_pixel(*res, precision.base[i]) {
-                    if res.alpha() != 255 {
+                if !same_pixel(*res, precision.base[i])
+                    && res.alpha() != 255 {
                         opaque = false;
                         break;
                     }
-                }
             }
             if opaque {
                 let mut rgb = ImageBuffer::<image::Rgb<f32>, Vec<f32>>::new(w, h);
@@ -2428,9 +2424,9 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
     };
 
     // 1. Apply background blur effect (if any)
-    if let Some(bg) = bg_effect {
-        if let TextEffect::Blur { sigma } | TextEffect::GradualBlur { sigma } = bg {
-            if let Some((min_x, max_x, min_y, max_y)) =
+    if let Some(bg) = bg_effect
+        && let TextEffect::Blur { sigma } | TextEffect::GradualBlur { sigma } = bg
+            && let Some((min_x, max_x, min_y, max_y)) =
                 compute_alpha_bbox(text_pixmap.pixels(), tw_u32, th_u32)
             {
                 let glyph_w = (max_x - min_x + 1) as f32;
@@ -2471,8 +2467,6 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
                     img_h,
                 )?;
             }
-        }
-    }
 
     // 2. Prepare glyph outline or shadow layer (if configured)
     let effect_layer = if let Some(glyph) = glyph_effect {
