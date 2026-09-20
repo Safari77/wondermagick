@@ -20,6 +20,7 @@ use bm3d_core::{
 use image::{DynamicImage, GenericImageView, Luma, Rgba};
 use ndarray::Array2;
 use oklab::{Oklab, Rgb, oklab_to_srgb, srgb_to_oklab};
+use std::cmp::Ordering;
 
 /// Upper bound for a PSF standard deviation, in pixels.
 /// Guards against absurd kernels (a Gaussian is truncated at 4 sigma).
@@ -149,7 +150,7 @@ impl PsfSpec {
 }
 
 fn sigma_to_radius(sigma: f32) -> usize {
-    if !(sigma > 0.0) {
+    if sigma.partial_cmp(&0.0) != Some(Ordering::Greater) {
         return 0;
     }
     (sigma.ceil() as usize).clamp(1, MAX_DERING_RADIUS)

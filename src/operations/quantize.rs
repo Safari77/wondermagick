@@ -1169,8 +1169,7 @@ fn generate_palette_oklab(
             effective_weights.iter().copied().fold(0.0f32, |acc, x| acc.algebraic_add(x));
         let mut threshold = (rng.unit_f32(TAG_FIRST, 0)).algebraic_mul(total_w);
         let mut chosen_u = 0;
-        for u in 0..n_unique {
-            let w = effective_weights[u];
+        for (u, &w) in effective_weights.iter().enumerate() {
             threshold = threshold.algebraic_sub(w);
             if threshold <= 0.0 {
                 chosen_u = u;
@@ -1270,7 +1269,7 @@ fn generate_palette_oklab(
         );
 
         // Step B: Parallel O(U) accumulation avoiding Rayon fold allocations
-        let partials: Vec<(Vec<(f32, f32, f32)>, Vec<f32>)> = oklab_pixels_slice
+        let partials: Vec<_> = oklab_pixels_slice
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
@@ -1322,8 +1321,8 @@ fn generate_palette_oklab(
         // Empty-cluster reseed intelligently using persistent `min_dists`
         // O(U) loop instead of O(U * K) network gathered per reseed.
         let mut reseeded = false;
-        for empty_idx in 0..k {
-            if counts[empty_idx] > 0.0 {
+        for (empty_idx, count) in counts.iter_mut().enumerate() {
+            if *count > 0.0 {
                 continue;
             }
 
@@ -1338,7 +1337,7 @@ fn generate_palette_oklab(
             centroids_soa.update(empty_idx, oklab_pts[best_u]);
             // Avoid picking the identical distance pixel next loop
             min_dists[best_u] = 0.0;
-            counts[empty_idx] = 1.0;
+            *count = 1.0;
             reseeded = true;
         }
 

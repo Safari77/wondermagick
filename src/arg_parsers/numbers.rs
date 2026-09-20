@@ -21,7 +21,7 @@ where
 /// # Type Parameters
 ///
 /// * `T`: The target numeric type. This type must implement `std::str::FromStr`.
-///        The associated error type `T::Err` should implement `Debug` for easier error handling.
+///   The associated error type `T::Err` should implement `Debug` for easier error handling.
 ///
 /// # Returns
 ///
@@ -56,10 +56,7 @@ mod tests {
 
     #[test]
     fn test_parse_usize_valid() {
-        assert_eq!(
-            strip_and_parse_number::<usize>("  9876543210  "),
-            Ok(9876543210)
-        );
+        assert_eq!(strip_and_parse_number::<usize>("  9876543210  "), Ok(9876543210));
     }
 
     #[test]

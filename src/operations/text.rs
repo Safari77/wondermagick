@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image, wm_err};
 use cosmic_text::{Align, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
 use image::{DynamicImage, GrayImage, ImageBuffer, RgbaImage};
@@ -77,25 +79,25 @@ fn parse_text_segments(text: &str) -> Result<Vec<TextSegment>, ArgParseErr> {
         // Detect {QR:...:...:...:...}
         if bytes[i] == b'{' {
             let rest = &text[i..];
-            if rest.starts_with("{QR:") {
+            if let Some(qr_body) = rest.strip_prefix("{QR:") {
                 // Find the closing brace, respecting escapes inside the QR block
-                let mut close_pos = None;
+                let mut close_offset = None;
                 let mut escaped = false;
-                for (offset, ch) in rest[4..].char_indices() {
+                for (offset, ch) in qr_body.char_indices() {
                     if escaped {
                         escaped = false;
                     } else if ch == '\\' {
                         escaped = true;
                     } else if ch == '}' {
-                        close_pos = Some(4 + offset);
+                        close_offset = Some(offset);
                         break;
                     }
                 }
 
-                let close_pos = close_pos
+                let close_offset = close_offset
                     .ok_or_else(|| ArgParseErr::with_msg("unclosed QR block: missing '}'"))?;
 
-                let inner = &rest[4..close_pos]; // after "{QR:" and before "}"
+                let inner = &qr_body[..close_offset]; // after "{QR:" and before "}"
 
                 // Parse: EcLevel:blur_sigma:light_color:content
                 // Split at first 3 colons to get 4 parts.
@@ -169,11 +171,12 @@ fn parse_text_segments(text: &str) -> Result<Vec<TextSegment>, ArgParseErr> {
                 while let Some(c) = chars.next() {
                     if c == '\\' {
                         if let Some(&next) = chars.peek()
-                            && (next == '}' || next == '\\') {
-                                content.push(next);
-                                chars.next();
-                                continue;
-                            }
+                            && (next == '}' || next == '\\')
+                        {
+                            content.push(next);
+                            chars.next();
+                            continue;
+                        }
                         content.push('\\');
                     } else {
                         content.push(c);
@@ -193,7 +196,7 @@ fn parse_text_segments(text: &str) -> Result<Vec<TextSegment>, ArgParseErr> {
                     light_color,
                 }));
 
-                i += close_pos + 1; // skip past '}' (both are byte offsets)
+                i += "{QR:".len() + close_offset + 1; // skip past '}' (both are byte offsets)
                 continue;
             }
         }
@@ -1054,11 +1057,10 @@ fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision)
         DynamicImage::ImageRgb8(orig) => {
             let mut opaque = true;
             for (i, res) in pixmap.pixels().iter().enumerate() {
-                if !same_pixel(*res, precision.base[i])
-                    && res.alpha() != 255 {
-                        opaque = false;
-                        break;
-                    }
+                if !same_pixel(*res, precision.base[i]) && res.alpha() != 255 {
+                    opaque = false;
+                    break;
+                }
             }
             if opaque {
                 let mut rgb = image::RgbImage::new(w, h);
@@ -1254,11 +1256,10 @@ fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision)
         DynamicImage::ImageRgb16(orig) => {
             let mut opaque = true;
             for (i, res) in pixmap.pixels().iter().enumerate() {
-                if !same_pixel(*res, precision.base[i])
-                    && res.alpha() != 255 {
-                        opaque = false;
-                        break;
-                    }
+                if !same_pixel(*res, precision.base[i]) && res.alpha() != 255 {
+                    opaque = false;
+                    break;
+                }
             }
             if opaque {
                 let mut rgb = ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(w, h);
@@ -1331,11 +1332,10 @@ fn finish_render(image: &mut Image, pixmap: &Pixmap, precision: SourcePrecision)
         DynamicImage::ImageRgb32F(orig) => {
             let mut opaque = true;
             for (i, res) in pixmap.pixels().iter().enumerate() {
-                if !same_pixel(*res, precision.base[i])
-                    && res.alpha() != 255 {
-                        opaque = false;
-                        break;
-                    }
+                if !same_pixel(*res, precision.base[i]) && res.alpha() != 255 {
+                    opaque = false;
+                    break;
+                }
             }
             if opaque {
                 let mut rgb = ImageBuffer::<image::Rgb<f32>, Vec<f32>>::new(w, h);
@@ -1829,7 +1829,7 @@ fn apply_explode(
     let h = img_h as usize;
 
     pixmap.pixels_mut().par_chunks_mut(w).enumerate().for_each(|(y_idx, row)| {
-        for x_idx in 0..w {
+        for (x_idx, pixel) in row.iter_mut().enumerate() {
             let dx = x_idx as f32 - cx;
             let dy = y_idx as f32 - cy;
             let dist = (dx * dx + dy * dy).sqrt();
@@ -1871,7 +1871,7 @@ fn apply_explode(
             let a = blerp(p00.alpha(), p10.alpha(), p01.alpha(), p11.alpha());
 
             if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, a) {
-                row[x_idx] = c;
+                *pixel = c;
             }
         }
     });
@@ -2426,47 +2426,46 @@ fn render_text_inner(image: &mut Image, config: &TextConfig) -> Result<(), Magic
     // 1. Apply background blur effect (if any)
     if let Some(bg) = bg_effect
         && let TextEffect::Blur { sigma } | TextEffect::GradualBlur { sigma } = bg
-            && let Some((min_x, max_x, min_y, max_y)) =
-                compute_alpha_bbox(text_pixmap.pixels(), tw_u32, th_u32)
-            {
-                let glyph_w = (max_x - min_x + 1) as f32;
-                let glyph_h = (max_y - min_y + 1) as f32;
+        && let Some((min_x, max_x, min_y, max_y)) =
+            compute_alpha_bbox(text_pixmap.pixels(), tw_u32, th_u32)
+    {
+        let glyph_w = (max_x - min_x + 1) as f32;
+        let glyph_h = (max_y - min_y + 1) as f32;
 
-                // Small symmetric margin around the tight glyph bounds
-                let inner_margin = font_size * 0.3;
-                // GradualBlur gets a smooth falloff zone; plain Blur stays sharp
-                let falloff = if matches!(bg, TextEffect::GradualBlur { .. }) {
-                    (*sigma * 3.0).max(font_size * 0.5)
-                } else {
-                    0.0
-                };
-                let (mask_src, total_margin) =
-                    build_blur_mask(glyph_w, glyph_h, inner_margin, falloff)?;
+        // Small symmetric margin around the tight glyph bounds
+        let inner_margin = font_size * 0.3;
+        // GradualBlur gets a smooth falloff zone; plain Blur stays sharp
+        let falloff = if matches!(bg, TextEffect::GradualBlur { .. }) {
+            (*sigma * 3.0).max(font_size * 0.5)
+        } else {
+            0.0
+        };
+        let (mask_src, total_margin) = build_blur_mask(glyph_w, glyph_h, inner_margin, falloff)?;
 
-                // The glyph bounding box top-left within the text pixmap is (min_x, min_y).
-                // The text pixmap top-left on the canvas is (start_x, start_y).
-                // So the glyph top-left on the canvas is (start_x + min_x, start_y + min_y).
-                // The mask starts total_margin before that.
-                let mask_x = start_x + min_x as f32 - total_margin;
-                let mask_y = start_y + min_y as f32 - total_margin;
+        // The glyph bounding box top-left within the text pixmap is (min_x, min_y).
+        // The text pixmap top-left on the canvas is (start_x, start_y).
+        // So the glyph top-left on the canvas is (start_x + min_x, start_y + min_y).
+        // The mask starts total_margin before that.
+        let mask_x = start_x + min_x as f32 - total_margin;
+        let mask_y = start_y + min_y as f32 - total_margin;
 
-                // Rotate around the same pivot as the text pixmap so blur stays aligned.
-                // Text pivots at (start_x + text_w/2, start_y + text_h/2) in canvas space.
-                let pivot_x = start_x + text_w / 2.0 - mask_x;
-                let pivot_y = start_y + text_h / 2.0 - mask_y;
-                let mask_transform = Transform::from_translate(mask_x, mask_y)
-                    .pre_concat(Transform::from_rotate_at(config.rotation, pivot_x, pivot_y));
+        // Rotate around the same pivot as the text pixmap so blur stays aligned.
+        // Text pivots at (start_x + text_w/2, start_y + text_h/2) in canvas space.
+        let pivot_x = start_x + text_w / 2.0 - mask_x;
+        let pivot_y = start_y + text_h / 2.0 - mask_y;
+        let mask_transform = Transform::from_translate(mask_x, mask_y)
+            .pre_concat(Transform::from_rotate_at(config.rotation, pivot_x, pivot_y));
 
-                apply_blur_under_rotated_region(
-                    &mut main_pixmap,
-                    image,
-                    &mask_src,
-                    mask_transform,
-                    *sigma,
-                    img_w,
-                    img_h,
-                )?;
-            }
+        apply_blur_under_rotated_region(
+            &mut main_pixmap,
+            image,
+            &mask_src,
+            mask_transform,
+            *sigma,
+            img_w,
+            img_h,
+        )?;
+    }
 
     // 2. Prepare glyph outline or shadow layer (if configured)
     let effect_layer = if let Some(glyph) = glyph_effect {

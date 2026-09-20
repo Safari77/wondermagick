@@ -307,11 +307,10 @@ pub fn parse_args(mut args: Vec<OsString>) -> Result<ExecutionPlan, MagickError>
         } else {
             // Check if the "filename" is actually a generator pseudo-file
             let arg_str = raw_arg.to_string_lossy();
-            if arg_str.starts_with("xc:") || arg_str.starts_with("canvas:") {
-                // Strip the prefix to get the spec (e.g. "size:100x100,solid,#ff0000")
-                let spec_str =
-                    if arg_str.starts_with("xc:") { &arg_str[3..] } else { &arg_str[7..] };
-
+            // Strip the prefix to get the spec (e.g. "size:100x100,solid,#ff0000")
+            if let Some(spec_str) =
+                arg_str.strip_prefix("xc:").or_else(|| arg_str.strip_prefix("canvas:"))
+            {
                 let config = CanvasConfig::parse_arg(spec_str).map_err(|e| {
                     wm_err!("{}", e.display_with_arg("canvas", OsStr::new(spec_str)))
                 })?;

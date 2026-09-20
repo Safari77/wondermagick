@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
 use delaunator::{Point as DelaunayPoint, triangulate};
 use image::{DynamicImage, ImageBuffer, Rgba};
@@ -1204,10 +1206,6 @@ fn parse_stops(tokens: &[&str]) -> Result<Vec<GradientStop>, ArgParseErr> {
         ));
     }
 
-    // The explicit `-> Result<GradientStop, ArgParseErr>` return type on these
-    // closures is needed because `ArgParseErr` has a `From<ParseFloatError>`
-    // impl, which makes the `?` operator's target error type ambiguous
-    // (E0282 / E0283 otherwise).
     let mut stops: Vec<GradientStop> = if all_positional {
         tokens
             .iter()
@@ -1236,25 +1234,13 @@ fn parse_stops(tokens: &[&str]) -> Result<Vec<GradientStop>, ArgParseErr> {
         let n = tokens.len();
         tokens
             .iter()
-            .map(|t| -> Result<GradientStop, ArgParseErr> {
-                let pos = if n > 1 {
-                    0.0 // computed dynamically after allocation below if needed
-                } else {
-                    0.0
-                };
-                let _ = pos;
+            .enumerate()
+            .map(|(i, t)| -> Result<GradientStop, ArgParseErr> {
+                let pos = i as f64 / (n - 1) as f64; // n >= 2 ensured above
                 let color = parse_color(t)?;
-                Ok(GradientStop { pos: 0.0, color })
+                Ok(GradientStop { pos, color })
             })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut auto_stops = Vec::with_capacity(n);
-        for (i, t) in tokens.iter().enumerate() {
-            let pos = i as f64 / (n - 1) as f64; // n >= 2 ensured above
-            let color = parse_color(t)?;
-            auto_stops.push(GradientStop { pos, color });
-        }
-        auto_stops
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     // Stable sort by position so equal positions preserve input order.
@@ -2133,20 +2119,20 @@ fn render_fbm(
         .set_is_seamless(seamless)
         .build()
     } else {
-    // Order matters: `set_persistence` recomputes the internal scale factor
-    // from the octave count, so octaves has to be set first.
-    // `noise` seeds are u32, so the canvas seed is deliberately narrowed here.
-    let fbm = Fbm::<Perlin>::new(seed as u32)
-        .set_octaves(octaves.clamp(1, Fbm::<Perlin>::MAX_OCTAVES))
-        .set_frequency(frequency)
-        .set_lacunarity(lacunarity)
-        .set_persistence(persistence);
+        // Order matters: `set_persistence` recomputes the internal scale factor
+        // from the octave count, so octaves has to be set first.
+        // `noise` seeds are u32, so the canvas seed is deliberately narrowed here.
+        let fbm = Fbm::<Perlin>::new(seed as u32)
+            .set_octaves(octaves.clamp(1, Fbm::<Perlin>::MAX_OCTAVES))
+            .set_frequency(frequency)
+            .set_lacunarity(lacunarity)
+            .set_persistence(persistence);
 
         PlaneMapBuilder::<_, 2>::new_fn(|p: [f64; 2]| fbm.get(p))
-        .set_size(width as usize, height as usize)
-        .set_x_bounds(-ex, ex)
-        .set_y_bounds(-ey, ey)
-        .set_is_seamless(seamless)
+            .set_size(width as usize, height as usize)
+            .set_x_bounds(-ex, ex)
+            .set_y_bounds(-ey, ey)
+            .set_is_seamless(seamless)
             .build()
     };
 
