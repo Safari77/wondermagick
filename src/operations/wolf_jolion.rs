@@ -9,10 +9,7 @@ pub struct WolfJolionConfig {
 
 impl Default for WolfJolionConfig {
     fn default() -> Self {
-        Self {
-            window_size: 15,
-            k: 0.5,
-        }
+        Self { window_size: 15, k: 0.5 }
     }
 }
 

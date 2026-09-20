@@ -20,14 +20,11 @@ impl TryFrom<&OsStr> for BlurGeometry {
 
     fn try_from(s: &OsStr) -> Result<Self, Self::Error> {
         if s.is_empty() {
-            return Err(ArgParseErr::with_msg(
-                "blur geometry must be non-empty and ASCII only",
-            ));
+            return Err(ArgParseErr::with_msg("blur geometry must be non-empty and ASCII only"));
         }
 
-        let string: &str = s
-            .try_into()
-            .map_err(|_e| ArgParseErr::with_msg("invalid blur geometry"))?;
+        let string: &str =
+            s.try_into().map_err(|_e| ArgParseErr::with_msg("invalid blur geometry"))?;
         let parts: Vec<&str> = string.split('x').collect();
 
         match parts.len() {
@@ -35,19 +32,11 @@ impl TryFrom<&OsStr> for BlurGeometry {
                 radius,
                 sigma: 1.2, // no science behind the value, just eyeballed to match ImageMagick's default
             }),
-            2 => {
-                match (
-                    parse_radius(parts.first().unwrap()),
-                    parse_sigma(parts.get(1).unwrap()),
-                ) {
-                    (Ok(radius), Ok(sigma)) => Ok(Self { radius, sigma }),
-                    (Err(_), Ok(sigma)) => Ok(Self {
-                        sigma,
-                        ..Default::default()
-                    }),
-                    _ => Err(ArgParseErr::with_msg("invalid sigma value")),
-                }
-            }
+            2 => match (parse_radius(parts.first().unwrap()), parse_sigma(parts.get(1).unwrap())) {
+                (Ok(radius), Ok(sigma)) => Ok(Self { radius, sigma }),
+                (Err(_), Ok(sigma)) => Ok(Self { sigma, ..Default::default() }),
+                _ => Err(ArgParseErr::with_msg("invalid sigma value")),
+            },
             _ => Err(ArgParseErr::with_msg("invalid blur geometry format")),
         }
     }

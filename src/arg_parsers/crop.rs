@@ -50,11 +50,6 @@ impl TryFrom<&OsStr> for CropGeometry {
             yoffset: geom.yoffset.map(|f| f.round() as i32),
         };
 
-        Ok(Self {
-            area,
-            slice_into_many,
-            repage,
-            percentage_mode,
-        })
+        Ok(Self { area, slice_into_many, repage, percentage_mode })
     }
 }

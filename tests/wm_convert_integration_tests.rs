@@ -56,13 +56,7 @@ fn test_identify_reports_current_color_type() {
 
     let binary = env!("CARGO_BIN_EXE_wm-convert");
     let identify = Command::new(binary)
-        .args([
-            "./tests/sample.png",
-            "-monochrome",
-            "default",
-            "-identify",
-            "null:",
-        ])
+        .args(["./tests/sample.png", "-monochrome", "default", "-identify", "null:"])
         .output()
         .expect("convert did not exit successfully");
 
@@ -118,14 +112,7 @@ fn test_write_as_intermediate() {
     let _ = fs::remove_file(&copy_path);
 
     let write = Command::new(binary)
-        .args(&[
-            "./tests/sample.png",
-            "-write",
-            &copy_path,
-            "-resize",
-            "50%x50%",
-            &output_path,
-        ])
+        .args(&["./tests/sample.png", "-write", &copy_path, "-resize", "50%x50%", &output_path])
         .output()
         .expect("convert did not exit successfully");
 
@@ -165,14 +152,7 @@ fn test_write_uses_current_modifiers() {
     assert!(default.status.success());
 
     let write = Command::new(binary)
-        .args([
-            "./tests/sample.png",
-            "-write",
-            &written_path,
-            "-quality",
-            "100",
-            &final_path,
-        ])
+        .args(["./tests/sample.png", "-write", &written_path, "-quality", "100", &final_path])
         .output()
         .expect("convert did not exit successfully");
     assert!(write.status.success());
@@ -237,13 +217,7 @@ fn combine_as_gray() {
     let _ = fs::remove_file(&output_path);
 
     let convert = Command::new(binary)
-        .args(&[
-            "./tests/sample.png",
-            "-colorspace",
-            "gray",
-            "-combine",
-            &output_path,
-        ])
+        .args(&["./tests/sample.png", "-colorspace", "gray", "-combine", &output_path])
         .output()
         .expect("convert did not exit successfully");
 
@@ -349,13 +323,7 @@ fn combine_plus_is_precise() {
     let _ = fs::remove_file(&output_path);
 
     let convert = Command::new(binary)
-        .args(&[
-            "./tests/sample.png",
-            "./tests/sample.png",
-            "+combine",
-            "gray",
-            &output_path,
-        ])
+        .args(&["./tests/sample.png", "./tests/sample.png", "+combine", "gray", &output_path])
         .output()
         .expect("convert did not exit successfully");
 

@@ -42,11 +42,7 @@ struct Parser {
 
 impl Parser {
     fn new() -> Self {
-        Self {
-            state: ParseState::Initial,
-            literal_accumulator: Vec::new(),
-            tokens: Vec::new(),
-        }
+        Self { state: ParseState::Initial, literal_accumulator: Vec::new(), tokens: Vec::new() }
     }
 
     fn start_literal(&mut self, char: &u8) {
@@ -94,11 +90,7 @@ impl Parser {
                     self.state = ParseState::Escape;
                 }
                 b'%' => {
-                    if self
-                        .literal_accumulator
-                        .last()
-                        .is_some_and(|&c| c.is_ascii_digit())
-                    {
+                    if self.literal_accumulator.last().is_some_and(|&c| c.is_ascii_digit()) {
                         self.literal_accumulator.push(*char);
                     } else {
                         self.try_finish_literal()?;
@@ -144,26 +136,17 @@ mod tests {
 
     #[test]
     fn test_parse_with_whitespace() {
-        assert_eq!(
-            parse(OsStr::new("  ")).unwrap(),
-            vec![Token::Literal("  ".into()),]
-        );
+        assert_eq!(parse(OsStr::new("  ")).unwrap(), vec![Token::Literal("  ".into()),]);
     }
 
     #[test]
     fn test_parse_with_percent_escape() {
-        assert_eq!(
-            parse(OsStr::new("%%")).unwrap(),
-            vec![Token::Literal("%".into()),]
-        );
+        assert_eq!(parse(OsStr::new("%%")).unwrap(), vec![Token::Literal("%".into()),]);
     }
 
     #[test]
     fn test_parse_with_backslash_escape() {
-        assert_eq!(
-            parse(OsStr::new("\\%")).unwrap(),
-            vec![Token::Literal("%".into()),]
-        );
+        assert_eq!(parse(OsStr::new("\\%")).unwrap(), vec![Token::Literal("%".into()),]);
     }
 
     #[test]
@@ -209,10 +192,7 @@ mod tests {
     // special case. EG: 10%[x]10.
     #[test]
     fn test_parse_with_shorthand_after_number() {
-        assert_eq!(
-            parse(OsStr::new("10%x10")).unwrap(),
-            vec![Token::Literal("10%x10".into())]
-        );
+        assert_eq!(parse(OsStr::new("10%x10")).unwrap(), vec![Token::Literal("10%x10".into())]);
     }
 
     #[test]
@@ -251,9 +231,6 @@ mod tests {
 
     #[test]
     fn test_parse_with_non_ascii_literal() {
-        assert_eq!(
-            parse(OsStr::new("💪")).unwrap(),
-            vec![Token::Literal("💪".into())]
-        );
+        assert_eq!(parse(OsStr::new("💪")).unwrap(), vec![Token::Literal("💪".into())]);
     }
 }

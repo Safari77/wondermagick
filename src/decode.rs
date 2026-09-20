@@ -50,22 +50,10 @@ pub fn decode(location: &Location, format: Option<FileFormat>) -> Result<Image, 
     let icc = metadata.icc_profile().unwrap_or(None);
     // `original_color_type` is now only an optional hint, set when the decoded data differs
     // from the source. When absent, the original matches the decoded image's color type.
-    let color_type = metadata
-        .attributes()
-        .original_color_type
-        .unwrap_or_else(|| pixels.color().into());
-    let properties = InputProperties {
-        filename: location.to_filename(),
-        color_type,
-    };
-    Ok(Image {
-        format,
-        exif,
-        xmp,
-        icc,
-        pixels,
-        properties,
-    })
+    let color_type =
+        metadata.attributes().original_color_type.unwrap_or_else(|| pixels.color().into());
+    let properties = InputProperties { filename: location.to_filename(), color_type };
+    Ok(Image { format, exif, xmp, icc, pixels, properties })
 }
 
 pub fn blank_image(location: &Location) -> Image {

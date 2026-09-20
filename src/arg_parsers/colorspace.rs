@@ -1,6 +1,6 @@
 use std::{ffi::OsStr, fmt::Display, str::FromStr};
 
-use image::{metadata::Cicp, ColorType};
+use image::{ColorType, metadata::Cicp};
 
 use crate::arg_parse_err::ArgParseErr;
 
@@ -22,10 +22,7 @@ impl TryFrom<&OsStr> for Colorspace {
     type Error = ArgParseErr;
 
     fn try_from(value: &OsStr) -> Result<Self, Self::Error> {
-        value
-            .to_str()
-            .ok_or_else(ArgParseErr::new)
-            .and_then(FromStr::from_str)
+        value.to_str().ok_or_else(ArgParseErr::new).and_then(FromStr::from_str)
     }
 }
 
@@ -35,30 +32,12 @@ impl FromStr for Colorspace {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // <https://imagemagick.org/script/command-line-options.php#colorspace>
         match s.to_lowercase().as_str() {
-            "srgb" => Ok(Colorspace {
-                cicp: Cicp::SRGB,
-                color: ColorModel::Rgb,
-            }),
-            "displayp3" => Ok(Colorspace {
-                cicp: Cicp::DISPLAY_P3,
-                color: ColorModel::Rgb,
-            }),
-            "rgb" => Ok(Colorspace {
-                cicp: Cicp::SRGB_LINEAR,
-                color: ColorModel::Luma,
-            }),
-            "gray" => Ok(Colorspace {
-                cicp: Cicp::SRGB,
-                color: ColorModel::Luma,
-            }),
-            "lineargray" => Ok(Colorspace {
-                cicp: Cicp::SRGB_LINEAR,
-                color: ColorModel::Luma,
-            }),
-            _ => Err(ArgParseErr::with_msg(format!(
-                "unsupported colorspace `{}`",
-                s
-            ))),
+            "srgb" => Ok(Colorspace { cicp: Cicp::SRGB, color: ColorModel::Rgb }),
+            "displayp3" => Ok(Colorspace { cicp: Cicp::DISPLAY_P3, color: ColorModel::Rgb }),
+            "rgb" => Ok(Colorspace { cicp: Cicp::SRGB_LINEAR, color: ColorModel::Luma }),
+            "gray" => Ok(Colorspace { cicp: Cicp::SRGB, color: ColorModel::Luma }),
+            "lineargray" => Ok(Colorspace { cicp: Cicp::SRGB_LINEAR, color: ColorModel::Luma }),
+            _ => Err(ArgParseErr::with_msg(format!("unsupported colorspace `{}`", s))),
         }
     }
 }

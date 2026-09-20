@@ -12,11 +12,7 @@ impl ArgParseErr {
         let value = value.to_string_lossy();
         // mimicking imagemagick: if there is a specific message, show it to the user,
         // otherwise simply echo the value the user has passed
-        let message = if let Some(msg) = &self.message {
-            msg.as_str()
-        } else {
-            &value
-        };
+        let message = if let Some(msg) = &self.message { msg.as_str() } else { &value };
 
         format!("invalid argument for option `{arg_name}': {message}")
     }
@@ -27,9 +23,7 @@ impl ArgParseErr {
 
     pub fn with_msg(str: impl ToString) -> Self {
         let string = str.to_string();
-        Self {
-            message: Some(string),
-        }
+        Self { message: Some(string) }
     }
 }
 

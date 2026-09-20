@@ -67,12 +67,7 @@ fn identify_impl(
                 write_filename(&image.properties.filename, writer)?;
             }
             Token::Var(Var::OriginalImageSize) => {
-                wm_try!(write!(
-                    writer,
-                    "{}x{}",
-                    image.pixels.width(),
-                    image.pixels.height()
-                ));
+                wm_try!(write!(writer, "{}x{}", image.pixels.width(), image.pixels.height()));
             }
             Token::Var(Var::LayerCanvasPageGeometry) => {
                 let dimensions = format!("{}x{}", image.pixels.width(), image.pixels.height());
@@ -242,9 +237,7 @@ mod tests {
                     color_type: ExtendedColorType::Cmyk8,
                 },
             },
-            Some(IdentifyFormat {
-                template: vec![Token::Literal("text".into())],
-            }),
+            Some(IdentifyFormat { template: vec![Token::Literal("text".into())] }),
             &mut output,
         )
         .unwrap();

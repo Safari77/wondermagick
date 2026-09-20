@@ -41,10 +41,7 @@ impl Arbitrary for Geometry {
 impl Display for Geometry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // fully empty geometry is 'x'
-        if [self.width, self.height, self.xoffset, self.yoffset]
-            .iter()
-            .all(|v| v.is_none())
-        {
+        if [self.width, self.height, self.xoffset, self.yoffset].iter().all(|v| v.is_none()) {
             return write!(f, "x");
         }
 
@@ -91,37 +88,41 @@ impl TryFrom<&OsStr> for Geometry {
         }
 
         if let Some(next_char) = ascii.first()
-            && !b"x+-".contains(next_char) {
-                result.width = Some(read_positive_float(&mut ascii).ok_or(ArgParseErr::new())?);
-            }
+            && !b"x+-".contains(next_char)
+        {
+            result.width = Some(read_positive_float(&mut ascii).ok_or(ArgParseErr::new())?);
+        }
         let mut found_x = false;
         if let Some(next_char) = ascii.first()
-            && next_char == &b'x' {
-                ascii = &ascii[1..]; // skip the 'x'
-                found_x = true;
+            && next_char == &b'x'
+        {
+            ascii = &ascii[1..]; // skip the 'x'
+            found_x = true;
 
-                if let Some(next_char) = ascii.first() {
-                    // width cannot be signed, if there's a sign it's an offset
-                    if !b"+-".contains(next_char) {
-                        result.height =
-                            Some(read_positive_float(&mut ascii).ok_or(ArgParseErr::new())?);
-                    }
+            if let Some(next_char) = ascii.first() {
+                // width cannot be signed, if there's a sign it's an offset
+                if !b"+-".contains(next_char) {
+                    result.height =
+                        Some(read_positive_float(&mut ascii).ok_or(ArgParseErr::new())?);
                 }
             }
+        }
 
         // imagemagick permits "+15+20" and "5x+15+20" but not "5+15+20"
         if result.width.is_none() && result.height.is_none() || found_x {
             // We try to read signed offsets afterwards ONLY if there was an 'x' to mimic imagemagick
             if let Some(next_char) = ascii.first()
-                && b"+-".contains(next_char) {
-                    let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
-                    result.xoffset = Some(offset);
-                }
+                && b"+-".contains(next_char)
+            {
+                let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
+                result.xoffset = Some(offset);
+            }
             if let Some(next_char) = ascii.first()
-                && b"+-".contains(next_char) {
-                    let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
-                    result.yoffset = Some(offset);
-                }
+                && b"+-".contains(next_char)
+            {
+                let offset = read_signed_float(&mut ascii).ok_or(ArgParseErr::new())?;
+                result.yoffset = Some(offset);
+            }
         }
 
         if !ascii.is_empty() {
@@ -171,11 +172,7 @@ fn read_float(input: &mut &[u8], allow_sign: bool) -> Option<f64> {
 }
 
 fn count_leading_digits(input: &[u8]) -> usize {
-    input
-        .iter()
-        .copied()
-        .take_while(|b| b.is_ascii_digit())
-        .count()
+    input.iter().copied().take_while(|b| b.is_ascii_digit()).count()
 }
 
 #[cfg(test)]
@@ -199,12 +196,8 @@ mod tests {
     #[test]
     fn test_missing_height() {
         // Needed for resize and crop (extended) geometry parsing
-        let expected = Geometry {
-            width: Some(5.0),
-            height: None,
-            xoffset: Some(15.0),
-            yoffset: Some(20.0),
-        };
+        let expected =
+            Geometry { width: Some(5.0), height: None, xoffset: Some(15.0), yoffset: Some(20.0) };
         let parsed = Geometry::from_str("5x+15+20").unwrap();
         assert_eq!(parsed, expected);
     }
@@ -231,12 +224,8 @@ mod tests {
     #[test]
     fn test_offsets_only() {
         // Notably used by the crop command
-        let expected = Geometry {
-            width: None,
-            height: None,
-            xoffset: Some(-15.0),
-            yoffset: Some(20.0),
-        };
+        let expected =
+            Geometry { width: None, height: None, xoffset: Some(-15.0), yoffset: Some(20.0) };
         let parsed = Geometry::from_str("-15+20").unwrap();
         assert_eq!(parsed, expected);
     }

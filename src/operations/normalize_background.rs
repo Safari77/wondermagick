@@ -1,5 +1,5 @@
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image};
-use image::{imageops, DynamicImage, GrayImage, Luma};
+use image::{DynamicImage, GrayImage, Luma, imageops};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizeBackgroundConfig {
@@ -51,12 +51,7 @@ pub fn normalize_background(
     let blurred_small = imageops::blur(&small_img, blur_sigma);
 
     // Blow it back up to full size to act as our Illumination Map
-    let bg_map = imageops::resize(
-        &blurred_small,
-        width,
-        height,
-        imageops::FilterType::Triangle,
-    );
+    let bg_map = imageops::resize(&blurred_small, width, height, imageops::FilterType::Triangle);
 
     // STEP 2: Image Arithmetic (Division)
     let mut output = GrayImage::new(width, height);

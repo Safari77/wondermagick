@@ -36,8 +36,6 @@ impl TryFrom<&std::ffi::OsStr> for IdentifyFormat {
     type Error = ArgParseErr;
 
     fn try_from(s: &OsStr) -> Result<Self, Self::Error> {
-        Ok(Self {
-            template: parse(s)?,
-        })
+        Ok(Self { template: parse(s)? })
     }
 }

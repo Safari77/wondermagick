@@ -148,9 +148,10 @@ fn choose_encoding_format(
     }
     // if format was not explicitly specified, guess based on the output path
     if let Location::Path(path) = location
-        && let Ok(format) = ImageFormat::from_path(path) {
-            return Ok(format);
-        }
+        && let Ok(format) = ImageFormat::from_path(path)
+    {
+        return Ok(format);
+    }
     // if that fails, use the input format (like ImageMagick)
     if let Some(format) = image.format {
         return Ok(format);
@@ -194,13 +195,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let location = Location::Path(tmp_dir.path().join("output.jpg"));
 
-        encode(
-            image,
-            &location,
-            Some(FileFormat::Format(ImageFormat::Jpeg)),
-            modifiers,
-        )
-        .unwrap();
+        encode(image, &location, Some(FileFormat::Format(ImageFormat::Jpeg)), modifiers).unwrap();
 
         crate::decode::decode(&location, Some(FileFormat::Format(ImageFormat::Jpeg))).unwrap()
     }

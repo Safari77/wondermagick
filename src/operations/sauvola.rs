@@ -10,11 +10,7 @@ pub struct SauvolaConfig {
 
 impl Default for SauvolaConfig {
     fn default() -> Self {
-        Self {
-            window_size: 15,
-            k: 0.2,
-            r: 128.0,
-        }
+        Self { window_size: 15, k: 0.2, r: 128.0 }
     }
 }
 

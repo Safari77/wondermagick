@@ -12,13 +12,7 @@ pub struct PhansalkarConfig {
 
 impl Default for PhansalkarConfig {
     fn default() -> Self {
-        Self {
-            window_size: 15,
-            k: 0.25,
-            r: 0.5,
-            p: 2.0,
-            q: 10.0,
-        }
+        Self { window_size: 15, k: 0.25, r: 0.5, p: 2.0, q: 10.0 }
     }
 }
 
@@ -64,13 +58,7 @@ impl PhansalkarConfig {
             .parse::<f32>()
             .map_err(|_| ArgParseErr::with_msg("invalid q value (must be float)"))?;
 
-        Ok(Self {
-            window_size,
-            k,
-            r,
-            p,
-            q,
-        })
+        Ok(Self { window_size, k, r, p, q })
     }
 }
 
@@ -135,11 +123,7 @@ pub fn phansalkar(image: &mut Image, config: &PhansalkarConfig) -> Result<(), Ma
             // Compute mean and std_dev in original 0-255 space, then normalize
             let mean_raw = sum as f64 / area;
             let variance_raw = (sq_sum as f64 - (mean_raw * mean_raw * area)) / area;
-            let std_raw = if variance_raw > 0.0 {
-                variance_raw.sqrt()
-            } else {
-                0.0
-            };
+            let std_raw = if variance_raw > 0.0 { variance_raw.sqrt() } else { 0.0 };
 
             let mean = mean_raw * norm;
             let std_dev = std_raw * norm;

@@ -264,16 +264,8 @@ fn two_color_centroids(histogram: &[u32; 256]) -> (f32, f32) {
             }
         }
 
-        let new_c0 = if count0 > 0.0 {
-            (sum0 / count0) as f32
-        } else {
-            c0
-        };
-        let new_c1 = if count1 > 0.0 {
-            (sum1 / count1) as f32
-        } else {
-            c1
-        };
+        let new_c0 = if count0 > 0.0 { (sum0 / count0) as f32 } else { c0 };
+        let new_c1 = if count1 > 0.0 { (sum1 / count1) as f32 } else { c1 };
 
         // Check convergence
         if (new_c0 - c0).abs() < 0.5 && (new_c1 - c1).abs() < 0.5 {

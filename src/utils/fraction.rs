@@ -8,17 +8,11 @@ pub struct Fraction {
 
 impl Fraction {
     pub fn new(numerator: u32, denominator: u32) -> Self {
-        Fraction {
-            numerator,
-            denominator,
-        }
+        Fraction { numerator, denominator }
     }
 
     pub fn reciprocal(&self) -> Self {
-        Fraction {
-            numerator: self.denominator,
-            denominator: self.numerator,
-        }
+        Fraction { numerator: self.denominator, denominator: self.numerator }
     }
 }
 

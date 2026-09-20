@@ -112,11 +112,7 @@ impl InputFileArg {
         // Try the input verbatim
         let location = Location::from_arg(input);
         if ready_to_return(&location) {
-            return Ok(Self {
-                location,
-                format: None,
-                read_mod: None,
-            });
+            return Ok(Self { location, format: None, read_mod: None });
         }
 
         // Parse any read modifier, e.g. "foo.jpg[50x50]"
@@ -134,11 +130,7 @@ impl InputFileArg {
             Some((path, modifier)) => {
                 let location = Location::from_arg(&path);
                 if ready_to_return(&location) {
-                    return Ok(Self {
-                        location,
-                        format: None,
-                        read_mod: Some(modifier),
-                    });
+                    return Ok(Self { location, format: None, read_mod: Some(modifier) });
                 }
                 (path, Some(modifier))
             }
@@ -153,11 +145,7 @@ impl InputFileArg {
             Some((path, format)) => {
                 let location = Location::from_arg(&path);
                 if ready_to_return(&location) {
-                    return Ok(Self {
-                        location,
-                        format: Some(format),
-                        read_mod,
-                    });
+                    return Ok(Self { location, format: Some(format), read_mod });
                 }
                 (path, Some(format))
             }
@@ -169,18 +157,15 @@ impl InputFileArg {
             // This means the remaining path after modifier & format removal is a directory.
             // ImageMagick simply returns this path (as mentioned, without modifier & format).
             // Any error will come later from the decoder.
-            Ok(true) => Ok(Self {
-                location: Location::Path(PathBuf::from(path)),
-                format,
-                read_mod,
-            }),
+            Ok(true) => {
+                Ok(Self { location: Location::Path(PathBuf::from(path)), format, read_mod })
+            }
             // A normal file would have been returned earlier
             Ok(false) => unreachable!(),
             // `metadata` failed, maybe the file doesn't exist
-            Err(error) => Err(wm_err!(
-                "unable to open image '{}': {error}",
-                input.to_string_lossy()
-            )),
+            Err(error) => {
+                Err(wm_err!("unable to open image '{}': {error}", input.to_string_lossy()))
+            }
         }
     }
 }
@@ -223,20 +208,16 @@ impl TryFrom<&OsStr> for ReadModifier {
         let plus_count = ascii.iter().copied().filter(|c| *c == b'+').take(3).count();
 
         if x_count == 1 && plus_count == 0 {
-            Ok(Self::Resize(ResizeGeometry::try_from(s).map_err(
-                |e| match &e.message {
-                    Some(msg) => wm_err!("invalid resize geometry: {msg}"),
-                    None => wm_err!("invalid resize geometry"),
-                },
-            )?))
+            Ok(Self::Resize(ResizeGeometry::try_from(s).map_err(|e| match &e.message {
+                Some(msg) => wm_err!("invalid resize geometry: {msg}"),
+                None => wm_err!("invalid resize geometry"),
+            })?))
         } else if x_count == 1 && plus_count == 2 {
             match LoadCropGeometry::try_from(s) {
                 Ok(geom) => Ok(Self::Crop(geom)),
                 Err(_) => Err(wm_err!("invalid crop geometry: {s:?}")),
             }
-        } else if ascii
-            .iter()
-            .all(|c| c.is_ascii_digit() || *c == b'-' || *c == b'+' || *c == b',')
+        } else if ascii.iter().all(|c| c.is_ascii_digit() || *c == b'-' || *c == b'+' || *c == b',')
         {
             Ok(Self::FrameSelect(s.to_owned()))
         } else {
@@ -303,10 +284,7 @@ fn split_off_bracketed_suffix(input: &OsStr) -> Option<(OsString, OsString)> {
 
         let slice_before_closing_bracket = &bytes[0..bytes.len() - 1];
 
-        match slice_before_closing_bracket
-            .iter()
-            .rposition(|&b| b == b'[')
-        {
+        match slice_before_closing_bracket.iter().rposition(|&b| b == b'[') {
             Some(open_bracket_idx) => {
                 let prefix_bytes = &bytes[0..open_bracket_idx];
                 let inner_content_bytes = &bytes[open_bracket_idx + 1..bytes.len() - 1];
@@ -340,10 +318,7 @@ fn split_off_bracketed_suffix(input: &OsStr) -> Option<(OsString, OsString)> {
         let slice_before_closing_bracket = &wide_chars[0..wide_chars.len() - 1];
 
         // '[' as a u16 is 91.
-        match slice_before_closing_bracket
-            .iter()
-            .rposition(|&wc| wc == (b'[' as u16))
-        {
+        match slice_before_closing_bracket.iter().rposition(|&wc| wc == (b'[' as u16)) {
             Some(open_bracket_u16_idx) => {
                 let prefix_u16_slice = &wide_chars[0..open_bracket_u16_idx];
                 let inner_u16_slice = &wide_chars[open_bracket_u16_idx + 1..wide_chars.len() - 1];
@@ -371,10 +346,7 @@ fn split_off_bracketed_suffix(input: &OsStr) -> Option<(OsString, OsString)> {
                 return None;
             }
             let slice_before_closing_bracket = &bytes[0..bytes.len() - 1];
-            match slice_before_closing_bracket
-                .iter()
-                .rposition(|&b| b == b'[')
-            {
+            match slice_before_closing_bracket.iter().rposition(|&b| b == b'[') {
                 Some(open_bracket_idx) => {
                     let prefix_str_slice = &s_ref[0..open_bracket_idx];
                     let inner_content_str_slice = &s_ref[open_bracket_idx + 1..bytes.len() - 1];
@@ -469,9 +441,7 @@ mod tests {
             InputFileArg {
                 location: Location::Path("file.png".into()),
                 format: Some(FileFormat::Format(ImageFormat::Jpeg)),
-                read_mod: Some(ReadModifier::Crop(
-                    LoadCropGeometry::from_str("1x2+3+4").unwrap()
-                ))
+                read_mod: Some(ReadModifier::Crop(LoadCropGeometry::from_str("1x2+3+4").unwrap()))
             }
         );
 
@@ -480,10 +450,7 @@ mod tests {
             OsStr::new("file.png[1x2+3+4]"),
             mock_is_dir(["file.png[1x2+3+4]"], []),
         );
-        assert_eq!(
-            result.unwrap().location,
-            Location::Path("file.png[1x2+3+4]".into()),
-        );
+        assert_eq!(result.unwrap().location, Location::Path("file.png[1x2+3+4]".into()),);
         let result = InputFileArg::parse_inner(
             OsStr::new("file.png[1x2+3+4]"),
             mock_is_dir(["file.png"], ["file.png[1x2+3+4]"]),
@@ -499,16 +466,7 @@ mod tests {
     #[test]
     fn parse_stdin() {
         // Simple cases (no weirdly-named files in the current dir)
-        for path in [
-            "",
-            "-",
-            "png:",
-            "png:-",
-            "[1x1]",
-            "-[1x1]",
-            "png:[1x1]",
-            "png:-[1x1]",
-        ] {
+        for path in ["", "-", "png:", "png:-", "[1x1]", "-[1x1]", "png:[1x1]", "png:-[1x1]"] {
             let result = InputFileArg::parse_inner(OsStr::new(path), mock_is_dir([], []));
             assert_eq!(result.unwrap().location, Location::Stdio, "{path:?}");
         }
@@ -524,10 +482,7 @@ mod tests {
         assert_eq!(result.unwrap().location, Location::Path("png:-".into()));
         let result =
             InputFileArg::parse_inner(OsStr::new("png:-[1x1]"), mock_is_dir(["png:-[1x1]"], []));
-        assert_eq!(
-            result.unwrap().location,
-            Location::Path("png:-[1x1]".into()),
-        );
+        assert_eq!(result.unwrap().location, Location::Path("png:-[1x1]".into()),);
         let result =
             InputFileArg::parse_inner(OsStr::new("png:-[1x1]"), mock_is_dir(["png:-"], []));
         assert_eq!(result.unwrap().location, Location::Path("png:-".into()));
@@ -536,12 +491,7 @@ mod tests {
     #[test]
     fn load_crop_geometry() {
         // only a basic smoke test because the underlying geometry parser is well tested already
-        let expected = LoadCropGeometry {
-            width: 1,
-            height: 2,
-            xoffset: 3,
-            yoffset: 4,
-        };
+        let expected = LoadCropGeometry { width: 1, height: 2, xoffset: 3, yoffset: 4 };
         let parsed = LoadCropGeometry::from_str("1x2+3+4").unwrap();
         assert_eq!(expected, parsed);
     }
@@ -634,24 +584,15 @@ mod tests {
         assert_eq!(parse_path_and_format(OsStr::new("file.png")), None);
         assert_eq!(
             parse_path_and_format(OsStr::new("jpg:file.png")),
-            Some((
-                OsString::from("file.png"),
-                FileFormat::Format(ImageFormat::Jpeg)
-            )),
+            Some((OsString::from("file.png"), FileFormat::Format(ImageFormat::Jpeg))),
         );
         assert_eq!(
             parse_path_and_format(OsStr::new("jpeg:file.png")),
-            Some((
-                OsString::from("file.png"),
-                FileFormat::Format(ImageFormat::Jpeg)
-            )),
+            Some((OsString::from("file.png"), FileFormat::Format(ImageFormat::Jpeg))),
         );
         assert_eq!(
             parse_path_and_format(OsStr::new("JPEG:file.png")),
-            Some((
-                OsString::from("file.png"),
-                FileFormat::Format(ImageFormat::Jpeg)
-            )),
+            Some((OsString::from("file.png"), FileFormat::Format(ImageFormat::Jpeg))),
         );
         assert_eq!(
             parse_path_and_format(OsStr::new("jpg:")),
@@ -660,10 +601,7 @@ mod tests {
         assert_eq!(parse_path_and_format(OsStr::new("")), None);
         assert_eq!(parse_path_and_format(OsStr::new(":")), None);
         assert_eq!(parse_path_and_format(OsStr::new(":file.png")), None);
-        assert_eq!(
-            parse_path_and_format(OsStr::new("unsupported_format:file.png")),
-            None,
-        );
+        assert_eq!(parse_path_and_format(OsStr::new("unsupported_format:file.png")), None,);
     }
 
     #[test]

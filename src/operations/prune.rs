@@ -93,11 +93,7 @@ pub fn prune(image: &mut Image, config: &PruneConfig) -> Result<(), MagickError>
     let mut output = GrayImage::new(width, height);
     for y in 0..height {
         for x in 0..width {
-            let val = if grid[(y * width + x) as usize] == 1 {
-                0
-            } else {
-                255
-            };
+            let val = if grid[(y * width + x) as usize] == 1 { 0 } else { 255 };
             output.put_pixel(x, y, Luma([val]));
         }
     }

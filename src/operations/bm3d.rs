@@ -1,8 +1,8 @@
 use crate::{arg_parse_err::ArgParseErr, error::MagickError, image::Image, wm_err};
-use bm3d_core::{bm3d_ring_artifact_removal, Bm3dConfig as CoreConfig, RingRemovalMode};
+use bm3d_core::{Bm3dConfig as CoreConfig, RingRemovalMode, bm3d_ring_artifact_removal};
 use image::{DynamicImage, GenericImageView, Luma, Rgba};
 use ndarray::Array2;
-use oklab::{oklab_to_srgb, srgb_to_oklab, Oklab, Rgb};
+use oklab::{Oklab, Rgb, oklab_to_srgb, srgb_to_oklab};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bm3dConfig {
@@ -56,7 +56,7 @@ impl Bm3dConfig {
                 _ => {
                     return Err(ArgParseErr::with_msg(
                         "invalid anscombe flag: expected true/false, 1/0, or yes/no",
-                    ))
+                    ));
                 }
             }
         } else {
@@ -153,11 +153,7 @@ pub fn bm3d(image: &mut Image, config: &Bm3dConfig) -> Result<(), MagickError> {
 
         // 1. Convert to Oklab
         for (x, y, pixel) in input.enumerate_pixels() {
-            let oklab = srgb_to_oklab(Rgb {
-                r: pixel[0],
-                g: pixel[1],
-                b: pixel[2],
-            });
+            let oklab = srgb_to_oklab(Rgb { r: pixel[0], g: pixel[1], b: pixel[2] });
             l_arr[[y as usize, x as usize]] = oklab.l;
             a_arr[[y as usize, x as usize]] = oklab.a;
             b_arr[[y as usize, x as usize]] = oklab.b;

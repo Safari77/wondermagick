@@ -32,12 +32,7 @@ pub fn scale(image: &mut Image, geometry: &ResizeGeometry) -> Result<(), MagickE
 /// Implements `-sample` command
 pub fn sample(image: &mut Image, geometry: &ResizeGeometry) -> Result<(), MagickError> {
     let (dst_width, dst_height) = compute_dimensions(&image.pixels, geometry);
-    resize_impl(
-        &mut image.pixels,
-        dst_width,
-        dst_height,
-        Some(Filter::Point),
-    )
+    resize_impl(&mut image.pixels, dst_width, dst_height, Some(Filter::Point))
 }
 
 /// Implements `-thumbnail` command
@@ -94,12 +89,7 @@ fn resize_impl(
             *src = ImageBuffer::from_raw(dst_width, dst_height, resized).unwrap();
         }
         DynamicImage::ImageLumaA8(src) => {
-            let resized = wm_try!(resize_plane8_with_alpha(
-                src.as_raw(),
-                src_size,
-                dst_size,
-                alg
-            ));
+            let resized = wm_try!(resize_plane8_with_alpha(src.as_raw(), src_size, dst_size, alg));
             *src = ImageBuffer::from_raw(dst_width, dst_height, resized).unwrap();
         }
         DynamicImage::ImageRgb8(src) => {
@@ -115,13 +105,8 @@ fn resize_impl(
             *src = ImageBuffer::from_raw(dst_width, dst_height, resized).unwrap();
         }
         DynamicImage::ImageLumaA16(src) => {
-            let resized = wm_try!(resize_plane16_with_alpha(
-                src.as_raw(),
-                src_size,
-                dst_size,
-                16,
-                alg
-            ));
+            let resized =
+                wm_try!(resize_plane16_with_alpha(src.as_raw(), src_size, dst_size, 16, alg));
             *src = ImageBuffer::from_raw(dst_width, dst_height, resized).unwrap();
         }
         DynamicImage::ImageRgb16(src) => {
@@ -287,11 +272,7 @@ fn compute_dimensions(image: &DynamicImage, geometry: &ResizeGeometry) -> (u32, 
     }
     let constraint = geometry.constraint;
     match geometry.target {
-        ResizeTarget::Size {
-            width,
-            height,
-            ignore_aspect_ratio,
-        } => {
+        ResizeTarget::Size { width, height, ignore_aspect_ratio } => {
             if ignore_aspect_ratio {
                 let width = compute_dimension(image.width(), width, &constraint);
                 let height = compute_dimension(image.height(), height, &constraint);
@@ -364,16 +345,10 @@ fn preserve_aspect_ratio(
     constraint: &ResizeConstraint,
 ) -> (u32, u32) {
     assert!(target_width.is_some() || target_height.is_some());
-    let target_width = compute_dimension(
-        image.width(),
-        Some(target_width.unwrap_or(u32::MAX)),
-        constraint,
-    );
-    let target_height = compute_dimension(
-        image.height(),
-        Some(target_height.unwrap_or(u32::MAX)),
-        constraint,
-    );
+    let target_width =
+        compute_dimension(image.width(), Some(target_width.unwrap_or(u32::MAX)), constraint);
+    let target_height =
+        compute_dimension(image.height(), Some(target_height.unwrap_or(u32::MAX)), constraint);
     let image_ratio = Fraction::new(image.width(), image.height());
     let target_ratio = Fraction::new(target_width, target_height);
     use std::cmp::Ordering;
@@ -423,11 +398,7 @@ fn cover_area(image: &DynamicImage, target_width: u32, target_height: u32) -> (u
 
 #[must_use]
 fn prevent_zero(size: u32) -> u32 {
-    if size == 0 {
-        1
-    } else {
-        size
-    }
+    if size == 0 { 1 } else { size }
 }
 
 #[must_use]
@@ -453,12 +424,7 @@ mod tests {
     fn preserve_aspect_ratio_wide() {
         let image = DynamicImage::new_rgb8(800, 600);
         assert_eq!(
-            preserve_aspect_ratio(
-                &image,
-                Some(100),
-                Some(100),
-                &ResizeConstraint::Unconstrained
-            ),
+            preserve_aspect_ratio(&image, Some(100), Some(100), &ResizeConstraint::Unconstrained),
             (100, 75)
         );
     }
@@ -467,12 +433,7 @@ mod tests {
     fn preserve_aspect_ratio_wide_upscale() {
         let image = DynamicImage::new_rgb8(100, 75);
         assert_eq!(
-            preserve_aspect_ratio(
-                &image,
-                Some(800),
-                Some(800),
-                &ResizeConstraint::Unconstrained
-            ),
+            preserve_aspect_ratio(&image, Some(800), Some(800), &ResizeConstraint::Unconstrained),
             (800, 600)
         );
     }
@@ -481,12 +442,7 @@ mod tests {
     fn preserve_aspect_ratio_narrow() {
         let image = DynamicImage::new_rgb8(600, 800);
         assert_eq!(
-            preserve_aspect_ratio(
-                &image,
-                Some(100),
-                Some(100),
-                &ResizeConstraint::Unconstrained
-            ),
+            preserve_aspect_ratio(&image, Some(100), Some(100), &ResizeConstraint::Unconstrained),
             (75, 100)
         );
     }
@@ -495,12 +451,7 @@ mod tests {
     fn preserve_aspect_ratio_narrow_upscale() {
         let image = DynamicImage::new_rgb8(75, 100);
         assert_eq!(
-            preserve_aspect_ratio(
-                &image,
-                Some(800),
-                Some(800),
-                &ResizeConstraint::Unconstrained
-            ),
+            preserve_aspect_ratio(&image, Some(800), Some(800), &ResizeConstraint::Unconstrained),
             (600, 800)
         );
     }
@@ -509,12 +460,7 @@ mod tests {
     fn preserve_aspect_ratio_same() {
         let image = DynamicImage::new_rgb8(800, 800);
         assert_eq!(
-            preserve_aspect_ratio(
-                &image,
-                Some(100),
-                Some(100),
-                &ResizeConstraint::Unconstrained
-            ),
+            preserve_aspect_ratio(&image, Some(100), Some(100), &ResizeConstraint::Unconstrained),
             (100, 100)
         );
     }

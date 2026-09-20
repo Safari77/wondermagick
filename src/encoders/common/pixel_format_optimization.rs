@@ -234,20 +234,12 @@ struct PixelFormatTransforms {
 impl PixelFormatTransforms {
     #[inline]
     fn all_true() -> Self {
-        Self {
-            grayscale: true,
-            strip_alpha: true,
-            eight_bit: true,
-        }
+        Self { grayscale: true, strip_alpha: true, eight_bit: true }
     }
 
     #[inline]
     fn all_false() -> Self {
-        Self {
-            grayscale: false,
-            strip_alpha: false,
-            eight_bit: false,
-        }
+        Self { grayscale: false, strip_alpha: false, eight_bit: false }
     }
 }
 

@@ -15,9 +15,7 @@ pub fn insert_suffix_before_extension_in_path(
         let filename_path_view = Path::new(filename_os_str);
 
         if let Some(ext_os_str) = filename_path_view.extension() {
-            let stem_os_str = filename_path_view
-                .file_stem()
-                .unwrap_or_else(|| OsStr::new(""));
+            let stem_os_str = filename_path_view.file_stem().unwrap_or_else(|| OsStr::new(""));
 
             let mut new_filename = OsString::new();
             new_filename.push(stem_os_str);
@@ -137,9 +135,6 @@ mod tests {
             "Input (non-UTF8): {:?}, Expected: {:?}, Got: {:?}",
             non_utf8_path, expected_non_utf8_path, result_non_utf8
         );
-        assert_eq!(
-            result_non_utf8, expected_non_utf8_path,
-            "Test for non-UTF8 path"
-        );
+        assert_eq!(result_non_utf8, expected_non_utf8_path, "Test for non-UTF8 path");
     }
 }

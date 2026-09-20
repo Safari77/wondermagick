@@ -37,9 +37,7 @@ pub fn grayscale(image: &mut Image, method: &GrayscaleMethod) -> Result<(), Magi
                 let b = pixel[2] as f64;
 
                 // SDTV and JPEG standard luma: calculated directly on gamma-compressed sRGB values
-                let luma = (0.299 * r + 0.587 * g + 0.114 * b)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                let luma = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8;
                 gray.put_pixel(x, y, Luma([luma]));
             }
 
@@ -117,9 +115,5 @@ fn srgb_to_oklab_l(r: u8, g: u8, b: u8) -> f64 {
 #[inline]
 fn srgb_to_linear(c: u8) -> f64 {
     let c = c as f64 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }

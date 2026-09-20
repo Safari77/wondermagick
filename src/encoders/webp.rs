@@ -29,18 +29,12 @@ pub fn encode<W: Write>(
     }
 
     let webp = match pixels.as_ref() {
-        DynamicImage::ImageRgb8(pixels) => config.encode_rgb(
-            pixels.as_raw(),
-            pixels.width(),
-            pixels.height(),
-            Unstoppable,
-        ),
-        DynamicImage::ImageRgba8(pixels) => config.encode_rgba(
-            pixels.as_raw(),
-            pixels.width(),
-            pixels.height(),
-            Unstoppable,
-        ),
+        DynamicImage::ImageRgb8(pixels) => {
+            config.encode_rgb(pixels.as_raw(), pixels.width(), pixels.height(), Unstoppable)
+        }
+        DynamicImage::ImageRgba8(pixels) => {
+            config.encode_rgba(pixels.as_raw(), pixels.width(), pixels.height(), Unstoppable)
+        }
         _ => unreachable!("to_8bit_rgb_maybe_a only returns Rgb8 or Rgba8"),
     }
     .map_err(|e| wm_err!("WebP encoding failed: {e:?}"))?;

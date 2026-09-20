@@ -9,18 +9,8 @@ pub enum FxOperator {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FxMode {
-    Rgb {
-        cond_r: u8,
-        cond_g: u8,
-        cond_b: u8,
-        replace_r: u8,
-        replace_g: u8,
-        replace_b: u8,
-    },
-    Gray {
-        cond: u8,
-        replace: u8,
-    },
+    Rgb { cond_r: u8, cond_g: u8, cond_b: u8, replace_r: u8, replace_g: u8, replace_b: u8 },
+    Gray { cond: u8, replace: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,11 +38,7 @@ impl FxConfig {
         let op = match op_str.as_str() {
             "le" | "<=" => FxOperator::LessThanEqual,
             "ge" | ">=" => FxOperator::GreaterThanEqual,
-            _ => {
-                return Err(ArgParseErr::with_msg(
-                    "fx operator must be 'le' (<=) or 'ge' (>=)",
-                ))
-            }
+            _ => return Err(ArgParseErr::with_msg("fx operator must be 'le' (<=) or 'ge' (>=)")),
         };
 
         let mode = if len == 7 {
@@ -81,14 +67,7 @@ impl FxConfig {
                 .parse::<u8>()
                 .map_err(|_| ArgParseErr::with_msg("invalid replace b value"))?;
 
-            FxMode::Rgb {
-                cond_r,
-                cond_g,
-                cond_b,
-                replace_r,
-                replace_g,
-                replace_b,
-            }
+            FxMode::Rgb { cond_r, cond_g, cond_b, replace_r, replace_g, replace_b }
         } else {
             let cond = parts[1]
                 .trim()
@@ -110,16 +89,11 @@ pub fn fx(image: &mut Image, config: &FxConfig) -> Result<(), MagickError> {
     let is_color = image.pixels.color().has_color();
 
     match &config.mode {
-        FxMode::Rgb {
-            cond_r,
-            cond_g,
-            cond_b,
-            replace_r,
-            replace_g,
-            replace_b,
-        } => {
+        FxMode::Rgb { cond_r, cond_g, cond_b, replace_r, replace_g, replace_b } => {
             if !is_color {
-                return Err(crate::wm_err!("fx RGB mode (7 arguments) requires an RGB image, but a grayscale image was loaded."));
+                return Err(crate::wm_err!(
+                    "fx RGB mode (7 arguments) requires an RGB image, but a grayscale image was loaded."
+                ));
             }
 
             let mut output = image.pixels.to_rgba8();
@@ -143,7 +117,9 @@ pub fn fx(image: &mut Image, config: &FxConfig) -> Result<(), MagickError> {
         }
         FxMode::Gray { cond, replace } => {
             if is_color {
-                return Err(crate::wm_err!("fx Grayscale mode (3 arguments) requires a grayscale image, but an RGB image was loaded."));
+                return Err(crate::wm_err!(
+                    "fx Grayscale mode (3 arguments) requires a grayscale image, but an RGB image was loaded."
+                ));
             }
 
             let mut output = image.pixels.to_luma8();

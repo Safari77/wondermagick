@@ -22,14 +22,11 @@ impl TryFrom<&OsStr> for UnsharpenGeometry {
 
     fn try_from(s: &OsStr) -> Result<Self, Self::Error> {
         if s.is_empty() {
-            return Err(ArgParseErr::with_msg(
-                "unsharp geometry must be non-empty and ASCII only",
-            ));
+            return Err(ArgParseErr::with_msg("unsharp geometry must be non-empty and ASCII only"));
         }
 
-        let string: &str = s
-            .try_into()
-            .map_err(|_e| ArgParseErr::with_msg("invalid unsharp geometry"))?;
+        let string: &str =
+            s.try_into().map_err(|_e| ArgParseErr::with_msg("invalid unsharp geometry"))?;
         let parts: Vec<&str> = string.split('x').collect();
 
         match parts.len() {
@@ -73,11 +70,7 @@ fn parse_rest(
 ) -> Result<UnsharpenGeometry, ArgParseErr> {
     let sigma = maybe_sigma.map_or_else(|| parse_sigma(rest.first().unwrap()), Ok)?;
     match rest.len() {
-        1 => Ok(UnsharpenGeometry {
-            radius,
-            sigma,
-            ..Default::default()
-        }),
+        1 => Ok(UnsharpenGeometry { radius, sigma, ..Default::default() }),
         2 => Ok(UnsharpenGeometry {
             radius,
             sigma,
@@ -103,10 +96,7 @@ mod tests {
     fn test_radius_only() {
         assert_eq!(
             UnsharpenGeometry::from_str("5"),
-            Ok(UnsharpenGeometry {
-                radius: 5,
-                ..Default::default()
-            })
+            Ok(UnsharpenGeometry { radius: 5, ..Default::default() })
         );
     }
 
@@ -114,11 +104,7 @@ mod tests {
     fn test_radius_and_sigma() {
         assert_eq!(
             UnsharpenGeometry::from_str("5x1.1"),
-            Ok(UnsharpenGeometry {
-                radius: 5,
-                sigma: 1.1,
-                ..Default::default()
-            })
+            Ok(UnsharpenGeometry { radius: 5, sigma: 1.1, ..Default::default() })
         );
     }
 
@@ -126,12 +112,7 @@ mod tests {
     fn test_radius_and_sigma_and_gain() {
         assert_eq!(
             UnsharpenGeometry::from_str("2x1.5+9"),
-            Ok(UnsharpenGeometry {
-                radius: 2,
-                sigma: 1.5,
-                gain: 9.0,
-                ..Default::default()
-            })
+            Ok(UnsharpenGeometry { radius: 2, sigma: 1.5, gain: 9.0, ..Default::default() })
         );
     }
 
@@ -139,12 +120,7 @@ mod tests {
     fn test_radius_and_sigma_and_gain_and_threshold() {
         assert_eq!(
             UnsharpenGeometry::from_str("42x2.1+7+11"),
-            Ok(UnsharpenGeometry {
-                radius: 42,
-                sigma: 2.1,
-                gain: 7.0,
-                threshold: 11,
-            })
+            Ok(UnsharpenGeometry { radius: 42, sigma: 2.1, gain: 7.0, threshold: 11 })
         );
     }
 
@@ -152,12 +128,7 @@ mod tests {
     fn test_radius_and_gain_and_threshold() {
         assert_eq!(
             UnsharpenGeometry::from_str("42+7+11"),
-            Ok(UnsharpenGeometry {
-                radius: 42,
-                gain: 7.0,
-                threshold: 11,
-                ..Default::default()
-            })
+            Ok(UnsharpenGeometry { radius: 42, gain: 7.0, threshold: 11, ..Default::default() })
         );
     }
 

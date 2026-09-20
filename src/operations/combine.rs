@@ -47,11 +47,7 @@ pub fn combine(
         }
 
         // Fallback to true color
-        if images.len() <= 3 {
-            image::ColorType::Rgb8
-        } else {
-            image::ColorType::Rgba8
-        }
+        if images.len() <= 3 { image::ColorType::Rgb8 } else { image::ColorType::Rgba8 }
     } else {
         color
     };
@@ -67,12 +63,7 @@ pub fn combine(
         image::ColorType::Rgba16 => (ChannelType::U16, ChannelCount::Four),
         image::ColorType::Rgb32F => (ChannelType::U32, ChannelCount::Three),
         image::ColorType::Rgba32F => (ChannelType::U32, ChannelCount::Four),
-        _ => {
-            return Err(wm_err!(
-                "unsupported color type {:?} for operation combine",
-                color
-            ))
-        }
+        _ => return Err(wm_err!("unsupported color type {:?} for operation combine", color)),
     };
 
     let Some(first) = images.first_mut() else {

@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::io::Write;
 
-use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::DynamicImage;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 
 use crate::encoders::common::{optimize_pixel_format_and_precision, write_metadata};
 use crate::plan::Modifiers;

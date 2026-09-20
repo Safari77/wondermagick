@@ -32,9 +32,8 @@ impl TryFrom<&std::ffi::OsStr> for GrayscaleMethod {
     type Error = ArgParseErr;
 
     fn try_from(s: &OsStr) -> Result<Self, Self::Error> {
-        s.to_str()
-            .ok_or_else(|| ArgParseErr::with_msg("non-utf8 grayscale value"))
-            .and_then(|val| {
+        s.to_str().ok_or_else(|| ArgParseErr::with_msg("non-utf8 grayscale value")).and_then(
+            |val| {
                 Self::try_from(val).map_err(|_| {
                     let valid_methods = Self::VARIANTS.join(", ");
                     ArgParseErr::with_msg(format!(
@@ -42,7 +41,8 @@ impl TryFrom<&std::ffi::OsStr> for GrayscaleMethod {
                         val, valid_methods
                     ))
                 })
-            })
+            },
+        )
     }
 }
 
@@ -53,10 +53,7 @@ mod tests {
 
     #[test]
     fn test_valid_methods() {
-        assert_eq!(
-            GrayscaleMethod::from_str("Rec709Luma"),
-            Ok(GrayscaleMethod::Rec709Luma)
-        );
+        assert_eq!(GrayscaleMethod::from_str("Rec709Luma"), Ok(GrayscaleMethod::Rec709Luma));
         assert_eq!(
             GrayscaleMethod::from_str("OklabLuminance"),
             Ok(GrayscaleMethod::OklabLuminance)
@@ -65,10 +62,7 @@ mod tests {
 
     #[test]
     fn test_case_insensitive() {
-        assert_eq!(
-            GrayscaleMethod::from_str("rec709lumA"),
-            Ok(GrayscaleMethod::Rec709Luma)
-        );
+        assert_eq!(GrayscaleMethod::from_str("rec709lumA"), Ok(GrayscaleMethod::Rec709Luma));
     }
 
     #[test]
