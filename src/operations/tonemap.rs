@@ -5,10 +5,12 @@ use gainforge::{
     RgbToneMapperParameters, ToneMappingMethod, create_tone_mapper_rgb, create_tone_mapper_rgb16,
     create_tone_mapper_rgba, create_tone_mapper_rgba16,
 };
-use image::{DynamicImage, ImageBuffer, Rgb as ImgRgb, RgbImage, Rgba as ImgRgba, RgbaImage};
+use image::{
+    DynamicImage, ImageBuffer, Luma, LumaA, Rgb as ImgRgb, Rgb32FImage, RgbImage, Rgba as ImgRgba,
+    Rgba32FImage, RgbaImage,
+};
 use moxcms::{ColorProfile, Rgb};
 use rayon::prelude::*;
-use std::borrow::Cow;
 
 // -----------------------------------------------------------------------------
 // Configuration data-model
@@ -118,22 +120,22 @@ impl AgxCustomLookConfig {
     /// slope/saturation non-negative, and power strictly positive (a zero or
     /// negative exponent is degenerate). Offset may be any finite value.
     fn validate(&self) -> Result<(), ArgParseErr> {
-        for &v in self.slope.iter() {
+        for &v in &self.slope {
             if !v.is_finite() || v < 0.0 {
                 return Err(ArgParseErr::with_msg("agx_slope values must be finite and >= 0"));
             }
         }
-        for &v in self.power.iter() {
+        for &v in &self.power {
             if !v.is_finite() || v <= 0.0 {
                 return Err(ArgParseErr::with_msg("agx_power values must be finite and > 0"));
             }
         }
-        for &v in self.saturation.iter() {
+        for &v in &self.saturation {
             if !v.is_finite() || v < 0.0 {
                 return Err(ArgParseErr::with_msg("agx_saturation values must be finite and >= 0"));
             }
         }
-        for &v in self.offset.iter() {
+        for &v in &self.offset {
             if !v.is_finite() {
                 return Err(ArgParseErr::with_msg("agx_offset values must be finite"));
             }
@@ -204,6 +206,7 @@ impl TonemapConfig {
 
         let mut config = Self::default();
         let mut custom_agx_specified = false;
+        let mut explicit_agx_look = false;
         let mut parts = s.split(',');
 
         while let Some(part) = parts.next() {
@@ -223,21 +226,18 @@ impl TonemapConfig {
                         })
                     };
 
-                    let cicp = if val.contains(':')
-                        || val.contains('/')
-                        || val.contains('-')
-                        || val.contains('_')
-                    {
-                        let pieces: Vec<&str> = val.split([':', '/', '-', '_']).collect();
-                        if pieces.len() != 4 {
+                    let cicp = if val.contains([':', '/', '-', '_']) {
+                        let mut pieces = val.split([':', '/', '-', '_']);
+                        let (Some(p1), Some(p2), Some(p3), Some(p4), None) = (
+                            pieces.next(),
+                            pieces.next(),
+                            pieces.next(),
+                            pieces.next(),
+                            pieces.next(),
+                        ) else {
                             return Err(ArgParseErr::with_msg("cicp requires 4 values"));
-                        }
-                        [
-                            parse_byte(pieces[0])?,
-                            parse_byte(pieces[1])?,
-                            parse_byte(pieces[2])?,
-                            parse_byte(pieces[3])?,
-                        ]
+                        };
+                        [parse_byte(p1)?, parse_byte(p2)?, parse_byte(p3)?, parse_byte(p4)?]
                     } else {
                         let p1 = parse_byte(val)?;
                         let p2_val = parts
@@ -267,7 +267,7 @@ impl TonemapConfig {
                 .or_else(|| part.strip_prefix("method="))
                 .or_else(|| part.strip_prefix("tm="))
             {
-                config.method = val.to_lowercase().replace('-', "_");
+                config.method = normalize_ident(val);
             } else if let Some(val) =
                 part.strip_prefix("exposure=").or_else(|| part.strip_prefix("exp="))
             {
@@ -278,14 +278,14 @@ impl TonemapConfig {
                 .or_else(|| part.strip_prefix("color-space="))
                 .or_else(|| part.strip_prefix("cs="))
             {
-                config.color_space = val.to_lowercase().replace('-', "_");
+                config.color_space = normalize_ident(val);
             } else if let Some(val) = part
                 .strip_prefix("gamut_clipping=")
                 .or_else(|| part.strip_prefix("gamut-clipping="))
                 .or_else(|| part.strip_prefix("gamutclipping="))
                 .or_else(|| part.strip_prefix("gc="))
             {
-                config.gamut_clipping = val.to_lowercase().replace('-', "_");
+                config.gamut_clipping = normalize_ident(val);
             } else if let Some(val) = part
                 .strip_prefix("max_luma=")
                 .or_else(|| part.strip_prefix("max-luma="))
@@ -358,6 +358,8 @@ impl TonemapConfig {
                 .or_else(|| part.strip_prefix("fs_gray_point_target="))
                 .or_else(|| part.strip_prefix("fs-grey-target="))
                 .or_else(|| part.strip_prefix("fs-gray-target="))
+                .or_else(|| part.strip_prefix("fs-grey-point-target="))
+                .or_else(|| part.strip_prefix("fs-gray-point-target="))
             {
                 config.filmic_spline.grey_point_target =
                     parse_f32(val, "invalid fs_grey_target value (must be float)")?;
@@ -383,7 +385,8 @@ impl TonemapConfig {
             } else if let Some(val) =
                 part.strip_prefix("agx_look=").or_else(|| part.strip_prefix("agx-look="))
             {
-                config.agx_look = val.to_lowercase().replace('-', "_");
+                config.agx_look = normalize_ident(val);
+                explicit_agx_look = true;
             } else if let Some(val) =
                 part.strip_prefix("agx_slope=").or_else(|| part.strip_prefix("agx-slope="))
             {
@@ -414,30 +417,40 @@ impl TonemapConfig {
             }
         }
 
-        if custom_agx_specified && config.agx_look == "default" {
+        if custom_agx_specified && !explicit_agx_look {
             config.agx_look = "custom".to_string();
         }
 
-        // Sanity-check the most important numericals.
-        if !config.nits.is_finite() || config.nits <= 0.0 {
-            return Err(ArgParseErr::with_msg("nits must be a positive, finite number"));
+        // Sanity-check the most important numericals and enum identifiers.
+        check_positive_finite(config.nits, "nits must be a positive, finite number")?;
+        check_positive_finite(config.exposure, "exposure must be a positive, finite number")?;
+        check_positive_finite(
+            config.display_max_brightness,
+            "display_max_brightness must be a positive, finite number",
+        )?;
+        check_positive_finite(config.max_luma, "max_luma must be positive and finite")?;
+        if let Some(cb) = config.content_brightness {
+            check_positive_finite(cb, "content_brightness must be positive and finite")?;
         }
-        if !config.exposure.is_finite() || config.exposure <= 0.0 {
-            return Err(ArgParseErr::with_msg("exposure must be a positive, finite number"));
-        }
-        if !config.display_max_brightness.is_finite() || config.display_max_brightness <= 0.0 {
-            return Err(ArgParseErr::with_msg(
-                "display_max_brightness must be a positive, finite number",
-            ));
-        }
-        if config.max_luma <= 0.0 || !config.max_luma.is_finite() {
-            return Err(ArgParseErr::with_msg("max_luma must be positive and finite"));
-        }
-        if let Some(cb) = config.content_brightness
-            && (!cb.is_finite() || cb <= 0.0)
-        {
-            return Err(ArgParseErr::with_msg("content_brightness must be positive and finite"));
-        }
+
+        // Validate string enum options early at parse time.
+        let _ = parse_color_space_kind(&config.color_space).map_err(|_| {
+            ArgParseErr::with_msg("unsupported color_space (use rgb, yrg, or jzazbz)")
+        })?;
+        let _ = parse_gamut_clipping(&config.gamut_clipping).map_err(|_| {
+            ArgParseErr::with_msg("unsupported gamut_clipping (use noclip or clip)")
+        })?;
+        let _ = build_agx_look(&config).map_err(|_| {
+            ArgParseErr::with_msg("unsupported agx_look (use default, punchy, golden, or custom)")
+        })?;
+        let _ = build_tone_mapping_method(&config).map_err(|_| {
+            ArgParseErr::with_msg(
+                "unsupported tonemapping method (options: itu2408, tuned_reinhard, \
+                 extended_reinhard, reinhard, reinhard_jodie, filmic, aces, clamp, \
+                 filmic_spline, agx)",
+            )
+        })?;
+
         // Filmic-spline and AgX knobs feed straight into gainforge, so range-check
         // them here too rather than trusting the mapper to handle garbage.
         config.filmic_spline.validate()?;
@@ -450,22 +463,26 @@ impl TonemapConfig {
 // Small parsing helpers
 // -----------------------------------------------------------------------------
 
+fn normalize_ident(val: &str) -> String {
+    val.trim().to_ascii_lowercase().replace('-', "_")
+}
+
 fn parse_f32(val: &str, err_label: &'static str) -> Result<f32, ArgParseErr> {
     val.trim().parse::<f32>().map_err(|_| ArgParseErr::with_msg(err_label))
 }
 
-/// Parse a 3-tuple either as a broadcast `v` or as `r:g:b`.
+/// Parse a 3-tuple either as a broadcast `v` or as `r:g:b` without heap allocation.
 fn parse_rgb3(val: &str, err_label: &'static str) -> Result<[f32; 3], ArgParseErr> {
-    let pieces: Vec<&str> = val.split([':', '/', 'x']).collect();
-    match pieces.len() {
-        1 => {
-            let v = parse_f32(pieces[0], err_label)?;
+    let mut pieces = val.split([':', '/', 'x']);
+    match (pieces.next(), pieces.next(), pieces.next(), pieces.next()) {
+        (Some(p0), None, None, None) => {
+            let v = parse_f32(p0, err_label)?;
             Ok([v, v, v])
         }
-        3 => {
-            let r = parse_f32(pieces[0], err_label)?;
-            let g = parse_f32(pieces[1], err_label)?;
-            let b = parse_f32(pieces[2], err_label)?;
+        (Some(p0), Some(p1), Some(p2), None) => {
+            let r = parse_f32(p0, err_label)?;
+            let g = parse_f32(p1, err_label)?;
+            let b = parse_f32(p2, err_label)?;
             Ok([r, g, b])
         }
         _ => Err(ArgParseErr::with_msg(
@@ -525,16 +542,88 @@ enum ColorSpaceKind {
     Jzazbz,
 }
 
-/// Grayscale input variants we tone-map through the RGB path and then collapse
-/// back to luma, so grayscale in yields grayscale out.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum GrayKind {
-    L8,
-    La8,
-    L16,
-    La16,
-    L32F,
-    La32F,
+fn parse_color_space_kind(s: &str) -> Result<ColorSpaceKind, MagickError> {
+    match s {
+        "rgb" => Ok(ColorSpaceKind::Rgb),
+        "yrg" | "default" => Ok(ColorSpaceKind::Yrg),
+        "jzazbz" | "jz_azbz" | "jzczaz" => Ok(ColorSpaceKind::Jzazbz),
+        other => Err(wm_err!("unsupported color_space: {} (use rgb, yrg, or jzazbz)", other)),
+    }
+}
+
+fn parse_gamut_clipping(s: &str) -> Result<GamutClipping, MagickError> {
+    match s {
+        "noclip" | "none" | "off" | "false" => Ok(GamutClipping::NoClip),
+        "clip" | "soft" | "on" | "true" => Ok(GamutClipping::Clip),
+        other => Err(wm_err!("unsupported gamut_clipping: {} (use noclip or clip)", other)),
+    }
+}
+
+fn build_tone_mapping_method(config: &TonemapConfig) -> Result<ToneMappingMethod, MagickError> {
+    let gain_metadata = GainHdrMetadata {
+        content_max_brightness: config.nits,
+        display_max_brightness: config.display_max_brightness,
+    };
+
+    match config.method.as_str() {
+        // ITU-R BT.2408 broadcast tone curve (default).
+        "itu2408" | "rec2408" | "bt2408" | "default" => {
+            Ok(ToneMappingMethod::Itu2408(gain_metadata))
+        }
+
+        // Tuned Reinhard (fast/accurate, tuned for typical HDR sources).
+        "tuned_reinhard" | "tuned" => Ok(ToneMappingMethod::TunedReinhard(gain_metadata)),
+
+        // Plain Erik Reinhard operator.
+        "reinhard" => Ok(ToneMappingMethod::Reinhard),
+
+        // Same as Reinhard but scaled to the full dynamic range of the image
+        // (max_luma is in linear scene-referred units, e.g. 3.0 = ~3x nominal exposure).
+        "extended_reinhard" | "extended" => {
+            Ok(ToneMappingMethod::ExtendedReinhard { max_luma: config.max_luma })
+        }
+
+        // Reinhard + colour preservation hybrid.
+        "reinhard_jodie" | "reinhardjodie" | "jodie" => Ok(ToneMappingMethod::ReinhardJodie),
+
+        // Uncharted 2 filmic curve.
+        "filmic" | "uncharted" | "uncharted2" => Ok(ToneMappingMethod::Filmic),
+
+        // Academy Color Encoding System filmic.
+        "aces" => Ok(ToneMappingMethod::Aces),
+
+        // Simple hard clamp.
+        "clamp" => Ok(ToneMappingMethod::Clamp),
+
+        // Blender Ansel/Darktable-style filmic spline.
+        "filmic_spline" | "filmicspline" | "spline" => {
+            Ok(ToneMappingMethod::FilmicSpline(FilmicSplineParameters {
+                output_power: config.filmic_spline.output_power,
+                latitude: config.filmic_spline.latitude,
+                white_point_source: config.filmic_spline.white_point_source,
+                black_point_source: config.filmic_spline.black_point_source,
+                contrast: config.filmic_spline.contrast,
+                black_point_target: config.filmic_spline.black_point_target,
+                grey_point_target: config.filmic_spline.grey_point_target,
+                white_point_target: config.filmic_spline.white_point_target,
+                balance: config.filmic_spline.balance,
+                saturation: config.filmic_spline.saturation,
+            }))
+        }
+
+        // Blender AgX.
+        "agx" | "ag_x" => {
+            let look = build_agx_look(config)?;
+            Ok(ToneMappingMethod::Agx(look))
+        }
+
+        other => Err(wm_err!(
+            "unsupported tonemapping method: {} (options: itu2408, tuned_reinhard, \
+             extended_reinhard, reinhard, reinhard_jodie, filmic, aces, clamp, \
+             filmic_spline, agx)",
+            other
+        )),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -584,38 +673,58 @@ fn expand_narrow_lane_u8(data: &mut [u8], channels: usize, color_channels: usize
     if channels == 0 || color_channels == 0 || channels < color_channels {
         return;
     }
-    for px in data.chunks_exact_mut(channels) {
-        for v in px[..color_channels].iter_mut() {
-            let x = (i32::from(*v) - 16).clamp(0, 219) as u32;
-            *v = ((x * 255 + 109) / 219) as u8; // +109 rounds to nearest
-        }
+    let scale = |v: u8| -> u8 {
+        let x = (i32::from(v) - 16).clamp(0, 219) as u32;
+        ((x * 255 + 109) / 219) as u8 // +109 rounds to nearest
+    };
+    if channels == color_channels {
+        data.par_iter_mut().for_each(|v| *v = scale(*v));
+    } else {
+        data.par_chunks_exact_mut(channels).for_each(|px| {
+            for v in &mut px[..color_channels] {
+                *v = scale(*v);
+            }
+        });
     }
 }
 
 fn expand_narrow_lane_u16(data: &mut [u16], channels: usize, color_channels: usize) {
     const LO: i32 = 16 << 8; // 4096
-    const SPAN: u64 = 219 << 8; // 56064
+    const SPAN: u32 = 219 << 8; // 56064
     if channels == 0 || color_channels == 0 || channels < color_channels {
         return;
     }
-    for px in data.chunks_exact_mut(channels) {
-        for v in px[..color_channels].iter_mut() {
-            let x = (i32::from(*v) - LO).clamp(0, SPAN as i32) as u64;
-            *v = ((x * 65535 + SPAN / 2) / SPAN) as u16;
-        }
+    // 56064 * 65535 + 28032 = 3_674_182_272, which fits inside u32::MAX (4_294_967_295).
+    let scale = |v: u16| -> u16 {
+        let x = (i32::from(v) - LO).clamp(0, SPAN as i32) as u32;
+        ((x * 65535 + SPAN / 2) / SPAN) as u16
+    };
+    if channels == color_channels {
+        data.par_iter_mut().for_each(|v| *v = scale(*v));
+    } else {
+        data.par_chunks_exact_mut(channels).for_each(|px| {
+            for v in &mut px[..color_channels] {
+                *v = scale(*v);
+            }
+        });
     }
 }
 
 fn expand_narrow_lane_f32(data: &mut [f32], channels: usize, color_channels: usize) {
     const LO: f32 = 16.0 / 255.0;
-    const SPAN: f32 = 219.0 / 255.0;
+    const INV_SPAN: f32 = 255.0 / 219.0;
     if channels == 0 || color_channels == 0 || channels < color_channels {
         return;
     }
-    for px in data.chunks_exact_mut(channels) {
-        for v in px[..color_channels].iter_mut() {
-            *v = ((*v - LO) / SPAN).clamp(0.0, 1.0);
-        }
+    let scale = |v: f32| -> f32 { ((v - LO) * INV_SPAN).clamp(0.0, 1.0) };
+    if channels == color_channels {
+        data.par_iter_mut().for_each(|v| *v = scale(*v));
+    } else {
+        data.par_chunks_exact_mut(channels).for_each(|px| {
+            for v in &mut px[..color_channels] {
+                *v = scale(*v);
+            }
+        });
     }
 }
 
@@ -659,6 +768,65 @@ fn map_rows<T: Copy + Default + Send + Sync>(
     Ok(dst)
 }
 
+/// Tone-maps grayscale (1ch Luma or 2ch LumaA) rows directly without allocating
+/// full-frame RGB/RGBA intermediate images. Each worker thread expands one row
+/// into a small per-row RGB(A) buffer, tone-maps it, and collapses neutral R
+/// (plus alpha if present) back into `dst`.
+fn map_gray_rows<T: Copy + Default + Send + Sync, const HAS_ALPHA: bool>(
+    src: &[T],
+    width: usize,
+    lane: impl Fn(&[T], &mut [T]) -> Result<(), ForgeError> + Sync + Send,
+) -> Result<Vec<T>, MagickError> {
+    let gray_ch = if HAS_ALPHA { 2 } else { 1 };
+    let rgb_ch = if HAS_ALPHA { 4 } else { 3 };
+    let gray_row_len = width * gray_ch;
+    let rgb_row_len = width * rgb_ch;
+
+    if gray_row_len == 0 || src.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut dst = vec![T::default(); src.len()];
+    src.par_chunks_exact(gray_row_len)
+        .zip(dst.par_chunks_exact_mut(gray_row_len))
+        .enumerate()
+        .try_for_each_init(
+            || (vec![T::default(); rgb_row_len], vec![T::default(); rgb_row_len]),
+            |(rgb_src, rgb_dst), (y, (src_row, dst_row))| {
+                if HAS_ALPHA {
+                    for (g, rgb) in src_row.chunks_exact(2).zip(rgb_src.chunks_exact_mut(4)) {
+                        rgb[0] = g[0];
+                        rgb[1] = g[0];
+                        rgb[2] = g[0];
+                        rgb[3] = g[1];
+                    }
+                } else {
+                    for (&g, rgb) in src_row.iter().zip(rgb_src.chunks_exact_mut(3)) {
+                        rgb[0] = g;
+                        rgb[1] = g;
+                        rgb[2] = g;
+                    }
+                }
+
+                lane(rgb_src, rgb_dst)
+                    .map_err(|e| wm_err!("Tone mapping failed on row {}: {}", y, e))?;
+
+                if HAS_ALPHA {
+                    for (rgb, g) in rgb_dst.chunks_exact(4).zip(dst_row.chunks_exact_mut(2)) {
+                        g[0] = rgb[0];
+                        g[1] = rgb[3];
+                    }
+                } else {
+                    for (rgb, g) in rgb_dst.chunks_exact(3).zip(dst_row.iter_mut()) {
+                        *g = rgb[0];
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    Ok(dst)
+}
+
 pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickError> {
     // 1. Determine Source Color Profile
     // "auto" fallback: Default to BT2020 PQ until PNG chunk metadata extraction is implemented
@@ -672,13 +840,15 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
     }
 
     // sRGB-tagged input with default broadcast settings is already standard SDR;
-    // nothing useful to do unless custom exposure, gamut clipping, or tone curves are requested.
+    // nothing useful to do unless custom exposure, gamut clipping, brightness scaling,
+    // or tone curves are requested.
     let is_default_curve =
         matches!(config.method.as_str(), "itu2408" | "rec2408" | "bt2408" | "default");
     let is_noclip = matches!(config.gamut_clipping.as_str(), "noclip" | "none" | "off" | "false");
     if cicp[0] == 1
         && cicp[1] == 13
-        && (config.exposure - 1.0).abs() < f32::EPSILON
+        && (config.exposure - 1.0).abs() <= f32::EPSILON
+        && (config.nits - config.display_max_brightness).abs() <= f32::EPSILON
         && is_default_curve
         && is_noclip
     {
@@ -688,89 +858,13 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
     let dst_profile = ColorProfile::new_srgb();
 
     // --- 2. Select Tone Mapping Method --------------------------------------
-    let gain_metadata = GainHdrMetadata {
-        content_max_brightness: config.nits,
-        display_max_brightness: config.display_max_brightness,
-    };
-
-    let tone_mapping_method = match config.method.as_str() {
-        // ITU-R BT.2408 broadcast tone curve (default).
-        "itu2408" | "rec2408" | "bt2408" | "default" => ToneMappingMethod::Itu2408(gain_metadata),
-
-        // Tuned Reinhard (fast/accurate, tuned for typical HDR sources).
-        "tuned_reinhard" | "tuned" => ToneMappingMethod::TunedReinhard(gain_metadata),
-
-        // Plain Erik Reinhard operator.
-        "reinhard" => ToneMappingMethod::Reinhard,
-
-        // Same as Reinhard but scaled to the full dynamic range of the image
-        // (max_luma is in linear scene-referred units, e.g. 3.0 = ~3x nominal exposure).
-        "extended_reinhard" | "extended" => {
-            ToneMappingMethod::ExtendedReinhard { max_luma: config.max_luma }
-        }
-
-        // Reinhard + colour preservation hybrid.
-        "reinhard_jodie" | "reinhardjodie" | "jodie" => ToneMappingMethod::ReinhardJodie,
-
-        // Uncharted 2 filmic curve.
-        "filmic" | "uncharted" | "uncharted2" => ToneMappingMethod::Filmic,
-
-        // Academy Color Encoding System filmic.
-        "aces" => ToneMappingMethod::Aces,
-
-        // Simple hard clamp.
-        "clamp" => ToneMappingMethod::Clamp,
-
-        // Blender Ansel/Darktable-style filmic spline.
-        "filmic_spline" | "filmicspline" | "spline" => {
-            ToneMappingMethod::FilmicSpline(FilmicSplineParameters {
-                output_power: config.filmic_spline.output_power,
-                latitude: config.filmic_spline.latitude,
-                white_point_source: config.filmic_spline.white_point_source,
-                black_point_source: config.filmic_spline.black_point_source,
-                contrast: config.filmic_spline.contrast,
-                black_point_target: config.filmic_spline.black_point_target,
-                grey_point_target: config.filmic_spline.grey_point_target,
-                white_point_target: config.filmic_spline.white_point_target,
-                balance: config.filmic_spline.balance,
-                saturation: config.filmic_spline.saturation,
-            })
-        }
-
-        // Blender AgX.
-        "agx" | "ag_x" => {
-            let look = build_agx_look(config)?;
-            ToneMappingMethod::Agx(look)
-        }
-
-        other => {
-            return Err(wm_err!(
-                "unsupported tonemapping method: {} (options: itu2408, tuned_reinhard, \
-                 extended_reinhard, reinhard, reinhard_jodie, filmic, aces, clamp, \
-                 filmic_spline, agx)",
-                other
-            ));
-        }
-    };
+    let tone_mapping_method = build_tone_mapping_method(config)?;
 
     // --- 3. Build the Mapping Color Space -----------------------------------
-    let gamut_clipping = match config.gamut_clipping.as_str() {
-        "noclip" | "none" | "off" | "false" => GamutClipping::NoClip,
-        "clip" | "soft" | "on" | "true" => GamutClipping::Clip,
-        other => return Err(wm_err!("unsupported gamut_clipping: {} (use noclip or clip)", other)),
-    };
-
+    let gamut_clipping = parse_gamut_clipping(&config.gamut_clipping)?;
     let exposure = config.exposure;
     let content_brightness = config.content_brightness.unwrap_or(config.nits);
-
-    let color_space_kind = match config.color_space.as_str() {
-        "rgb" => ColorSpaceKind::Rgb,
-        "yrg" | "default" => ColorSpaceKind::Yrg,
-        "jzazbz" | "jz_azbz" | "jzczaz" => ColorSpaceKind::Jzazbz,
-        other => {
-            return Err(wm_err!("unsupported color_space: {} (use rgb, yrg, or jzazbz)", other));
-        }
-    };
+    let color_space_kind = parse_color_space_kind(&config.color_space)?;
 
     // We construct a fresh `MappingColorSpace` per call site so the type
     // doesn't need to be `Copy`.
@@ -791,34 +885,12 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
     let map_creation_err = |e: ForgeError| wm_err!("Failed to create tone mapper: {}", e);
     let alloc_err = || wm_err!("Failed to allocate SDR output image buffer");
 
-    // gainforge only exposes RGB/RGBA lanes, so grayscale is tone-mapped by
-    // replicating L into RGB and collapsing back to luma afterwards. A neutral
-    // (R=G=B) pixel stays neutral through every mapper/working space, so the
-    // round-trip is lossless for the grey axis.
-    let gray_kind = match &image.pixels {
-        DynamicImage::ImageLuma8(_) => Some(GrayKind::L8),
-        DynamicImage::ImageLumaA8(_) => Some(GrayKind::La8),
-        DynamicImage::ImageLuma16(_) => Some(GrayKind::L16),
-        DynamicImage::ImageLumaA16(_) => Some(GrayKind::La16),
-        DynamicImage::ImageLuma32F(_) => Some(GrayKind::L32F),
-        DynamicImage::ImageLumaA32F(_) => Some(GrayKind::La32F),
-        _ => None,
-    };
-
-    // The buffer we actually feed to the mapper: the pixels themselves for RGB
-    // inputs, or an owned RGB(A) expansion for grayscale inputs.
-    let src_dyn: Cow<DynamicImage> = match gray_kind {
-        None => Cow::Borrowed(&image.pixels),
-        Some(GrayKind::L8) => Cow::Owned(DynamicImage::ImageRgb8(image.pixels.to_rgb8())),
-        Some(GrayKind::La8) => Cow::Owned(DynamicImage::ImageRgba8(image.pixels.to_rgba8())),
-        Some(GrayKind::L16) => Cow::Owned(DynamicImage::ImageRgb16(image.pixels.to_rgb16())),
-        Some(GrayKind::La16) => Cow::Owned(DynamicImage::ImageRgba16(image.pixels.to_rgba16())),
-        Some(GrayKind::L32F) => Cow::Owned(DynamicImage::ImageRgb32F(image.pixels.to_rgb32f())),
-        Some(GrayKind::La32F) => Cow::Owned(DynamicImage::ImageRgba32F(image.pixels.to_rgba32f())),
-    };
-
     // --- 4. Tone-map at the native bit depth of the image -------------------
-    let mapped_rgb = match &*src_dyn {
+    // gainforge only exposes RGB/RGBA lanes, so grayscale is tone-mapped by
+    // replicating L into RGB per row and collapsing back to luma afterwards.
+    // A neutral (R=G=B) pixel stays neutral through every mapper/working space,
+    // so the round-trip is lossless for the grey axis.
+    let mapped = match &image.pixels {
         DynamicImage::ImageRgb8(buf) => {
             let (width, height) = buf.dimensions();
             let mapper = create_tone_mapper_rgb(
@@ -843,6 +915,42 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
             .map_err(map_creation_err)?;
             let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| mapper.tonemap_lane(s, d))?;
             DynamicImage::ImageRgba8(RgbaImage::from_raw(width, height, dst).ok_or_else(alloc_err)?)
+        }
+
+        DynamicImage::ImageLuma8(buf) => {
+            let (width, height) = buf.dimensions();
+            let mapper = create_tone_mapper_rgb(
+                &src_profile,
+                &dst_profile,
+                tone_mapping_method,
+                make_mapping(),
+            )
+            .map_err(map_creation_err)?;
+            let dst = map_gray_rows::<u8, false>(buf.as_raw(), width as usize, |s, d| {
+                mapper.tonemap_lane(s, d)
+            })?;
+            DynamicImage::ImageLuma8(
+                ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(width, height, dst)
+                    .ok_or_else(alloc_err)?,
+            )
+        }
+
+        DynamicImage::ImageLumaA8(buf) => {
+            let (width, height) = buf.dimensions();
+            let mapper = create_tone_mapper_rgba(
+                &src_profile,
+                &dst_profile,
+                tone_mapping_method,
+                make_mapping(),
+            )
+            .map_err(map_creation_err)?;
+            let dst = map_gray_rows::<u8, true>(buf.as_raw(), width as usize, |s, d| {
+                mapper.tonemap_lane(s, d)
+            })?;
+            DynamicImage::ImageLumaA8(
+                ImageBuffer::<LumaA<u8>, Vec<u8>>::from_raw(width, height, dst)
+                    .ok_or_else(alloc_err)?,
+            )
         }
 
         DynamicImage::ImageRgb16(buf) => {
@@ -877,14 +985,51 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
             )
         }
 
+        DynamicImage::ImageLuma16(buf) => {
+            let (width, height) = buf.dimensions();
+            let mapper = create_tone_mapper_rgb16(
+                &src_profile,
+                &dst_profile,
+                tone_mapping_method,
+                make_mapping(),
+            )
+            .map_err(map_creation_err)?;
+            let dst = map_gray_rows::<u16, false>(buf.as_raw(), width as usize, |s, d| {
+                mapper.tonemap_lane(s, d)
+            })?;
+            DynamicImage::ImageLuma16(
+                ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(width, height, dst)
+                    .ok_or_else(alloc_err)?,
+            )
+        }
+
+        DynamicImage::ImageLumaA16(buf) => {
+            let (width, height) = buf.dimensions();
+            let mapper = create_tone_mapper_rgba16(
+                &src_profile,
+                &dst_profile,
+                tone_mapping_method,
+                make_mapping(),
+            )
+            .map_err(map_creation_err)?;
+            let dst = map_gray_rows::<u16, true>(buf.as_raw(), width as usize, |s, d| {
+                mapper.tonemap_lane(s, d)
+            })?;
+            DynamicImage::ImageLumaA16(
+                ImageBuffer::<LumaA<u16>, Vec<u16>>::from_raw(width, height, dst)
+                    .ok_or_else(alloc_err)?,
+            )
+        }
+
         // 32-bit float. gainforge has no f32 lane (its highest-precision mapper
-        // is 16-bit), so we quantize to u16 and map that. NOTE: this treats the
+        // is 16-bit), so we quantize to u16, map that, and convert back to f32
+        // so the DynamicImage variant stays consistent. NOTE: this treats the
         // float samples as the source-encoded signal in [0, 1]; linear
         // scene-referred values above 1.0 (e.g. from EXR/Radiance) will be
         // clamped by to_rgb16/to_rgba16. If that's your case, encode to the
         // source transfer function before this step.
         DynamicImage::ImageRgb32F(_) => {
-            let buf = src_dyn.to_rgb16();
+            let buf = image.pixels.to_rgb16();
             let (width, height) = buf.dimensions();
             let mapper = create_tone_mapper_rgb16(
                 &src_profile,
@@ -894,14 +1039,15 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
             )
             .map_err(map_creation_err)?;
             let dst = map_rows(buf.as_raw(), width as usize * 3, |s, d| mapper.tonemap_lane(s, d))?;
-            DynamicImage::ImageRgb16(
+            let mapped16 = DynamicImage::ImageRgb16(
                 ImageBuffer::<ImgRgb<u16>, Vec<u16>>::from_raw(width, height, dst)
                     .ok_or_else(alloc_err)?,
-            )
+            );
+            DynamicImage::ImageRgb32F(Rgb32FImage::from(mapped16.to_rgb32f()))
         }
 
         DynamicImage::ImageRgba32F(_) => {
-            let buf = src_dyn.to_rgba16();
+            let buf = image.pixels.to_rgba16();
             let (width, height) = buf.dimensions();
             let mapper = create_tone_mapper_rgba16(
                 &src_profile,
@@ -911,10 +1057,51 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
             )
             .map_err(map_creation_err)?;
             let dst = map_rows(buf.as_raw(), width as usize * 4, |s, d| mapper.tonemap_lane(s, d))?;
-            DynamicImage::ImageRgba16(
+            let mapped16 = DynamicImage::ImageRgba16(
                 ImageBuffer::<ImgRgba<u16>, Vec<u16>>::from_raw(width, height, dst)
                     .ok_or_else(alloc_err)?,
+            );
+            DynamicImage::ImageRgba32F(Rgba32FImage::from(mapped16.to_rgba32f()))
+        }
+
+        DynamicImage::ImageLuma32F(_) => {
+            let buf = image.pixels.to_luma16();
+            let (width, height) = buf.dimensions();
+            let mapper = create_tone_mapper_rgb16(
+                &src_profile,
+                &dst_profile,
+                tone_mapping_method,
+                make_mapping(),
             )
+            .map_err(map_creation_err)?;
+            let dst = map_gray_rows::<u16, false>(buf.as_raw(), width as usize, |s, d| {
+                mapper.tonemap_lane(s, d)
+            })?;
+            let mapped16 = DynamicImage::ImageLuma16(
+                ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(width, height, dst)
+                    .ok_or_else(alloc_err)?,
+            );
+            DynamicImage::ImageLuma32F(mapped16.to_luma32f())
+        }
+
+        DynamicImage::ImageLumaA32F(_) => {
+            let buf = image.pixels.to_luma_alpha16();
+            let (width, height) = buf.dimensions();
+            let mapper = create_tone_mapper_rgba16(
+                &src_profile,
+                &dst_profile,
+                tone_mapping_method,
+                make_mapping(),
+            )
+            .map_err(map_creation_err)?;
+            let dst = map_gray_rows::<u16, true>(buf.as_raw(), width as usize, |s, d| {
+                mapper.tonemap_lane(s, d)
+            })?;
+            let mapped16 = DynamicImage::ImageLumaA16(
+                ImageBuffer::<LumaA<u16>, Vec<u16>>::from_raw(width, height, dst)
+                    .ok_or_else(alloc_err)?,
+            );
+            DynamicImage::ImageLumaA32F(mapped16.to_luma_alpha32f())
         }
 
         // Catch-all for any future DynamicImage variants: convert to 16-bit first.
@@ -954,18 +1141,6 @@ pub fn tonemap(image: &mut Image, config: &TonemapConfig) -> Result<(), MagickEr
                 )
             }
         }
-    };
-
-    // Collapse the tone-mapped RGB back to luma for grayscale inputs so the
-    // output pixel format matches the input.
-    let mapped = match gray_kind {
-        None => mapped_rgb,
-        Some(GrayKind::L8) => DynamicImage::ImageLuma8(mapped_rgb.to_luma8()),
-        Some(GrayKind::La8) => DynamicImage::ImageLumaA8(mapped_rgb.to_luma_alpha8()),
-        Some(GrayKind::L16) => DynamicImage::ImageLuma16(mapped_rgb.to_luma16()),
-        Some(GrayKind::La16) => DynamicImage::ImageLumaA16(mapped_rgb.to_luma_alpha16()),
-        Some(GrayKind::L32F) => DynamicImage::ImageLuma32F(mapped_rgb.to_luma32f()),
-        Some(GrayKind::La32F) => DynamicImage::ImageLumaA32F(mapped_rgb.to_luma_alpha32f()),
     };
 
     image.pixels = mapped;
