@@ -174,10 +174,10 @@ impl QuantizeConfig {
     ///    colors:  palette size (2-)
     ///    dither:  error diffusion strength (0.0 = off, 1.0 = full)
     ///    bias:    algorithm selector:
-    ///                <= -2.0        MacQueen online k-means in Oklab (stochastic, fast)
+    ///                 <= -2.0        MacQueen online k-means in Oklab (stochastic, fast)
     ///          -2.0 < ... < 0.0    Oklab median-cut (fast, good for flat art)
-    ///                     0.0        classic RGB k-means (mapping & dither run in RGB too)
-    ///                   > 0.0        Oklab k-means++ (perceptual, value = saturation boost)
+    ///                       0.0        classic RGB k-means (mapping & dither run in RGB too)
+    ///                     > 0.0        Oklab k-means++ (perceptual, value = saturation boost)
     ///
     ///  Oklab k-means++ accepts optional suffixes after bias:
     ///    light_boost      highlight preservation (default 1.0, higher keeps brights)
@@ -185,8 +185,8 @@ impl QuantizeConfig {
     ///    light_boost:lc:bright brightness preservation (0.0 = off, 1.0 = match source mean L, default 0.0)
     ///
     ///  Examples:  16,1.0,0.0          16 colors, full dither, RGB k-means
-    ///             8,0.5,-1.0            8 colors, half dither, Oklab median-cut
-    ///             32,0.1,1.0:1.5:0.5  32 colors, Oklab K-means with chroma+lightness equalization balanced
+    ///              8,0.5,-1.0            8 colors, half dither, Oklab median-cut
+    ///              32,0.1,1.0:1.5:0.5  32 colors, Oklab K-means with chroma+lightness equalization balanced
     pub fn parse_arg(s: &str) -> Result<Self, ArgParseErr> {
         let s = s.trim();
         if s.eq_ignore_ascii_case("default") {
@@ -211,9 +211,13 @@ impl QuantizeConfig {
             }
         };
 
-        let colors = colors_str.trim().parse::<u32>().map_err(|_| {
-            ArgParseErr::with_msg("invalid colors value (must be positive integer)")
-        })?;
+        let colors = colors_str
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| ArgParseErr::with_msg("invalid colors value (must be an integer >= 2)"))?;
+        if colors < 2 {
+            return Err(ArgParseErr::with_msg("quantize requires at least 2 colors"));
+        }
 
         let dither_level =
             parse_finite_f32(dither_str, "invalid dither_level value (must be a finite float)")?
@@ -480,16 +484,16 @@ where
 
     let palette_pts: Vec<T> = palette.iter().map(|&c| make_pt(convert(c))).collect();
 
-    let best_per_unique: Vec<u32> = unique
-        .par_iter()
-        .map(|&c| nearest_idx(make_pt(convert(c)), &palette_pts, &dist) as u32)
-        .collect();
-
     // Pre-map each unique color index directly to its final RGB palette entry,
-    // eliminating double-array indirection (`palette[best_per_unique[...]]`)
-    // inside the multi-million iteration output loop.
-    let unique_to_rgb: Vec<[u8; 3]> =
-        best_per_unique.iter().map(|&idx| palette[idx as usize]).collect();
+    // eliminating an intermediate `best_per_unique` allocation and double-array
+    // indirection inside the multi-million iteration output loop.
+    let unique_to_rgb: Vec<[u8; 3]> = unique
+        .par_iter()
+        .map(|&c| {
+            let best = nearest_idx(make_pt(convert(c)), &palette_pts, &dist);
+            palette[best]
+        })
+        .collect();
 
     let mut out = vec![0u8; pixels.len() * 3];
     out.par_chunks_exact_mut(3).enumerate().for_each(|(i, px)| {
@@ -528,25 +532,30 @@ fn error_diffusion_map<T, D, M>(
     M: Fn([f32; 3]) -> T,
 {
     let padded_w = width + 2;
-    let mut errors = vec![[0.0f32; 3]; padded_w * height];
+    // Rolling 2-row error buffer: Sierra Lite only touches row `y` and `y + 1`,
+    // so keeping 2 rows instead of `padded_w * height` reduces memory from
+    // O(W * H) to O(W) and keeps error accumulation inside L1 cache.
+    let mut curr_err = vec![[0.0f32; 3]; padded_w];
+    let mut next_err = vec![[0.0f32; 3]; padded_w];
 
     for y in 0..height {
         // Serpentine: even rows scan left→right, odd rows right→left.
         let ltr = y % 2 == 0;
         let fwd_dx: isize = if ltr { 1 } else { -1 };
         let diag_dx: isize = -fwd_dx;
+        let row_offset = y * width;
 
         for step in 0..width {
             let xs = if ltr { step } else { width - 1 - step };
-            let i = y * width + xs;
-            let idx = y * padded_w + xs + 1;
+            let i = row_offset + xs;
+            let col = xs + 1;
 
             // Current pixel + accumulated diffused error (clamped).
             let p = working[i];
             let e = [
-                errors[idx][0].clamp(-clamp[0], clamp[0]),
-                errors[idx][1].clamp(-clamp[1], clamp[1]),
-                errors[idx][2].clamp(-clamp[2], clamp[2]),
+                curr_err[col][0].clamp(-clamp[0], clamp[0]),
+                curr_err[col][1].clamp(-clamp[1], clamp[1]),
+                curr_err[col][2].clamp(-clamp[2], clamp[2]),
             ];
 
             // Blue-noise jitter — shifts decision boundaries between palette
@@ -584,22 +593,22 @@ fn error_diffusion_map<T, D, M>(
             // Edge pixels write into the padding column (never read), so no
             // explicit x-bounds check is needed.
             let fwd_col = (xs as isize + fwd_dx + 1) as usize;
-            let fwd_idx = y * padded_w + fwd_col;
-            errors[fwd_idx][0] += err[0] * 0.5;
-            errors[fwd_idx][1] += err[1] * 0.5;
-            errors[fwd_idx][2] += err[2] * 0.5;
+            curr_err[fwd_col][0] += err[0] * 0.5;
+            curr_err[fwd_col][1] += err[1] * 0.5;
+            curr_err[fwd_col][2] += err[2] * 0.5;
 
             if y + 1 < height {
-                let below_row = (y + 1) * padded_w;
                 let diag_col = (xs as isize + diag_dx + 1) as usize;
-                let diag_idx = below_row + diag_col;
-                let below_idx = below_row + xs + 1;
                 for ch in 0..3 {
-                    errors[diag_idx][ch] += err[ch] * 0.25;
-                    errors[below_idx][ch] += err[ch] * 0.25;
+                    let quarter = err[ch] * 0.25;
+                    next_err[diag_col][ch] += quarter;
+                    next_err[col][ch] += quarter;
                 }
             }
         }
+
+        std::mem::swap(&mut curr_err, &mut next_err);
+        next_err.fill([0.0f32; 3]);
     }
 }
 
@@ -709,38 +718,46 @@ fn generate_palette_macqueen(
     let iterations = (samples / BATCH_SIZE).max(1);
     let noise_spread = dither_level * 0.1; // Reduced multiplier due to tight Oklab ranges
 
+    // Jitter only L (matching dither_and_map's [1.0, 0.0, 0.0] Oklab jitter_mask)
+    // so chroma/hue are not artificially skewed during online centroid updates.
     let jitter = |p: Oklab, idx: usize| -> OkPt {
         if noise_spread <= 0.0 {
             return OkPt::from_oklab(p);
         }
         let noise = (get_noise((idx % width) as u32, (idx / width) as u32) as f32 / 255.0) - 0.5;
         let j = noise * noise_spread;
-        OkPt::from_arr([(p.l + j).clamp(0.0, 1.0), p.a + j, p.b + j])
+        OkPt::from_arr([(p.l + j).clamp(0.0, 1.0), p.a, p.b])
     };
+
+    // Hoist per-batch buffers outside the loop to avoid repeated heap allocations
+    let mut batch_indices = Vec::with_capacity(BATCH_SIZE);
+    let mut centroid_pts = Vec::with_capacity(k);
+    let mut assignments = Vec::with_capacity(BATCH_SIZE);
 
     // MacQueen iterations
     for _ in 0..iterations {
-        let batch_indices: Vec<usize> =
-            (0..BATCH_SIZE).map(|_| (xorshift() as usize) % n_pixels).collect();
+        batch_indices.clear();
+        batch_indices.extend((0..BATCH_SIZE).map(|_| (xorshift() as usize) % n_pixels));
 
         // Centroids are fixed during the assignment phase of a batch —
         // k chroma sqrts here instead of k per sample.
-        let centroid_pts: Vec<OkPt> = centroids.iter().map(|&c| OkPt::from_oklab(c)).collect();
+        centroid_pts.clear();
+        centroid_pts.extend(centroids.iter().map(|&c| OkPt::from_oklab(c)));
 
         // Step 1: in parallel, sample colors and find their nearest current
         // centroid. Uses the same oklch_weighted_dist as the mapping pass so
         // centroids are optimized under the selection metric. The jittered
         // pixel (with its chroma) is computed once and reused for the update.
-        let assignments: Vec<(usize, OkPt)> = batch_indices
+        batch_indices
             .par_iter()
             .map(|&idx| {
                 let p = jitter(oklab_pixels[idx], idx);
                 (nearest_idx(p, &centroid_pts, oklch_weighted_dist_pt), p)
             })
-            .collect();
+            .collect_into_vec(&mut assignments);
 
         // Step 2: sequentially update the centroids based on assignments
-        for (c_idx, p) in assignments {
+        for &(c_idx, p) in &assignments {
             counts[c_idx] += 1;
             // Adaptive learning rate: 1.0 / sqrt(count)
             let rate = 1.0 / (counts[c_idx] as f32).sqrt();
@@ -769,34 +786,45 @@ fn generate_palette_rgb(pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]> {
         *c = [p[0] as f32, p[1] as f32, p[2] as f32];
     }
 
+    // Deduplicate into unique colors + counts so the 15 k-means iterations run
+    // in O(unique * k) instead of O(pixels * k), while producing identical sums.
+    let (unique_rgb, unique_counts) = unique_colors_with_counts(pixels);
+    let n_unique = unique_rgb.len();
+    let unique_f32: Vec<[f32; 3]> = unique_rgb.iter().map(|&p| rgb_to_f32(p)).collect();
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = n_unique.div_ceil(num_threads * 4).max(1);
+
     let max_iterations = 15;
     for _ in 0..max_iterations {
-        let (new_sums, new_counts) = pixels
-            .par_iter()
-            .fold(
-                || (vec![0.0f32; 3 * k], vec![0usize; k]),
-                |mut acc: (Vec<f32>, Vec<usize>), p| {
-                    let pf = rgb_to_f32(*p);
+        let partials: Vec<(Vec<f32>, Vec<usize>)> = unique_f32
+            .par_chunks(chunk_size)
+            .zip(unique_counts.par_chunks(chunk_size))
+            .map(|(c_chunk, cnt_chunk)| {
+                let mut sums = vec![0.0f32; 3 * k];
+                let mut counts = vec![0usize; k];
+                for (&pf, &cnt) in c_chunk.iter().zip(cnt_chunk.iter()) {
                     let best = nearest_idx(pf, &centroids, rgb_dist_sq);
-                    acc.0[best * 3] += pf[0];
-                    acc.0[best * 3 + 1] += pf[1];
-                    acc.0[best * 3 + 2] += pf[2];
-                    acc.1[best] += 1;
-                    acc
-                },
-            )
-            .reduce(
-                || (vec![0.0f32; 3 * k], vec![0usize; k]),
-                |mut a, b| {
-                    for i in 0..3 * k {
-                        a.0[i] = a.0[i].algebraic_add(b.0[i]);
-                    }
-                    for i in 0..k {
-                        a.1[i] += b.1[i];
-                    }
-                    a
-                },
-            );
+                    let w = cnt as f32;
+                    sums[best * 3] = sums[best * 3].algebraic_add(pf[0].algebraic_mul(w));
+                    sums[best * 3 + 1] = sums[best * 3 + 1].algebraic_add(pf[1].algebraic_mul(w));
+                    sums[best * 3 + 2] = sums[best * 3 + 2].algebraic_add(pf[2].algebraic_mul(w));
+                    counts[best] += cnt as usize;
+                }
+                (sums, counts)
+            })
+            .collect();
+
+        let mut new_sums = vec![0.0f32; 3 * k];
+        let mut new_counts = vec![0usize; k];
+        for (ps, pc) in &partials {
+            for i in 0..3 * k {
+                new_sums[i] = new_sums[i].algebraic_add(ps[i]);
+            }
+            for i in 0..k {
+                new_counts[i] += pc[i];
+            }
+        }
 
         let mut changed = false;
         for (i, c) in centroids.iter_mut().enumerate() {
@@ -882,20 +910,18 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
 
         let mut var = [0.0f32; 3];
         for p in slice {
-            let vals = [p.l, p.a, p.b];
-            for ch in 0..3 {
-                let d = vals[ch] - mean[ch];
-                var[ch] += d * d;
-            }
+            let dl = p.l - mean[0];
+            let da = p.a - mean[1];
+            let db = p.b - mean[2];
+            var[0] += dl * dl;
+            var[1] += da * da;
+            var[2] += db * db;
         }
         let weighted_var =
             [var[0] * CHANNEL_WEIGHT[0], var[1] * CHANNEL_WEIGHT[1], var[2] * CHANNEL_WEIGHT[2]];
 
-        let (split_channel, _) = weighted_var
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
+        let (split_channel, _) =
+            weighted_var.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
 
         McBox {
             start,
@@ -906,7 +932,8 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
     };
 
     // Start with one box containing all pixels
-    let mut boxes: Vec<McBox> = vec![compute_box_stats(&oklab_pixels, 0, oklab_pixels.len())];
+    let mut boxes: Vec<McBox> = Vec::with_capacity(k);
+    boxes.push(compute_box_stats(&oklab_pixels, 0, oklab_pixels.len()));
 
     while boxes.len() < k {
         // Find the box with the highest total weighted variance to split
@@ -914,9 +941,7 @@ fn generate_palette_median_cut(rgb_pixels: &[[u8; 3]], k: usize) -> Vec<[u8; 3]>
             .iter()
             .enumerate()
             .filter(|(_, b)| b.len >= 2)
-            .max_by(|a, b| {
-                a.1.priority.partial_cmp(&b.1.priority).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .max_by(|a, b| a.1.priority.total_cmp(&b.1.priority))
             .map(|(i, _)| i);
 
         let best_idx = match best_idx {
@@ -988,7 +1013,7 @@ fn preserve_brightness(palette_oklab: &mut [Oklab], rgb_pixels: &[[u8; 3]], stre
     let mut source_l_sum = 0.0f64;
     let mut source_count = 0u64;
     for p in rgb_pixels.iter().step_by(step) {
-        source_l_sum += srgb_to_oklab(*p).l as f64;
+        source_l_sum += srgb_to_oklab(*p).l.clamp(0.0, 1.0) as f64;
         source_count += 1;
     }
     if source_count == 0 {
@@ -996,21 +1021,27 @@ fn preserve_brightness(palette_oklab: &mut [Oklab], rgb_pixels: &[[u8; 3]], stre
     }
     let source_mean_l = (source_l_sum / source_count as f64) as f32;
 
-    // Palette mean L
-    let palette_mean_l: f32 =
-        palette_oklab.iter().map(|c| c.l as f64).sum::<f64>() as f32 / palette_oklab.len() as f32;
+    // Palette mean L (clamped per-entry to avoid tiny FP excursions outside 0..=1)
+    let palette_mean_l: f32 = palette_oklab.iter().map(|c| c.l.clamp(0.0, 1.0) as f64).sum::<f64>()
+        as f32
+        / palette_oklab.len() as f32;
 
-    if palette_mean_l <= 1e-4 || source_mean_l <= 1e-4 {
+    if palette_mean_l <= 1e-4
+        || source_mean_l <= 1e-4
+        || palette_mean_l >= 1.0 - 1e-4
+        || source_mean_l >= 1.0 - 1e-4
+    {
         return;
     }
 
     // Power curve mapping: L -> L^gamma. Preserves relative spacing while avoiding
     // highlight clamping. Clamped to avoid extreme distortion.
-    let target_mean = palette_mean_l + (source_mean_l - palette_mean_l) * strength;
+    let target_mean =
+        (palette_mean_l + (source_mean_l - palette_mean_l) * strength).clamp(1e-4, 1.0 - 1e-4);
     let gamma = (target_mean.ln() / palette_mean_l.ln()).clamp(0.5, 2.0);
 
     for c in palette_oklab.iter_mut() {
-        c.l = c.l.powf(gamma).clamp(0.0, 1.0);
+        c.l = c.l.clamp(0.0, 1.0).powf(gamma).clamp(0.0, 1.0);
     }
 }
 
@@ -1045,12 +1076,10 @@ fn generate_palette_oklab(
 
     // 1. Per-pixel weights: uniform base with optional linear chroma boost and highlight boost.
     let chroma_multiplier = (sat_bias.algebraic_sub(1.0)).max(0.0);
-    let chromas: Vec<f32> = oklab_pts.iter().map(|p| p.chroma).collect();
-    let mut weights: Vec<f32> = oklab_pixels
+    let mut weights: Vec<f32> = oklab_pts
         .iter()
-        .zip(chromas.iter())
-        .map(|(p, &c)| {
-            let mut w = 1.0f32.algebraic_add(c.algebraic_mul(chroma_multiplier));
+        .map(|p| {
+            let mut w = 1.0f32.algebraic_add(p.chroma.algebraic_mul(chroma_multiplier));
             if light_boost > 1.0 && p.l > 0.65 {
                 let l_norm = (p.l.algebraic_sub(0.65)).algebraic_div(0.35);
                 let boost_factor =
@@ -1076,7 +1105,8 @@ fn generate_palette_oklab(
     const L_BINS: usize = 16;
     let mut l_bin_weights = [0.0f32; L_BINS];
     for u in 0..n_unique {
-        let bin = ((oklab_pixels_slice[u].l.algebraic_mul(L_BINS as f32)) as usize).min(L_BINS - 1);
+        let bin = ((oklab_pixels_slice[u].l.max(0.0).algebraic_mul(L_BINS as f32)) as usize)
+            .min(L_BINS - 1);
         let w = weights_slice[u].algebraic_mul(unique_counts_slice[u] as f32);
         l_bin_weights[bin] = l_bin_weights[bin].algebraic_add(w);
     }
@@ -1092,9 +1122,11 @@ fn generate_palette_oklab(
     let mut grid_weights = [0.0f32; 512];
     for u in 0..n_unique {
         let p = oklab_pixels_slice[u];
-        let l_bin = ((p.l.algebraic_mul(8.0)) as usize).min(7);
-        let a_bin = (((p.a.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
-        let b_bin = (((p.b.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
+        let l_bin = ((p.l.max(0.0).algebraic_mul(8.0)) as usize).min(7);
+        let a_bin =
+            (((p.a.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)).clamp(0.0, 7.0) as usize).min(7);
+        let b_bin =
+            (((p.b.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)).clamp(0.0, 7.0) as usize).min(7);
         let bin = (l_bin << 6) | (a_bin << 3) | b_bin;
         let w = weights_slice[u].algebraic_mul(unique_counts_slice[u] as f32);
         grid_weights[bin] = grid_weights[bin].algebraic_add(w);
@@ -1134,10 +1166,12 @@ fn generate_palette_oklab(
 
     for u in 0..n_unique {
         let p = oklab_pixels_slice[u];
-        let l_bin = ((p.l.algebraic_mul(L_BINS as f32)) as usize).min(L_BINS - 1);
-        let gl_bin = ((p.l.algebraic_mul(8.0)) as usize).min(7);
-        let a_bin = (((p.a.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
-        let b_bin = (((p.b.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)) as usize).clamp(0, 7);
+        let l_bin = ((p.l.max(0.0).algebraic_mul(L_BINS as f32)) as usize).min(L_BINS - 1);
+        let gl_bin = ((p.l.max(0.0).algebraic_mul(8.0)) as usize).min(7);
+        let a_bin =
+            (((p.a.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)).clamp(0.0, 7.0) as usize).min(7);
+        let b_bin =
+            (((p.b.algebraic_add(0.3)).algebraic_mul(8.0 / 0.6)).clamp(0.0, 7.0) as usize).min(7);
         let g_bin = (gl_bin << 6) | (a_bin << 3) | b_bin;
 
         let eq_factor = l_eq_lut[l_bin].algebraic_mul(grid_eq_lut[g_bin]);
@@ -1237,6 +1271,9 @@ fn generate_palette_oklab(
     let num_threads = rayon::current_num_threads().max(1);
     let chunk_size = n_unique.div_ceil(num_threads * 4).max(1);
 
+    let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
+    let mut counts = vec![0.0f32; k];
+
     for _ in 0..20 {
         // Step A: Parallel nearest-centroid assignment using SoA
         best_per_unique.par_iter_mut().zip(min_dists.par_iter_mut()).enumerate().for_each(
@@ -1273,24 +1310,24 @@ fn generate_palette_oklab(
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
-                let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
-                let mut counts = vec![0.0f32; k];
+                let mut c_sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
+                let mut c_counts = vec![0.0f32; k];
                 for (u_in_chunk, p) in chunk.iter().enumerate() {
                     let u = chunk_idx * chunk_size + u_in_chunk;
                     let effective_w = effective_weights[u];
                     let best = best_per_unique[u] as usize;
 
-                    sums[best].0 = sums[best].0.algebraic_add(p.l.algebraic_mul(effective_w));
-                    sums[best].1 = sums[best].1.algebraic_add(p.a.algebraic_mul(effective_w));
-                    sums[best].2 = sums[best].2.algebraic_add(p.b.algebraic_mul(effective_w));
-                    counts[best] = counts[best].algebraic_add(effective_w);
+                    c_sums[best].0 = c_sums[best].0.algebraic_add(p.l.algebraic_mul(effective_w));
+                    c_sums[best].1 = c_sums[best].1.algebraic_add(p.a.algebraic_mul(effective_w));
+                    c_sums[best].2 = c_sums[best].2.algebraic_add(p.b.algebraic_mul(effective_w));
+                    c_counts[best] = c_counts[best].algebraic_add(effective_w);
                 }
-                (sums, counts)
+                (c_sums, c_counts)
             })
             .collect();
 
-        let mut sums = vec![(0.0f32, 0.0f32, 0.0f32); k];
-        let mut counts = vec![0.0f32; k];
+        sums.fill((0.0f32, 0.0f32, 0.0f32));
+        counts.fill(0.0f32);
         for (ps, pc) in &partials {
             for i in 0..k {
                 sums[i].0 = sums[i].0.algebraic_add(ps[i].0);
@@ -1329,13 +1366,20 @@ fn generate_palette_oklab(
             let best_u = min_dists
                 .par_iter()
                 .enumerate()
-                .map(|(i, &d)| (i, d))
-                .max_by(|&(_, a), &(_, b)| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal))
+                .filter(|&(_, &d)| d > 0.0)
+                .max_by(|&(_, a), &(_, b)| a.total_cmp(b))
                 .map(|(i, _)| i)
                 .unwrap_or(0);
 
             centroids_soa.update(empty_idx, oklab_pts[best_u]);
-            // Avoid picking the identical distance pixel next loop
+            // Update `min_dists` against the newly reseeded centroid so any subsequent
+            // empty cluster in the same pass picks a genuinely distinct farthest point.
+            min_dists.par_iter_mut().enumerate().for_each(|(i, d)| {
+                let dist = oklch_weighted_dist_soa_single(oklab_pts[i], &centroids_soa, empty_idx);
+                if dist < *d {
+                    *d = dist;
+                }
+            });
             min_dists[best_u] = 0.0;
             *count = 1.0;
             reseeded = true;
@@ -1398,6 +1442,7 @@ impl OkPt {
 /// The weighted OkLCh metric with both chromas precomputed — zero sqrts, pure
 /// FMA. Same expression order as the original inline-sqrt version, so results
 /// are bit-identical.
+#[inline(always)]
 fn oklch_weighted_dist_pt(p: OkPt, c: OkPt) -> f32 {
     // 1. Lightness difference
     let dl = p.l.algebraic_sub(c.l);
@@ -1488,15 +1533,61 @@ fn oklab_to_srgb_u8(mut ok: Oklab) -> [u8; 3] {
     std::array::from_fn(|i| (linear_to_srgb(linear[i]).clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-/// Precomputed lookup table: sRGB u8 → linear f32.
-static SRGB_TO_LINEAR_LUT: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
+/// Compile-time lookup table: sRGB u8 → linear f32.
+/// Evaluated in f64 at compile time via Taylor series so every f32 entry is
+/// bit-identical to `((x + 0.055) / 1.055).powf(2.4)` with zero runtime init overhead.
+const SRGB_TO_LINEAR_LUT: [f32; 256] = {
+    const fn const_ln(y: f64) -> f64 {
+        // Range-reduce y = m * 2^k with m in [1/sqrt(2), sqrt(2)]
+        let mut m = y;
+        let mut k = 0i32;
+        while m > 1.414_213_562_373_095_1 {
+            m *= 0.5;
+            k += 1;
+        }
+        while m < 0.707_106_781_186_547_5 {
+            m *= 2.0;
+            k -= 1;
+        }
+        let t = (m - 1.0) / (m + 1.0);
+        let t2 = t * t;
+        let mut term = t;
+        let mut sum = 0.0;
+        let mut n = 1;
+        while n <= 29 {
+            sum += term / (n as f64);
+            term *= t2;
+            n += 2;
+        }
+        2.0 * sum + (k as f64) * core::f64::consts::LN_2
+    }
+
+    const fn const_exp(x: f64) -> f64 {
+        let mut sum = 1.0;
+        let mut term = 1.0;
+        let mut n = 1;
+        while n <= 35 {
+            term *= x / (n as f64);
+            sum += term;
+            n += 1;
+        }
+        sum
+    }
+
     let mut lut = [0.0f32; 256];
-    for (i, v) in lut.iter_mut().enumerate() {
-        let x = i as f32 / 255.0;
-        *v = if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
+    let mut i = 0;
+    while i < 256 {
+        let x = (i as f32) / 255.0;
+        lut[i] = if x <= 0.04045 {
+            x / 12.92
+        } else {
+            let base = ((x + 0.055) / 1.055) as f64;
+            const_exp(2.4 * const_ln(base)) as f32
+        };
+        i += 1;
     }
     lut
-});
+};
 
 #[inline(always)]
 fn srgb_u8_to_linear(v: u8) -> f32 {
@@ -1508,6 +1599,7 @@ fn linear_to_srgb(x: f32) -> f32 {
     if x <= 0.0031308 { x * 12.92 } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 }
 }
 
+#[inline(always)]
 fn srgb_to_oklab(rgb: [u8; 3]) -> Oklab {
     let r = srgb_u8_to_linear(rgb[0]);
     let g = srgb_u8_to_linear(rgb[1]);
@@ -1540,14 +1632,15 @@ fn srgb_to_oklab(rgb: [u8; 3]) -> Oklab {
     }
 }
 
+#[inline(always)]
 fn oklab_to_linear_srgb(ok: Oklab) -> [f32; 3] {
     let l_ = ok.l + 0.396_337_78 * ok.a + 0.215_803_76 * ok.b;
     let m_ = ok.l - 0.105_561_346 * ok.a - 0.063_854_17 * ok.b;
     let s_ = ok.l - 0.089_484_18 * ok.a - 1.291_485_5 * ok.b;
 
-    let l = l_.powi(3);
-    let m = m_.powi(3);
-    let s = s_.powi(3);
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
 
     [
         4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s,
