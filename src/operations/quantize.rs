@@ -1541,11 +1541,11 @@ const SRGB_TO_LINEAR_LUT: [f32; 256] = {
         // Range-reduce y = m * 2^k with m in [1/sqrt(2), sqrt(2)]
         let mut m = y;
         let mut k = 0i32;
-        while m > 1.414_213_562_373_095_1 {
+        while m > std::f64::consts::SQRT_2 {
             m *= 0.5;
             k += 1;
         }
-        while m < 0.707_106_781_186_547_5 {
+        while m < std::f64::consts::FRAC_1_SQRT_2 {
             m *= 2.0;
             k -= 1;
         }

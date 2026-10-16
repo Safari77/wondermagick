@@ -794,14 +794,16 @@ fn map_gray_rows<T: Copy + Default + Send + Sync, const HAS_ALPHA: bool>(
             || (vec![T::default(); rgb_row_len], vec![T::default(); rgb_row_len]),
             |(rgb_src, rgb_dst), (y, (src_row, dst_row))| {
                 if HAS_ALPHA {
-                    for (g, rgb) in src_row.chunks_exact(2).zip(rgb_src.chunks_exact_mut(4)) {
+                    for (g, rgb) in
+                        src_row.as_chunks::<2>().0.iter().zip(rgb_src.as_chunks_mut::<4>().0)
+                    {
                         rgb[0] = g[0];
                         rgb[1] = g[0];
                         rgb[2] = g[0];
                         rgb[3] = g[1];
                     }
                 } else {
-                    for (&g, rgb) in src_row.iter().zip(rgb_src.chunks_exact_mut(3)) {
+                    for (&g, rgb) in src_row.iter().zip(rgb_src.as_chunks_mut::<3>().0) {
                         rgb[0] = g;
                         rgb[1] = g;
                         rgb[2] = g;
@@ -812,12 +814,14 @@ fn map_gray_rows<T: Copy + Default + Send + Sync, const HAS_ALPHA: bool>(
                     .map_err(|e| wm_err!("Tone mapping failed on row {}: {}", y, e))?;
 
                 if HAS_ALPHA {
-                    for (rgb, g) in rgb_dst.chunks_exact(4).zip(dst_row.chunks_exact_mut(2)) {
+                    for (rgb, g) in
+                        rgb_dst.as_chunks::<4>().0.iter().zip(dst_row.as_chunks_mut::<2>().0)
+                    {
                         g[0] = rgb[0];
                         g[1] = rgb[3];
                     }
                 } else {
-                    for (rgb, g) in rgb_dst.chunks_exact(3).zip(dst_row.iter_mut()) {
+                    for (rgb, g) in rgb_dst.as_chunks::<3>().0.iter().zip(dst_row.iter_mut()) {
                         *g = rgb[0];
                     }
                 }
